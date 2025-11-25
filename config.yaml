@@ -1,0 +1,76 @@
+# Configuration file for EEG Seizure Onset Detection Pipeline
+
+# Data paths
+data:
+  data_root: "E:/output/segment_results"  # Root directory containing NHFE data (NPZ files)
+  labels_path: "E:/output/segment_results/nhfe_channel_label.csv"  # CSV file with ground truth labels
+  pattern: "**/*_filtered_3_45_postICA_eye_BEI.npz"  # Glob pattern to find NPZ files
+
+# Feature extraction
+features:
+  baseline_duration: 10.0  # Baseline duration in seconds
+  window_size: 0.25  # Time window size in seconds (250ms)
+  onset_window_ms: 100.0  # Window for multi-label onset grouping (ms)
+  stability_window: 2.0  # Window for stability feature (seconds)
+  target_band: "gamma"  # Target frequency band
+
+# Model configuration
+model:
+  type: "lightgbm"  # Options: "xgboost", "lightgbm", "temporal_cnn"
+  
+  # XGBoost/LightGBM parameters
+  n_estimators: 500
+  max_depth: 6
+  learning_rate: 0.1
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 1.0
+  random_state: 42
+  
+  # LightGBM specific
+  num_leaves: 31
+  
+  # Temporal CNN parameters
+  # input_length: Set to None or 0 to use full sequence length (auto-detect)
+  #               Or set to a fixed value (e.g., 5000 for 20s at 250Hz, 10000 for 40s)
+  #               Recommended: None (use full length) or 5000-10000 for fixed length
+  input_length: 10000  # null = use full sequence, or set to integer (e.g., 5000)
+  n_filters: [32, 64, 128]
+  kernel_sizes: [5, 5, 5]
+  dropout: 0.3
+  batch_size: 32
+  epochs: 50
+  device: "cuda"  # "cpu" or "cuda"
+
+# Training configuration
+training:
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_state: 42
+
+# Output paths
+output:
+  model_dir: "checkpoints"  # Directory to save trained models
+  results_dir: "results"  # Directory to save evaluation results
+  inference_output: "inference_results"  # Directory for inference outputs
+
+# Inference configuration
+inference:
+  threshold: 0.5  # Probability threshold for binary prediction
+  top_k: 5  # Number of top channels to return in ranking
+
+# Detection configuration (for detect_onset_channels.py)
+detection:
+  # Detection mode: False = normalized NHFE with adaptive threshold, True = raw NHFE with manual threshold
+  use_raw_nhfe: false  # Set to true to use raw NHFE values
+
+  # For normalized mode (use_raw_nhfe=false):
+  threshold_percentile: 99.5  # Percentile for adaptive threshold
+  fallback_threshold: 3.0  # Fallback threshold in MAD units
+  
+  # For raw mode (use_raw_nhfe=true):
+  manual_threshold: 30.0  # Manual threshold value (required if use_raw_nhfe=true)
+                          # Example: 100.0, 500.0, 1000.0 (depends on your NHFE scale)
+
