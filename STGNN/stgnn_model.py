@@ -17,11 +17,12 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 
-from .temporal_extractor import TemporalFeatureExtractor
-from .graph_learning import AdaptiveGraphLearning
-from .graph_conv import GraphConvolutionBlock
-from .classifier_head import ClassificationHead
-from .positional_encoding import PositionalEncoding
+from classifier_head import ClassificationHead
+from graph_conv import GraphConvolutionBlock
+from graph_learning import AdaptiveGraphLearning
+from graph_learning_with_prior import AdaptiveGraphLearningWithPrior
+from positional_encoding import PositionalEncoding
+from temporal_extractor import TemporalFeatureExtractor
 
 
 class STGNN_SOZ_Locator(nn.Module):
@@ -43,15 +44,17 @@ class STGNN_SOZ_Locator(nn.Module):
         n_channels: int = 21,
         n_bands: int = 5,
         time_steps: int = 10000,
-        temporal_hidden_dim: int = 128,
+        temporal_hidden_dim: int = 32,  # Reduced from 128 to prevent overfitting
         temporal_reduced_steps: int = 64,
         graph_learning_method: str = 'combined',
-        graph_hidden_dim: int = 128,
+        graph_hidden_dim: int = 32,  # Reduced from 128 to prevent overfitting
         graph_conv_type: str = 'gcn',
         graph_n_layers: int = 2,
         classifier_hidden_dim: Optional[int] = None,
-        dropout: float = 0.2,
-        use_batch_norm: bool = True
+        dropout: float = 0.6,  # Increased from 0.2 to 0.6 for stronger regularization
+        use_batch_norm: bool = True,
+        use_distance_prior: bool = False,  # 是否使用基于距离的先验（容积传导）
+        distance_prior: Optional[torch.Tensor] = None  # 距离先验矩阵
     ):
         """
         Args:
@@ -67,6 +70,8 @@ class STGNN_SOZ_Locator(nn.Module):
             classifier_hidden_dim: Hidden dimension for classifier (None = use graph_hidden_dim)
             dropout: Dropout rate (default: 0.2)
             use_batch_norm: Whether to use batch normalization (default: True)
+            use_distance_prior: Whether to use distance-based prior (volume conduction)
+            distance_prior: Pre-computed distance-based adjacency matrix (n_channels, n_channels)
         """
         super(STGNN_SOZ_Locator, self).__init__()
         
@@ -75,6 +80,16 @@ class STGNN_SOZ_Locator(nn.Module):
         self.time_steps = time_steps
         self.temporal_hidden_dim = temporal_hidden_dim
         self.temporal_reduced_steps = temporal_reduced_steps
+        self.use_distance_prior = use_distance_prior
+        
+        # Register distance prior as buffer (non-trainable)
+        if use_distance_prior and distance_prior is not None:
+            if isinstance(distance_prior, torch.Tensor):
+                self.register_buffer('distance_prior', distance_prior)
+            else:
+                self.register_buffer('distance_prior', torch.from_numpy(distance_prior).float())
+        else:
+            self.register_buffer('distance_prior', None)
         
         # Positional Encoding: Add temporal position information
         # Applied before temporal extraction to preserve chronological order
@@ -93,13 +108,25 @@ class STGNN_SOZ_Locator(nn.Module):
         )
         
         # Module B: Adaptive Graph Structure Learning
-        self.graph_learning = AdaptiveGraphLearning(
-            n_channels=n_channels,
-            hidden_dim=temporal_hidden_dim,
-            method=graph_learning_method,
-            temperature=0.1,
-            k_nearest=None  # Fully connected
-        )
+        # 如果使用距离先验，则使用AdaptiveGraphLearningWithPrior
+        if use_distance_prior and distance_prior is not None:
+            self.graph_learning = AdaptiveGraphLearningWithPrior(
+                n_channels=n_channels,
+                hidden_dim=temporal_hidden_dim,
+                method=graph_learning_method,
+                temperature=0.1,
+                k_nearest=None,  # Fully connected
+                use_prior=True,
+                prior_weight=0.4  # 容积传导先验权重40%
+            )
+        else:
+            self.graph_learning = AdaptiveGraphLearning(
+                n_channels=n_channels,
+                hidden_dim=temporal_hidden_dim,
+                method=graph_learning_method,
+                temperature=0.1,
+                k_nearest=None  # Fully connected
+            )
         
         # Module C: Graph Convolution
         self.graph_conv = GraphConvolutionBlock(
@@ -159,10 +186,22 @@ class STGNN_SOZ_Locator(nn.Module):
         # Compute adjacency matrix from temporal features
         # (B, 21, 128, 64) -> adjacency: (B, 21, 21), node_features: (B, 21, 128)
         # Note: graph_learning aggregates temporal dimension internally
-        adjacency, node_features = self.graph_learning(
-            temporal_features,
-            return_adjacency=True
-        )
+        if self.use_distance_prior and self.distance_prior is not None:
+            # 传入距离先验矩阵（容积传导）
+            batch_size = temporal_features.size(0)
+            prior_batch = self.distance_prior.unsqueeze(0).expand(batch_size, -1, -1)
+            
+            # AdaptiveGraphLearningWithPrior需要prior_adjacency参数
+            adjacency, node_features = self.graph_learning(
+                temporal_features,
+                prior_adjacency=prior_batch,  # 传入容积传导先验
+                return_adjacency=True
+            )
+        else:
+            adjacency, node_features = self.graph_learning(
+                temporal_features,
+                return_adjacency=True
+            )
         
         # Step 4: Module C: Graph Convolution
         # Apply graph convolution while preserving temporal dimension

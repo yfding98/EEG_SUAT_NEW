@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from typing import Tuple
 
 # Import causal TCN
-from .causal_tcn import CausalTemporalExtractor
+from causal_tcn import CausalTemporalExtractor
 
 
 class TemporalFeatureExtractor(nn.Module):

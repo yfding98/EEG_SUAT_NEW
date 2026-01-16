@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 # Import temporal attention
-from .temporal_attention import TemporalAttention
+from temporal_attention import TemporalAttention
 
 
 class ClassificationHead(nn.Module):
