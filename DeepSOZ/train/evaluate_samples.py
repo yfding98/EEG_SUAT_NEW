@@ -37,6 +37,7 @@ from dataset import (
     create_cross_validation_splits
 )
 from model_wrapper import create_model
+from eegnet_model import create_eegnet_model
 from trainer import get_device, set_seed
 
 import logging
@@ -577,7 +578,7 @@ def generate_visualization_report(
     print(f"有错误样本: {summary['total_samples'] - summary['perfect_samples']} ({summary['error_rate']*100:.1f}%)")
     print("\nTop 5 问题样本:")
     for i, sample in enumerate(summary['top_10_worst_samples'][:5]):
-        print(f"  {i+1}. {sample['pt_id']}_SZ{sample['sz_idx']}: Loss={sample['sample_loss']:.4f}, F1={sample['sample_f1']:.4f}, Errors={sample['n_errors']}")
+        print(f"  {i+1}. {sample['fn']}_segment_{sample['sz_idx']}: Loss={sample['sample_loss']:.4f}, F1={sample['sample_f1']:.4f}, Errors={sample['n_errors']}")
     print("="*60)
 
 
@@ -588,6 +589,7 @@ def generate_visualization_report(
 def run_evaluation(
     checkpoint_path: str,
     task_type: str = 'channel',
+    model_type: str = 'stgnn',  # 'stgnn' 或 'eegnet'
     output_dir: str = None,
     manifest_path: str = None,
     data_roots: List[str] = None,
@@ -603,6 +605,7 @@ def run_evaluation(
     Args:
         checkpoint_path: 模型检查点路径
         task_type: 任务类型
+        model_type: 模型架构类型 ('stgnn' 或 'eegnet')
         output_dir: 输出目录
         manifest_path: manifest文件路径
         data_roots: 数据根目录列表
@@ -621,6 +624,14 @@ def run_evaluation(
         config.data.manifest_path = manifest_path
     if data_roots:
         config.data.edf_data_roots = data_roots
+    
+    # 根据config中的use_bipolar设置正确的通道数
+    if config.data.use_bipolar:
+        config.model.n_channels = 18
+        logger.info("使用TCP双极导联模式，通道数: 18")
+    else:
+        config.model.n_channels = 19
+        logger.info("使用单极导联模式，通道数: 19")
     
     # 设置输出目录
     if output_dir is None:
@@ -659,17 +670,37 @@ def run_evaluation(
     
     logger.info(f"数据集大小: {len(dataset)} 样本")
     
-    # 加载模型
-    model_config = {
-        'n_channels': config.model.n_channels,
-        'n_bands': config.model.n_bands,
-        'time_steps': config.model.time_steps,
-        'n_windows': config.data.n_windows,
-        'temporal_hidden_dim': 32,
-        'graph_hidden_dim': 32,
-        'dropout': 0.6
-    }
-    model = create_model(task_type, model_config)
+    # 根据模型类型创建模型
+    if model_type.lower() == 'eegnet':
+        # EEGNet模型配置
+        model_config = {
+            'n_channels': config.model.n_channels,
+            'n_samples': config.model.time_steps,
+            'n_windows': config.data.n_windows,
+            'n_classes': 5 if task_type == 'onset_zone' else (4 if task_type == 'hemi' else 19),
+            'dropout': 0.5,
+            'F1': 8,
+            'D': 2,
+            'F2': 16,
+            'kernel_length': 64,
+            'temporal_aggregation': 'attention'
+        }
+        model = create_eegnet_model(task_type, model_config)
+        logger.info("使用 EEGNet 模型架构")
+    else:
+        # STGNN模型配置（默认）
+        model_config = {
+            'n_channels': config.model.n_channels,
+            'n_bands': config.model.n_bands,
+            'time_steps': config.model.time_steps,
+            'n_windows': config.data.n_windows,
+            'temporal_hidden_dim': 32,
+            'graph_hidden_dim': 32,
+            'dropout': 0.6
+        }
+        model = create_model(task_type, model_config)
+        logger.info("使用 STGNN 模型架构")
+    
     model = model.to(device)
     
     # 加载权重
@@ -705,9 +736,12 @@ def parse_args():
     
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='模型检查点路径')
-    parser.add_argument('--task-type', type=str, default='hemi',
+    parser.add_argument('--task-type', type=str, default='onset_zone',
                         choices=['channel', 'hemi', 'onset_zone'],
                         help='任务类型')
+    parser.add_argument('--model-type', type=str, default='stgnn',
+                        choices=['stgnn', 'eegnet'],
+                        help='模型架构类型')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='输出目录')
     parser.add_argument('--manifest', type=str, default=None,
@@ -734,6 +768,7 @@ def main():
     run_evaluation(
         checkpoint_path=args.checkpoint,
         task_type=args.task_type,
+        model_type=args.model_type,
         output_dir=args.output_dir,
         manifest_path=args.manifest,
         data_roots=args.data_roots,

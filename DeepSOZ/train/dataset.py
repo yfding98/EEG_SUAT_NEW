@@ -259,6 +259,101 @@ def apply_windows(x: np.ndarray, fs: float, window_len: float = 1.0,
     return windows
 
 
+def adaptive_apply_windows(
+    x: np.ndarray, 
+    fs: float, 
+    window_len: float = 1.0, 
+    overlap: float = 0.0,
+    min_windows: int = 2
+) -> np.ndarray:
+    """
+    自适应窗口划分 - 处理数据不足的情况
+    
+    当剩余数据不足以按标准重叠策略划分时，采用"首尾两端"策略：
+    - 如果数据 >= 2 * window_len: 使用标准重叠策略
+    - 如果 window_len < 数据 < 2 * window_len: 取首尾两个窗口
+    - 如果数据 <= window_len: 只取一个窗口（可能需要填充）
+    
+    例如：29s数据，20s窗口
+    -> 取 [0-20s] 和 [9-29s] 两个窗口
+    
+    Args:
+        x: 输入数据 (n_channels, n_samples) 或 (n_samples,)
+        fs: 采样率
+        window_len: 窗口长度（秒）
+        overlap: 标准重叠比例
+        min_windows: 最少生成的窗口数
+    
+    Returns:
+        windows: (n_windows, n_channels, samples_per_window) 或 (n_windows, samples_per_window)
+    """
+    samples_per_window = int(window_len * fs)
+    step = int(samples_per_window * (1 - overlap))
+    
+    n_samples = x.shape[-1]
+    data_duration = n_samples / fs
+    
+    is_multichannel = len(x.shape) > 1
+    n_channels = x.shape[0] if is_multichannel else 1
+    
+    # 计算按标准策略可以划分的窗口数
+    standard_n_windows = max(0, (n_samples - samples_per_window) // step + 1)
+    
+    # 情况1: 数据足够，使用标准策略
+    if standard_n_windows >= min_windows:
+        return apply_windows(x, fs, window_len, overlap)
+    
+    # 情况2: 数据刚好够2个窗口，但重叠不够 -> 首尾策略
+    if n_samples >= samples_per_window and n_samples < 2 * samples_per_window:
+        # 取首窗口 [0, window_len] 和尾窗口 [end-window_len, end]
+        if is_multichannel:
+            windows = np.zeros((2, n_channels, samples_per_window))
+            windows[0] = x[:, :samples_per_window]  # 首窗口
+            windows[1] = x[:, -samples_per_window:]  # 尾窗口
+        else:
+            windows = np.zeros((2, samples_per_window))
+            windows[0] = x[:samples_per_window]
+            windows[1] = x[-samples_per_window:]
+        
+        # 计算实际重叠
+        actual_overlap_samples = 2 * samples_per_window - n_samples
+        actual_overlap_ratio = actual_overlap_samples / samples_per_window
+        logger.debug(
+            f"自适应窗口划分: {data_duration:.1f}s数据, {window_len}s窗口 -> "
+            f"2个窗口, 实际重叠{actual_overlap_ratio*100:.1f}%"
+        )
+        return windows
+    
+    # 情况3: 数据够2个窗口以上，但按标准策略只有1个 -> 首尾策略
+    if n_samples >= 2 * samples_per_window:
+        if is_multichannel:
+            windows = np.zeros((2, n_channels, samples_per_window))
+            windows[0] = x[:, :samples_per_window]
+            windows[1] = x[:, -samples_per_window:]
+        else:
+            windows = np.zeros((2, samples_per_window))
+            windows[0] = x[:samples_per_window]
+            windows[1] = x[-samples_per_window:]
+        return windows
+    
+    # 情况4: 数据不够一个完整窗口 -> 填充到一个窗口
+    if n_samples < samples_per_window:
+        if is_multichannel:
+            windows = np.zeros((1, n_channels, samples_per_window))
+            windows[0, :, :n_samples] = x
+        else:
+            windows = np.zeros((1, samples_per_window))
+            windows[0, :n_samples] = x
+        
+        logger.warning(
+            f"数据不足: {data_duration:.1f}s < {window_len}s窗口, 使用零填充"
+        )
+        return windows
+    
+    # 默认回退到标准策略
+    return apply_windows(x, fs, window_len, overlap)
+
+
 # ==============================================================================
 # EDF文件读取
 # ==============================================================================
@@ -473,6 +568,376 @@ def parse_seizure_times(sz_starts: str, sz_ends: str) -> List[Tuple[float, float
         return []
 
 
+def parse_mask_segments(mask_segments: str) -> List[Tuple[float, float]]:
+    """
+    解析mask_segments字段（坏段时间范围）
+    
+    Args:
+        mask_segments: JSON格式的时间范围列表，如 "[[226.0, 228.0],[888,891]]"
+    
+    Returns:
+        [(start1, end1), (start2, end2), ...] 坏段时间范围列表
+    """
+    if pd.isna(mask_segments) or mask_segments == '' or mask_segments is None:
+        return []
+    
+    try:
+        import json
+        # 尝试解析JSON格式
+        segments = json.loads(str(mask_segments))
+        
+        result = []
+        for seg in segments:
+            if isinstance(seg, (list, tuple)) and len(seg) >= 2:
+                result.append((float(seg[0]), float(seg[1])))
+        
+        return result
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        logger.warning(f"解析mask_segments失败: {mask_segments}, 错误: {e}")
+        return []
+
+
+def apply_mask_segments(
+    data: np.ndarray,
+    fs: float,
+    mask_segments: List[Tuple[float, float]],
+    fill_value: float = 0.0
+) -> np.ndarray:
+    """
+    应用掩码，将坏段数据置为指定值
+    
+    此函数应在滤波之前调用，以避免坏段数据影响滤波结果。
+    
+    Args:
+        data: EEG数据 (n_channels, n_samples)
+        fs: 采样率
+        mask_segments: 坏段时间范围列表 [(start1, end1), ...]
+        fill_value: 填充值，默认为0
+    
+    Returns:
+        处理后的数据（坏段被填充为指定值）
+    """
+    if not mask_segments:
+        return data
+    
+    masked_data = data.copy()
+    n_samples = data.shape[-1]
+    
+    for start_time, end_time in mask_segments:
+        start_sample = int(start_time * fs)
+        end_sample = int(end_time * fs)
+        
+        # 边界检查
+        start_sample = max(0, start_sample)
+        end_sample = min(n_samples, end_sample)
+        
+        if start_sample < end_sample:
+            masked_data[:, start_sample:end_sample] = fill_value
+            logger.debug(f"掩码应用: [{start_time:.2f}s, {end_time:.2f}s] -> [{start_sample}, {end_sample}] samples")
+    
+    return masked_data
+
+
+def interpolate_mask_segments(
+    data: np.ndarray,
+    fs: float,
+    mask_segments: List[Tuple[float, float]]
+) -> np.ndarray:
+    """
+    使用线性插值替换坏段数据
+    
+    相比直接置零，插值可以减少滤波时的边界效应。
+    
+    Args:
+        data: EEG数据 (n_channels, n_samples)
+        fs: 采样率
+        mask_segments: 坏段时间范围列表 [(start1, end1), ...]
+    
+    Returns:
+        处理后的数据（坏段被线性插值替换）
+    """
+    if not mask_segments:
+        return data
+    
+    interpolated_data = data.copy()
+    n_channels, n_samples = data.shape
+    
+    for start_time, end_time in mask_segments:
+        start_sample = int(start_time * fs)
+        end_sample = int(end_time * fs)
+        
+        # 边界检查
+        start_sample = max(0, start_sample)
+        end_sample = min(n_samples, end_sample)
+        
+        if start_sample < end_sample and end_sample > start_sample:
+            # 对每个通道进行线性插值
+            for ch in range(n_channels):
+                # 获取边界值
+                left_val = data[ch, max(0, start_sample - 1)] if start_sample > 0 else 0
+                right_val = data[ch, min(n_samples - 1, end_sample)] if end_sample < n_samples else 0
+                
+                # 线性插值
+                n_interp = end_sample - start_sample
+                interpolated_data[ch, start_sample:end_sample] = np.linspace(
+                    left_val, right_val, n_interp
+                )
+    
+    return interpolated_data
+
+
+def remove_mask_segments(
+    data: np.ndarray,
+    fs: float,
+    mask_segments: List[Tuple[float, float]]
+) -> Tuple[np.ndarray, float]:
+    """
+    移除坏段数据，将剩余数据拼接
+
+    直接剔除坏段对应的时间段数据，然后将前后的数据拼接起来。
+
+    Args:
+        data: EEG数据 (n_channels, n_samples)
+        fs: 采样率
+        mask_segments: 坏段时间范围列表 [(start1, end1), ...]
+
+    Returns:
+        cleaned_data: 移除坏段后的数据 (n_channels, new_n_samples)
+        new_duration: 移除坏段后的新时长(秒)
+    """
+    if not mask_segments:
+        return data, data.shape[1] / fs
+
+    n_channels, n_samples = data.shape
+
+    # 将mask_segments转换为采样点，并按起始时间排序
+    mask_samples = []
+    for start_time, end_time in mask_segments:
+        start_sample = int(start_time * fs)
+        end_sample = int(end_time * fs)
+
+        # 边界检查
+        start_sample = max(0, start_sample)
+        end_sample = min(n_samples, end_sample)
+
+        if start_sample < end_sample:
+            mask_samples.append((start_sample, end_sample))
+
+    # 按起始位置排序
+    mask_samples.sort(key=lambda x: x[0])
+
+    # 合并重叠的坏段
+    merged_masks = []
+    for start, end in mask_samples:
+        if merged_masks and start <= merged_masks[-1][1]:
+            # 与前一个坏段重叠，合并
+            merged_masks[-1] = (merged_masks[-1][0], max(merged_masks[-1][1], end))
+        else:
+            merged_masks.append((start, end))
+
+    # 计算要保留的数据段
+    good_segments = []
+    prev_end = 0
+    for start, end in merged_masks:
+        if prev_end < start:
+            good_segments.append((prev_end, start))
+        prev_end = end
+
+    # 添加最后一段
+    if prev_end < n_samples:
+        good_segments.append((prev_end, n_samples))
+
+    # 拼接好的数据段
+    if not good_segments:
+        # 全是坏段，返回空数据
+        logger.warning("所有数据都是坏段，返回空数组")
+        return np.zeros((n_channels, 0)), 0.0
+
+    cleaned_parts = [data[:, start:end] for start, end in good_segments]
+    cleaned_data = np.concatenate(cleaned_parts, axis=1)
+
+    new_duration = cleaned_data.shape[1] / fs
+
+    # 计算移除的时长
+    removed_samples = n_samples - cleaned_data.shape[1]
+    removed_duration = removed_samples / fs
+    logger.info(f"移除了 {len(merged_masks)} 个坏段, 共 {removed_duration:.2f}s, 剩余 {new_duration:.2f}s")
+
+    return cleaned_data, new_duration
+
+
+def filter_mask_segments_for_range(
+    mask_segments: List[Tuple[float, float]],
+    range_start: float,
+    range_end: float
+) -> List[Tuple[float, float]]:
+    """
+    筛选并转换mask_segments到指定时间范围的相对时间戳
+    
+    mask_segments使用的是相对于原始数据的绝对时间戳，
+    而我们需要提取的是[range_start, range_end]范围内的片段。
+    
+    此函数会：
+    1. 筛选出与[range_start, range_end]重叠的坏段
+    2. 裁剪坏段到范围边界
+    3. 转换为相对于range_start的时间戳
+    
+    例如：
+        mask_segments = [[2041.5, 2042.5], [2045.0, 2048.5], [1330, 1331.5]]
+        range_start = 2040, range_end = 2075
+        
+        输出: [[1.5, 2.5], [5.0, 8.5]]  (相对于2040的时间戳)
+    
+    Args:
+        mask_segments: 绝对时间戳的坏段列表 [(abs_start1, abs_end1), ...]
+        range_start: 目标范围起始时间（秒）
+        range_end: 目标范围结束时间（秒）
+    
+    Returns:
+        相对时间戳的坏段列表 [(rel_start1, rel_end1), ...]
+    """
+    if not mask_segments:
+        return []
+    
+    relative_segments = []
+    
+    for abs_start, abs_end in mask_segments:
+        # 检查是否与目标范围重叠
+        if abs_end <= range_start or abs_start >= range_end:
+            # 不重叠，跳过
+            continue
+        
+        # 裁剪到范围边界
+        clipped_start = max(abs_start, range_start)
+        clipped_end = min(abs_end, range_end)
+        
+        # 转换为相对时间戳
+        rel_start = clipped_start - range_start
+        rel_end = clipped_end - range_start
+        
+        if rel_end > rel_start:
+            relative_segments.append((rel_start, rel_end))
+    
+    # 按起始时间排序
+    relative_segments.sort(key=lambda x: x[0])
+    
+    return relative_segments
+
+
+def calculate_clean_duration(
+    range_start: float,
+    range_end: float,
+    mask_segments: List[Tuple[float, float]]
+) -> float:
+    """
+    计算指定时间范围内移除坏段后的有效时长
+    
+    用于在构建样本阶段预先计算清洗后的数据时长，
+    以便正确划分滑动窗口。
+    
+    例如：
+        range_start = 2040, range_end = 2075 (35s)
+        mask_segments = [[2041.5, 2042.5], [2045.0, 2048.5], [1330, 1331.5]]
+        
+        范围内的坏段: [2041.5-2042.5] (1s) + [2045.0-2048.5] (3.5s) = 4.5s
+        有效时长: 35s - 4.5s = 30.5s
+    
+    Args:
+        range_start: 目标范围起始时间（秒）
+        range_end: 目标范围结束时间（秒）
+        mask_segments: 绝对时间戳的坏段列表 [(abs_start, abs_end), ...]
+    
+    Returns:
+        clean_duration: 移除坏段后的有效时长（秒）
+    """
+    if not mask_segments:
+        return range_end - range_start
+    
+    total_bad_duration = 0.0
+    
+    for abs_start, abs_end in mask_segments:
+        # 检查是否与目标范围重叠
+        if abs_end <= range_start or abs_start >= range_end:
+            # 不重叠，跳过
+            continue
+        
+        # 裁剪到范围边界
+        clipped_start = max(abs_start, range_start)
+        clipped_end = min(abs_end, range_end)
+        
+        bad_duration = clipped_end - clipped_start
+        if bad_duration > 0:
+            total_bad_duration += bad_duration
+    
+    clean_duration = (range_end - range_start) - total_bad_duration
+    return max(0.0, clean_duration)
+
+
+def extract_segment_with_mask_removal(
+    data: np.ndarray,
+    fs: float,
+    segment_start: float,
+    segment_end: float,
+    mask_segments: List[Tuple[float, float]]
+) -> Tuple[np.ndarray, float]:
+    """
+    提取指定时间范围的片段，并移除范围内的坏段数据
+    
+    这是处理mask_segments的正确方式：
+    1. 首先提取[segment_start, segment_end]范围的数据
+    2. 筛选并转换mask_segments为相对时间戳
+    3. 移除坏段，拼接好的数据
+    
+    Args:
+        data: 完整的EEG数据 (n_channels, total_samples)
+        fs: 采样率
+        segment_start: 片段起始时间（绝对时间戳，秒）
+        segment_end: 片段结束时间（绝对时间戳，秒）
+        mask_segments: 绝对时间戳的坏段列表 [(abs_start, abs_end), ...]
+    
+    Returns:
+        cleaned_segment: 移除坏段后的片段数据
+        clean_duration: 清洗后的时长（秒）
+    """
+    n_channels, total_samples = data.shape
+    
+    # 1. 提取片段
+    start_sample = int(segment_start * fs)
+    end_sample = int(segment_end * fs)
+    
+    # 边界检查
+    start_sample = max(0, start_sample)
+    end_sample = min(total_samples, end_sample)
+    
+    if end_sample <= start_sample:
+        logger.warning(f"无效的片段范围: {segment_start}s - {segment_end}s")
+        return np.zeros((n_channels, 0)), 0.0
+    
+    segment = data[:, start_sample:end_sample]
+    segment_duration = segment.shape[1] / fs
+    
+    # 2. 筛选并转换mask_segments为相对时间戳
+    relative_masks = filter_mask_segments_for_range(
+        mask_segments, segment_start, segment_end
+    )
+    
+    if not relative_masks:
+        # 没有需要移除的坏段
+        return segment, segment_duration
+    
+    # 3. 移除坏段
+    cleaned_segment, clean_duration = remove_mask_segments(
+        segment, fs, relative_masks
+    )
+    
+    logger.debug(
+        f"片段提取: [{segment_start:.1f}s, {segment_end:.1f}s] -> "
+        f"原始{segment_duration:.1f}s, 移除坏段后{clean_duration:.1f}s"
+    )
+    
+    return cleaned_segment, clean_duration
+
+
 # ==============================================================================
 # 数据集类
 # ==============================================================================
@@ -566,6 +1031,9 @@ class PrivateEEGDataset(Dataset):
             # 解析baseline
             baseline = parse_baseline(row.get('base_line'))
             
+            # 解析mask_segments（坏段）
+            mask_segments = parse_mask_segments(row.get('mask_segments'))
+            
             # 为每个发作创建样本
             for sz_idx, (sz_start, sz_end) in enumerate(seizure_times):
                 sample = {
@@ -577,6 +1045,7 @@ class PrivateEEGDataset(Dataset):
                     'sz_start': sz_start,
                     'sz_end': sz_end,
                     'baseline': baseline,
+                    'mask_segments': mask_segments,  # 新增: 坏段时间范围
                     'labels': labels,
                     'duration': row.get('duration'),
                 }
@@ -668,11 +1137,24 @@ class PrivateEEGDataset(Dataset):
         }
     
     def _load_and_preprocess(self, sample: Dict) -> np.ndarray:
-        """加载并预处理EDF数据"""
+        """
+        加载并预处理EDF数据
+        
+        处理流程优化：
+        1. 读取完整EDF数据
+        2. 提取标准通道 + 可选双极转换
+        3. 预处理（滤波、幅值裁剪）- 在完整数据上进行
+        4. 重采样到目标采样率
+        5. 提取baseline片段用于标准化
+        6. 提取发作片段 + 移除范围内的坏段（正确处理时间偏移）
+        7. 窗口划分
+        8. 标准化
+        """
         edf_path = sample['edf_path']
         sz_start = sample['sz_start']
         sz_end = sample['sz_end']
         base_line_start, base_line_end = sample['baseline']
+        mask_segments = sample.get('mask_segments', [])  # 绝对时间戳的坏段
         
         # 1. 读取EDF
         raw_data, fs, ch_names = read_edf(edf_path)
@@ -686,7 +1168,7 @@ class PrivateEEGDataset(Dataset):
             data, found_channels = convert_to_bipolar(data, found_channels, bipolar_pairs)
             logger.debug(f"双极导联转换完成: {len(found_channels)} 通道")
         
-        # 3. 预处理每个通道
+        # 3. 预处理每个通道（在完整数据上进行）
         processed_data = np.zeros_like(data)
         for i in range(data.shape[0]):
             # 带通滤波
@@ -708,31 +1190,60 @@ class PrivateEEGDataset(Dataset):
                     processed_data[i], fs, self.config.target_fs
                 )
             processed_data = resampled_data
+            
+            # 重采样后需要调整mask_segments的时间戳（采样率变化）
+            # 但由于我们使用的是秒为单位的时间戳，不需要调整
             fs = self.config.target_fs
         
-        # 5. 提取发作片段（发作前后的窗口）
-        start_sample = max(0, int((sz_start - self.window_before) * fs))
-        end_sample = min(processed_data.shape[1], int((sz_end + self.window_after) * fs))
+        # 5. 提取baseline片段用于标准化（baseline通常不需要移除坏段）
+        if base_line_start is not None and base_line_end is not None:
+            bl_start_sample = int(base_line_start * fs)
+            bl_end_sample = int(base_line_end * fs)
+            bl_start_sample = max(0, bl_start_sample)
+            bl_end_sample = min(processed_data.shape[1], bl_end_sample)
+            baseline_segment = processed_data[:, bl_start_sample:bl_end_sample]
+        else:
+            baseline_segment = None
         
-        segment = processed_data[:, start_sample:end_sample]
-        baseline_segment = processed_data[:,int(base_line_start * fs):int(base_line_end * fs)]
+        # 6. 提取发作片段 + 移除范围内的坏段
+        # 计算需要提取的时间范围（包含发作前后的窗口）
+        segment_start = max(0, sz_start - self.window_before)
+        segment_end = sz_end + self.window_after
         
-        # 6. 分割成窗口
-        windows = apply_windows(
+        # 使用extract_segment_with_mask_removal正确处理坏段
+        # 这会筛选范围内的坏段，转换为相对时间戳，然后移除
+        segment, clean_duration = extract_segment_with_mask_removal(
+            processed_data, fs, 
+            segment_start, segment_end,
+            mask_segments
+        )
+        
+        # 检查清洗后的数据是否足够
+        if segment.shape[1] == 0:
+            logger.warning(f"片段 {sample['fn']} SZ{sample['sz_idx']} 清洗后没有数据")
+            # 返回空窗口
+            n_channels = processed_data.shape[0]
+            n_samples = int(self.config.window_length * fs)
+            return np.zeros((self.config.n_windows, n_channels, n_samples))
+        
+        # 7. 分割成窗口 - 使用自适应策略处理数据不足情况
+        windows = adaptive_apply_windows(
             segment, fs,
             window_len=self.config.window_length,
-            overlap=self.config.window_overlap
-        )  # (n_windows, 19, 200)
+            overlap=self.config.window_overlap,
+            min_windows=2
+        )  # (n_windows, n_channels, n_samples)
 
-
-        # 7. 标准化
+        # 8. 标准化
         if self.config.normalize:
-            # # 按窗口的标准化
-            # windows = (windows - np.mean(windows)) / (np.std(windows) + 1e-16)
-            # 基线标准化
-            windows = (windows - np.mean(baseline_segment)) / (np.std(baseline_segment) + 1e-16)
+            if baseline_segment is not None and baseline_segment.size > 0:
+                # 基线标准化
+                windows = (windows - np.mean(baseline_segment)) / (np.std(baseline_segment) + 1e-16)
+            else:
+                # 使用片段自身进行标准化
+                windows = (windows - np.mean(segment)) / (np.std(segment) + 1e-16)
         
-        # 8. 确保窗口数量（填充或截断到45窗口）
+        # 9. 确保窗口数量（填充或截断到目标窗口数）
         target_windows = self.config.n_windows
         if windows.shape[0] < target_windows:
             # 填充

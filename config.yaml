@@ -2,9 +2,9 @@
 
 # Data paths
 data:
-  data_root: "E:/output/segment_results"  # Root directory containing NHFE data (NPZ files)
-  labels_path: "E:/output/segment_results/nhfe_channel_label.csv"  # CSV file with ground truth labels
-  pattern: "**/*_filtered_3_45_postICA_eye_BEI.npz"  # Glob pattern to find NPZ files
+  data_root: "E:/output/multi_segment_nhfe"  # Root directory containing NHFE data (NPZ files)
+  labels_path: "E:/output/multi_segment_nhfe/nhfe_channel_label.csv"  # CSV file with ground truth labels
+  pattern: "**/NHFE.npz"  # Glob pattern to find NPZ files
 
 # Feature extraction
 features:
@@ -67,7 +67,7 @@ detection:
   use_raw_nhfe: false  # Set to true to use raw NHFE values
 
   # For normalized mode (use_raw_nhfe=false):
-  threshold_percentile: 99.5  # Percentile for adaptive threshold
+  threshold_percentile: 70  # Percentile for adaptive threshold
   fallback_threshold: 3.0  # Fallback threshold in MAD units
   
   # For raw mode (use_raw_nhfe=true):

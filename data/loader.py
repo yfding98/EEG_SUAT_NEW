@@ -143,7 +143,7 @@ class NHFEDataLoader:
         
         # Get sampling rate and window size from metadata if available
         sfreq = float(
-            data.get('sfreq', [self.sampling_rate])[0]
+            data.get('sfreq', [self.sampling_rate])#[0]
             if hasattr(data.get('sfreq', self.sampling_rate), '__len__')
             else data.get('sfreq', self.sampling_rate)
         )
@@ -302,58 +302,207 @@ class NHFEDataLoader:
                 continue
         
         return patients
-    
+    # def _extract_patient_id(self, path: Path) -> str:
+    #     """Extract patient ID from file path."""
+    #     # Try to extract from path structure
+    #     parts = path.parts
+    #     index = None
+    #     for part in reversed(parts):
+    #         if part != path.name and part != path.stem:
+    #
+    #             # Common patterns: patient_name, P001, etc.
+    #             if len(part) > 0 and not part.startswith('.'):
+    #                 index = parts.index(part)
+    #                 break
+    #
+    #     patient_name = parts[index-1] if index is not None else None
+    #     patient_time = parts[index] if index is not None else None
+    #     patient_id = patient_name + '-' + patient_time
+    #     return patient_id
     def _extract_patient_id(self, path: Path) -> str:
         """Extract patient ID from file path."""
         # Try to extract from path structure
         parts = path.parts
+        index = None
         for part in reversed(parts):
             if part != path.name and part != path.stem:
+
                 # Common patterns: patient_name, P001, etc.
                 if len(part) > 0 and not part.startswith('.'):
-                    return part
-        
-        # Fallback: use stem of filename
-        return path.stem.replace('_BEI', '').replace('_filtered', '')
+                    index = parts.index(part)
+                    break
+
+        patient_name = parts[index-1] if index is not None else None
+        patient_time = parts[index] if index is not None else None
+        patient_id = patient_name + '-' + patient_time
+        return patient_id
+
 
 
 def load_patient_labels(
     labels_path: Union[str, Path],
-    patient_id_col: str = 'patient_id',
-    channel_col: str = 'channel',
-    label_col: str = 'is_onset'
+    relate_path_col: str = 'relate_path',
+    label_col: str = 'label',
+    patient_id_from_path: bool = True
 ) -> Dict[str, List[str]]:
     """
     Load ground truth seizure onset channel labels.
-    
+
+    Supports two CSV formats:
+    1. Format with relate_path and label columns:
+       - relate_path: e.g., "头皮数据-6例\\刘娟\\389to399_401to432"
+       - label: e.g., "T6,Pz" (comma-separated onset channel names)
+       - Patient ID is extracted from relate_path (second path component)
+
+    2. Format with patient_id, channel, is_onset columns:
+       - patient_id: Patient identifier
+       - channel: Channel name
+       - is_onset: Binary label (1 = onset, 0 = non-onset)
+
     Args:
         labels_path: Path to CSV file with labels
-        patient_id_col: Column name for patient ID
-        channel_col: Column name for channel names
-        label_col: Column name for binary label (1 = onset, 0 = non-onset)
-    
+        relate_path_col: Column name for relate_path (for format 1)
+        label_col: Column name for label/onset channels (for format 1) or is_onset (for format 2)
+        patient_id_from_path: If True, extract patient ID from relate_path (format 1)
+
     Returns:
         Dictionary mapping patient_id -> list of onset channel names
     """
     labels_path = Path(labels_path)
     if not labels_path.exists():
         raise FileNotFoundError(f"Labels file not found: {labels_path}")
-    
-    df = pd.read_csv(labels_path)
-    
-    required_cols = [patient_id_col, channel_col, label_col]
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
-    
-    # Filter for onset channels (label == 1)
-    onset_df = df[df[label_col] == 1]
-    
-    # Group by patient
+
+    df = pd.read_csv(labels_path, encoding='utf-8')
+
+    # Check which format we have
+    has_relate_path = relate_path_col in df.columns
+    has_label = label_col in df.columns
+    has_patient_id = 'patient_id' in df.columns
+    has_channel = 'channel' in df.columns
+    has_is_onset = 'is_onset' in df.columns
+
     labels = {}
-    for patient_id, group in onset_df.groupby(patient_id_col):
-        onset_channels = group[channel_col].tolist()
-        labels[str(patient_id)] = onset_channels
+
+    if has_relate_path and has_label:
+        # Format 1: relate_path and label columns
+        for _, row in df.iterrows():
+            relate_path = str(row[relate_path_col])
+            label_str = str(row[label_col]) if pd.notna(row[label_col]) else ""
+
+            # Extract patient ID from relate_path
+            # Format: "头皮数据-6例\刘娟\389to399_401to432"
+            # Patient ID format: "患者名-文件名" = "刘娟-389to399_401to432"
+            # path_parts[0] = "头皮数据-6例" (first level)
+            # path_parts[1] = "刘娟" (second level = patient name)
+            # path_parts[2] = "389to399_401to432" (third level = file name)
+            path_parts = relate_path.replace('\\', '/').split('/')
+            if len(path_parts) >= 3:
+                # Combine: "患者名-文件名"
+                patient_name = path_parts[1]  # Second-level directory = patient name
+                file_name = Path(path_parts[2]).stem  # Third-level = file name (without extension)
+                patient_id = f"{patient_name}-{file_name}"
+            elif len(path_parts) >= 2:
+                # Fallback: if only 2 parts, use "患者名-文件名" where filename is from last part
+                patient_name = path_parts[1]
+                file_name = Path(path_parts[-1]).stem if len(path_parts) > 1 else Path(relate_path).stem
+                patient_id = f"{patient_name}-{file_name}"
+            else:
+                # Fallback: use last component without extension
+                patient_id = Path(relate_path).stem
+
+            # Parse comma-separated channel names
+            if label_str and label_str.strip():
+                # Split by comma and strip whitespace
+                onset_channels = [ch.strip() for ch in label_str.split(',') if ch.strip()]
+            else:
+                onset_channels = []
+
+            # Add to labels (handle multiple rows per patient)
+            if patient_id not in labels:
+                labels[patient_id] = []
+            labels[patient_id].extend(onset_channels)
+
+        # Remove duplicates while preserving order
+        for patient_id in labels:
+            # Remove duplicates
+            seen = set()
+            unique_channels = []
+            for ch in labels[patient_id]:
+                if ch not in seen:
+                    seen.add(ch)
+                    unique_channels.append(ch)
+            labels[patient_id] = unique_channels
+
+    elif has_patient_id and has_channel and has_is_onset:
+        # Format 2: patient_id, channel, is_onset columns
+        onset_df = df[df[label_col] == 1]
+
+        # Group by patient
+        for patient_id, group in onset_df.groupby('patient_id'):
+            onset_channels = group['channel'].tolist()
+            labels[str(patient_id)] = onset_channels
+
+    else:
+        # Try to auto-detect format
+        if has_relate_path:
+            # Assume format 1 but label column might have different name
+            possible_label_cols = ['label', 'labels', 'onset_channels', 'channels']
+            found_label_col = None
+            for col in possible_label_cols:
+                if col in df.columns:
+                    found_label_col = col
+                    break
+
+            if found_label_col:
+                # Use found label column
+                for _, row in df.iterrows():
+                    relate_path = str(row[relate_path_col])
+                    label_str = str(row[found_label_col]) if pd.notna(row[found_label_col]) else ""
+
+                    # Extract patient ID from relate_path
+                    # Format: "头皮数据-6例\刘娟\389to399_401to432" -> patient_id = "刘娟-389to399_401to432"
+                    path_parts = relate_path.replace('\\', '/').split('/')
+                    if len(path_parts) >= 3:
+                        patient_name = path_parts[1]  # Second-level directory = patient name
+                        file_name = Path(path_parts[2]).stem  # Third-level = file name
+                        patient_id = f"{patient_name}-{file_name}"
+                    elif len(path_parts) >= 2:
+                        patient_name = path_parts[1]
+                        file_name = Path(path_parts[-1]).stem if len(path_parts) > 1 else Path(relate_path).stem
+                        patient_id = f"{patient_name}-{file_name}"
+                    else:
+                        patient_id = Path(relate_path).stem
+
+                    if label_str and label_str.strip():
+                        onset_channels = [ch.strip() for ch in label_str.split(',') if ch.strip()]
+                    else:
+                        onset_channels = []
+
+                    if patient_id not in labels:
+                        labels[patient_id] = []
+                    labels[patient_id].extend(onset_channels)
+
+                # Remove duplicates
+                for patient_id in labels:
+                    seen = set()
+                    unique_channels = []
+                    for ch in labels[patient_id]:
+                        if ch not in seen:
+                            seen.add(ch)
+                            unique_channels.append(ch)
+                    labels[patient_id] = unique_channels
+            else:
+                raise ValueError(
+                    f"Could not find label column. Expected one of: {possible_label_cols}\n"
+                    f"Found columns: {list(df.columns)}"
+                )
+        else:
+            raise ValueError(
+                f"Unsupported CSV format. Expected either:\n"
+                f"  Format 1: 'relate_path' and 'label' columns\n"
+                f"  Format 2: 'patient_id', 'channel', and 'is_onset' columns\n"
+                f"Found columns: {list(df.columns)}"
+            )
     
     return labels
 

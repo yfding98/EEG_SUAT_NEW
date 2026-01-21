@@ -1,12 +1,12 @@
 """
 脑区映射脚本
-根据19通道脑区映射规则自动补充converted_manifest.csv文件中的region字段
+根据21通道（19标准 + 2蝶骨）脑区映射规则自动补充converted_manifest.csv文件中的region字段
 
-19通道脑区映射规则:
-BRAIN_REGIONS_19 = { 
+21通道脑区映射规则:
+BRAIN_REGIONS_21 = { 
     'frontal':    ['Fp1', 'Fp2', 'F3', 'F4', 'F7', 'F8', 'Fz'],
     'central':    ['C3', 'C4', 'Cz'], 
-    'temporal':   ['T3', 'T4', 'T5', 'T6'],  # 或 T7/T8/P7/P8
+    'temporal':   ['T3', 'T4', 'T5', 'T6', 'Sph-L', 'Sph-R'],  # 或 T7/T8/P7/P8，含蝶骨电极
     'parietal':   ['P3', 'P4', 'Pz'],
     'occipital':  ['O1', 'O2']
 }
@@ -16,7 +16,8 @@ DEEPSOZ_REGION_MAP = {
         'Fp1', 'Fp2',
         'F3', 'F4', 'F7', 'F8', 'Fz',
         'C3', 'C4', 'Cz',
-        'T3', 'T4'   # T7, T8
+        'T3', 'T4',   # T7, T8
+        'Sph-L', 'Sph-R'  # 蝶骨电极，靠近前颞叶
     ],
     'P': [
         'T5', 'T6',  # P7, P8
@@ -25,6 +26,10 @@ DEEPSOZ_REGION_MAP = {
     ]
 }
 
+蝶骨电极说明:
+- Sph-L (Sphenoidal Left): 左侧蝶骨电极，靠近前颞叶内侧
+- Sph-R (Sphenoidal Right): 右侧蝶骨电极，靠近前颞叶内侧
+- 由于其解剖位置接近前颞叶，归类到 temporal 脑区和 A (Anterior) 区域
 
 """
 
@@ -34,25 +39,27 @@ import os
 import argparse
 
 
-# 19通道脑区映射定义（用于onset_zone字段）
-BRAIN_REGIONS_19 = {
+# 21通道脑区映射定义（用于onset_zone字段）
+# 标准19通道 + 2蝶骨电极 (sph-l, sph-r)
+BRAIN_REGIONS_21 = {
     'frontal': ['fp1', 'fp2', 'f3', 'f4', 'f7', 'f8', 'fz'],
     'central': ['c3', 'c4', 'cz'],
-    'temporal': ['t3', 't4', 't5', 't6', 't7', 't8', 'p7', 'p8'],  # 包含替代命名
+    'temporal': ['t3', 't4', 't5', 't6', 't7', 't8', 'p7', 'p8', 'sph-l', 'sph-r'],  # 包含替代命名和蝶骨电极
     'parietal': ['p3', 'p4', 'pz'],
     'occipital': ['o1', 'o2']
 }
 
 # DeepSOZ脑区映射（用于region字段，与DeepSOZ保持一致）
 # A = Anterior（前部）, P = Posterior（后部）
+# 蝶骨电极靠近前颞叶，归入A区
 DEEPSOZ_REGION_MAP = {
-    'A': ['fp1', 'fp2', 'f3', 'f4', 'f7', 'f8', 'fz', 'c3', 'c4', 'cz', 't3', 't4', 't7', 't8'],
+    'A': ['fp1', 'fp2', 'f3', 'f4', 'f7', 'f8', 'fz', 'c3', 'c4', 'cz', 't3', 't4', 't7', 't8', 'sph-l', 'sph-r'],
     'P': ['t5', 't6', 'p7', 'p8', 'p3', 'p4', 'pz', 'o1', 'o2']
 }
 
 # 反向映射：通道名 -> 脑区（用于onset_zone）
 CHANNEL_TO_REGION = {}
-for region, channels in BRAIN_REGIONS_19.items():
+for region, channels in BRAIN_REGIONS_21.items():
     for channel in channels:
         CHANNEL_TO_REGION[channel.lower()] = region
 
@@ -180,13 +187,15 @@ def process_manifest(input_csv, output_csv=None):
     print(f"正在读取文件: {input_csv}")
     df = pd.read_csv(input_csv)
     
-    # 确定通道列（19通道标准）
+    # 确定通道列（21通道：19标准 + 2蝶骨）
     standard_channels = ['fp1', 'f7', 't3', 't5', 'o1', 'f3', 'c3', 'p3', 
                         'fz', 'cz', 'pz', 'fp2', 'f8', 't4', 't6', 'o2', 
                         'f4', 'c4', 'p4']
+    extra_channels = ['sph-l', 'sph-r']  # 蝶骨电极
+    all_standard_channels = standard_channels + extra_channels
     
     # 找到实际存在的通道列
-    existing_channels = [ch for ch in standard_channels if ch in df.columns]
+    existing_channels = [ch for ch in all_standard_channels if ch in df.columns]
     print(f"找到 {len(existing_channels)} 个通道列: {existing_channels}")
     
     # 为每行计算region和onset_zone
@@ -237,8 +246,10 @@ def analyze_channel_distribution(df):
     standard_channels = ['fp1', 'f7', 't3', 't5', 'o1', 'f3', 'c3', 'p3', 
                         'fz', 'cz', 'pz', 'fp2', 'f8', 't4', 't6', 'o2', 
                         'f4', 'c4', 'p4']
+    external_channels = ['sph-l', 'sph-r']
+    all_channels = standard_channels + external_channels
     
-    for channel in standard_channels:
+    for channel in all_channels:
         if channel in df.columns:
             try:
                 count = df[channel].astype(int).sum()

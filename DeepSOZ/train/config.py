@@ -68,7 +68,7 @@ class DataConfig:
     noise_sigma: float = 0.2
     
     # 双极导联配置
-    use_bipolar: bool = False  # 是否使用TCP双极导联
+    use_bipolar: bool = True  # 是否使用TCP双极导联
     bipolar_pairs: List[Tuple[str, str]] = field(default_factory=lambda: [
         # 左颞链
         ('FP1', 'F7'), ('F7', 'T3'), ('T3', 'T5'), ('T5', 'O1'),

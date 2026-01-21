@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-onset_zone 脑区级别分类训练脚本
+EEGNet onset_zone 脑区级别分类训练脚本
 
-训练STGNN模型进行脑区级别的SOZ定位（5类多标签分类）：
+使用经典EEGNet模型进行脑区级别的SOZ定位（5类多标签分类）：
 - frontal
 - temporal  
 - central
@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import get_config, Config
 from dataset import PrivateEEGDataset, create_cross_validation_splits, create_dataloader
-from losses import OnsetZoneLoss, get_loss_function
-from model_wrapper import create_model
+from losses import OnsetZoneLoss
+from eegnet_model import EEGNetOnsetZone, create_eegnet_model
 from trainer import Trainer, create_optimizer, create_scheduler, set_seed, get_device, count_parameters
 
 import logging
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='onset_zone脑区级别分类训练')
+    parser = argparse.ArgumentParser(description='EEGNet onset_zone脑区级别分类训练')
     
     # 数据
     parser.add_argument('--manifest', type=str, default=None,
@@ -44,20 +44,27 @@ def parse_args():
     parser.add_argument('--data-roots', type=str, nargs='+', default=None,
                         help='EDF数据根目录列表')
     
-    # 模型
-    parser.add_argument('--temporal-hidden-dim', type=int, default=32,
-                        help='时间特征隐藏维度')
-    parser.add_argument('--graph-hidden-dim', type=int, default=32,
-                        help='图特征隐藏维度')
-    parser.add_argument('--dropout', type=float, default=0.6,
+    # EEGNet模型参数
+    parser.add_argument('--F1', type=int, default=8,
+                        help='时间卷积滤波器数量')
+    parser.add_argument('--D', type=int, default=2,
+                        help='深度乘数')
+    parser.add_argument('--F2', type=int, default=16,
+                        help='分离卷积滤波器数量')
+    parser.add_argument('--kernel-length', type=int, default=64,
+                        help='时间卷积核长度')
+    parser.add_argument('--dropout', type=float, default=0.5,
                         help='Dropout率')
+    parser.add_argument('--temporal-agg', type=str, default='attention',
+                        choices=['mean', 'max', 'attention'],
+                        help='时间窗口聚合方式')
     
     # 训练
     parser.add_argument('--epochs', type=int, default=100,
                         help='训练轮数')
-    parser.add_argument('--batch-size', type=int, default=4,
+    parser.add_argument('--batch-size', type=int, default=8,
                         help='批次大小')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--lr', type=float, default=1e-3,
                         help='学习率')
     parser.add_argument('--weight-decay', type=float, default=1e-4,
                         help='权重衰减')
@@ -88,8 +95,6 @@ def parse_args():
                         help='数据加载线程数')
     parser.add_argument('--experiment-name', type=str, default=None,
                         help='实验名称')
-    parser.add_argument('--visualize', action='store_true',
-                        help='训练后生成样本级别可视化报告')
     parser.add_argument('--bipolar', action='store_true',
                         help='使用TCP双极导联(通道数从19变为18)')
     
@@ -117,7 +122,7 @@ def train_fold(
         训练结果
     """
     logger.info(f"\n{'='*60}")
-    logger.info(f"开始训练 Fold {fold}")
+    logger.info(f"开始训练 Fold {fold} (EEGNet)")
     logger.info(f"训练患者: {len(train_ids)}, 验证患者: {len(val_ids)}")
     logger.info(f"{'='*60}")
     
@@ -155,20 +160,23 @@ def train_fold(
         num_workers=args.num_workers
     )
     
-    # 创建模型
+    # 创建EEGNet模型
     model_config = {
         'n_channels': config.model.n_channels,
-        'n_bands': config.model.n_bands,
-        'time_steps': config.model.time_steps,
+        'n_samples': config.model.time_steps,
         'n_windows': config.data.n_windows,
-        'temporal_hidden_dim': args.temporal_hidden_dim,
-        'graph_hidden_dim': args.graph_hidden_dim,
-        'dropout': args.dropout
+        'n_classes': 5,  # onset_zone 5个脑区
+        'dropout': args.dropout,
+        'F1': args.F1,
+        'D': args.D,
+        'F2': args.F2,
+        'kernel_length': args.kernel_length,
+        'temporal_aggregation': args.temporal_agg
     }
-    model = create_model('onset_zone', model_config)
+    model = create_eegnet_model('onset_zone', model_config)
     
     total_params, trainable_params = count_parameters(model)
-    logger.info(f"模型参数: {total_params:,} 总计, {trainable_params:,} 可训练")
+    logger.info(f"EEGNet模型参数: {total_params:,} 总计, {trainable_params:,} 可训练")
     
     # 创建损失函数
     criterion = OnsetZoneLoss(
@@ -192,7 +200,7 @@ def train_fold(
     )
     
     # 实验名称
-    experiment_name = args.experiment_name or f'onset_zone_fold{fold}'
+    experiment_name = args.experiment_name or f'eegnet_onset_zone_fold{fold}'
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     experiment_name = f'{experiment_name}_{timestamp}'
     
@@ -208,8 +216,8 @@ def train_fold(
         task_type='multilabel',
         use_amp=True,
         grad_clip_norm=1.0,
-        checkpoint_dir=str(Path(config.training.checkpoint_dir) / 'onset_zone'),
-        log_dir=str(Path(config.training.log_dir) / 'onset_zone'),
+        checkpoint_dir=str(Path(config.training.checkpoint_dir) / 'eegnet_onset_zone'),
+        log_dir=str(Path(config.training.log_dir) / 'eegnet_onset_zone'),
         experiment_name=experiment_name
     )
     
@@ -271,6 +279,13 @@ def main():
     
     logger.info(f"数据划分完成: {args.n_folds} 折交叉验证")
     
+    # 打印EEGNet模型配置
+    logger.info(f"\nEEGNet配置:")
+    logger.info(f"  F1={args.F1}, D={args.D}, F2={args.F2}")
+    logger.info(f"  kernel_length={args.kernel_length}")
+    logger.info(f"  dropout={args.dropout}")
+    logger.info(f"  temporal_aggregation={args.temporal_agg}")
+    
     # 训练
     results = []
     
@@ -288,44 +303,13 @@ def main():
     
     # 汇总结果
     logger.info("\n" + "="*60)
-    logger.info("训练完成 - onset_zone 脑区级别分类")
+    logger.info("训练完成 - EEGNet onset_zone 脑区级别分类")
     logger.info("="*60)
     
     best_metrics = [r['best_metric'] for r in results]
     logger.info(f"各Fold最佳F1-Macro: {best_metrics}")
     logger.info(f"平均F1-Macro: {sum(best_metrics)/len(best_metrics):.4f}")
     logger.info(f"标准差: {(sum((x-sum(best_metrics)/len(best_metrics))**2 for x in best_metrics)/len(best_metrics))**0.5:.4f}")
-    
-    # 生成样本级别可视化报告
-    if args.visualize:
-        logger.info("\n生成样本级别可视化报告...")
-        try:
-            from evaluate_samples import run_evaluation
-            
-            for fold in folds_to_train:
-                checkpoint_dir = Path(config.training.checkpoint_dir) / 'onset_zone'
-                best_checkpoints = list(checkpoint_dir.glob(f'*fold{fold}*best*.pth'))
-                if best_checkpoints:
-                    checkpoint_path = str(best_checkpoints[0])
-                    output_dir = str(checkpoint_dir / f'evaluation_fold{fold}')
-                    
-                    run_evaluation(
-                        checkpoint_path=checkpoint_path,
-                        task_type='onset_zone',
-                        output_dir=output_dir,
-                        manifest_path=config.data.manifest_path,
-                        data_roots=config.data.edf_data_roots,
-                        fold=fold,
-                        n_folds=args.n_folds,
-                        batch_size=args.batch_size,
-                        device=args.device,
-                        seed=args.seed
-                    )
-                    logger.info(f"Fold {fold} 可视化报告已生成: {output_dir}")
-        except Exception as e:
-            logger.error(f"生成可视化报告失败: {e}")
-            import traceback
-            traceback.print_exc()
 
 
 if __name__ == '__main__':

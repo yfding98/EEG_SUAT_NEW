@@ -22,7 +22,7 @@ import warnings
 warnings.filterwarnings('ignore')
 mne.set_log_level('ERROR')
 
-from STGNN import STGNN_SOZ_Locator
+from stgnn_model import STGNN_SOZ_Locator
 
 
 class STGNNDataset(Dataset):
@@ -226,15 +226,9 @@ class STGNNDataset(Dataset):
             if not npz_path.exists():
                 print(f"Warning: NPZ not found: {npz_path}")
                 continue
-            # 去npz_path下找 *filtered_3_45_postICA_eye_BEI.npz的文件并加载
-            npz_pattern = "*filtered_3_45_postICA_eye_BEI.npz"
-            npz_files = list(npz_path.glob(npz_pattern))
-            bei_npz_path = npz_files[0] if len(npz_files) > 0 else None
-            if bei_npz_path is None or not bei_npz_path.exists():
-                print(f"  ⚠️  BEI.npz file not found: {bei_npz_path}")
-                continue
+
             try:
-                data = np.load(bei_npz_path, allow_pickle=True)
+                data = np.load(npz_path, allow_pickle=True)
                 if 'NHFE' not in data:
                     print(f"Warning: No NHFE in {npz_path}")
                     continue
@@ -332,24 +326,27 @@ class STGNNDataset(Dataset):
                     continue
                 nhfe_all = nhfe_all[reorder_idx, :, :]
             
-            # Parse SOZ channels
+            # Parse SOZ channels (multi-label support)
             soz_channels = self._parse_soz_channels(label_str)
             if not soz_channels:
                 print(f"Warning: No SOZ channels for {relate_path}")
                 continue
             
-            # Create label (index of first SOZ channel)
+            # Create multi-label vector: (n_channels,) with 1.0 for SOZ channels, 0.0 for others
             soz_indices = [self.channel_names.index(ch) for ch in soz_channels if ch in self.channel_names]
             if not soz_indices:
                 print(f"Warning: SOZ channels not found in channel list for {relate_path}")
                 continue
             
-            # Use first SOZ channel as label (chronological order)
-            label = min(soz_indices)
+            # Multi-hot encoding: binary vector indicating which channels are SOZ
+            multi_label = np.zeros(len(self.channel_names), dtype=np.float32)
+            for idx in soz_indices:
+                multi_label[idx] = 1.0
             
             self.samples.append({
                 'nhfe': nhfe_all.astype(np.float32),  # (n_channels, n_bands, time_steps)
-                'label': label,
+                'label': multi_label,  # Multi-label: (n_channels,) binary vector
+                'soz_indices': soz_indices,  # List of SOZ channel indices for evaluation
                 'patient_id': str(relate_path)
             })
         
@@ -379,25 +376,58 @@ class STGNNDataset(Dataset):
         
         return {
             'nhfe': nhfe,
-            'label': torch.tensor(sample['label'], dtype=torch.long),
+            'label': torch.from_numpy(sample['label']),  # Multi-label: (n_channels,) binary vector
+            'soz_indices': sample['soz_indices'],  # List of SOZ indices for evaluation
             'patient_id': sample['patient_id']
         }
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
-    """Train for one epoch"""
+def train_epoch(model, dataloader, criterion, optimizer, device, use_augmentation=True):
+    """
+    Train for one epoch with data augmentation (multi-label)
+    
+    Args:
+        model: Model to train
+        dataloader: Data loader
+        criterion: Loss function (BCEWithLogitsLoss for multi-label)
+        optimizer: Optimizer
+        device: Device
+        use_augmentation: If True, apply data augmentation (noise injection and channel masking)
+    """
     model.train()
     total_loss = 0.0
-    correct = 0
     total = 0
     
     for batch in tqdm(dataloader, desc='Training'):
         nhfe = batch['nhfe'].to(device)  # (B, N_Ch, N_Bands, Time_Steps)
-        labels = batch['label'].to(device)  # (B,)
+        labels = batch['label'].to(device)  # (B, N_Ch) - multi-label binary vector
+        
+        # Data Augmentation (only during training)
+        if use_augmentation:
+            # 1. Noise Injection: Add Gaussian noise
+            noise = torch.randn_like(nhfe) * 0.05
+            nhfe = nhfe + noise
+            
+            # 2. Channel Masking: Randomly mask 1-2 non-seizing channels
+            # Get SOZ channels from labels
+            batch_size, n_channels = nhfe.shape[0], nhfe.shape[1]
+            for b in range(batch_size):
+                soz_channels = torch.where(labels[b] > 0.5)[0].cpu().tolist()
+                # Get non-seizing channels
+                non_seizing = [i for i in range(n_channels) if i not in soz_channels]
+                if len(non_seizing) > 0:
+                    # Randomly mask 1-2 channels
+                    n_mask = torch.randint(1, min(3, len(non_seizing) + 1), (1,)).item()
+                    mask_channels = torch.tensor(
+                        np.random.choice(non_seizing, size=n_mask, replace=False),
+                        device=device
+                    )
+                    # Set masked channels to zero
+                    nhfe[b, mask_channels, :, :] = 0.0
         
         optimizer.zero_grad()
         logits = model(nhfe)  # (B, N_Ch)
-        loss = criterion(logits, labels)
+        loss = criterion(logits, labels)  # Multi-label BCE loss
         loss.backward()
         
         # Gradient clipping to prevent exploding gradients
@@ -406,34 +436,241 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         optimizer.step()
         
         total_loss += loss.item()
-        pred = logits.argmax(dim=1)
-        correct += (pred == labels).sum().item()
         total += labels.size(0)
     
-    return total_loss / len(dataloader), correct / total
+    # Calculate approximate accuracy (using IOU)
+    # This is just for monitoring, not used for optimization
+    avg_iou = 0.0
+    with torch.no_grad():
+        for batch in dataloader:
+            nhfe = batch['nhfe'].to(device)
+            labels = batch['label'].to(device)
+            logits = model(nhfe)
+            
+            # Apply sigmoid and threshold
+            probs = torch.sigmoid(logits)
+            pred_mask = (probs > 0.5).float()
+            
+            # Calculate IOU for this batch
+            for b in range(labels.size(0)):
+                true_indices = torch.where(labels[b] > 0.5)[0].cpu().tolist()
+                pred_indices = torch.where(pred_mask[b] > 0.5)[0].cpu().tolist()
+                if true_indices or pred_indices:
+                    intersection = len(set(true_indices) & set(pred_indices))
+                    union = len(set(true_indices) | set(pred_indices))
+                    if union > 0:
+                        iou = intersection / union
+                        avg_iou += iou
+    
+    avg_iou = avg_iou / total if total > 0 else 0.0
+    
+    return total_loss / len(dataloader), avg_iou
 
 
-def validate(model, dataloader, criterion, device):
-    """Validate model"""
+def validate(
+    model, 
+    dataloader, 
+    criterion, 
+    device, 
+    return_topk=False, 
+    print_details=False, 
+    channel_names=None,
+    top_k: int = 5,
+    return_f1: bool = False
+):
+    """
+    Validate model with Top-K ranking metrics (Multi-Label Ranking)
+    
+    Args:
+        model: Model to validate
+        dataloader: Data loader
+        criterion: Loss function (BCEWithLogitsLoss)
+        device: Device
+        return_topk: If True, return hit rates and recall@K
+        print_details: If True, print patient info and predictions
+        channel_names: List of channel names for printing
+        top_k: Top-K value for ranking (default: 5)
+    
+    Returns:
+        If return_topk=False: (loss,)
+        If return_topk=True: (loss, hit_rate_3, hit_rate_5, recall_3, recall_5)
+    """
     model.eval()
     total_loss = 0.0
-    correct = 0
+    
+    # For Top-K metrics
+    hits_at_3 = 0  # Count of samples where Top-3 contains at least one true SOZ
+    hits_at_5 = 0  # Count of samples where Top-5 contains at least one true SOZ
+    recall_at_3_sum = 0.0  # Sum of recall@3 (found true channels / total true channels)
+    recall_at_5_sum = 0.0  # Sum of recall@5
+    
     total = 0
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc='Validating'):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc='Validating')):
             nhfe = batch['nhfe'].to(device)
-            labels = batch['label'].to(device)
+            labels = batch['label'].to(device)  # (B, N_Ch) - multi-label
+            soz_indices_list = batch.get('soz_indices', [])
+            patient_ids = batch.get('patient_id', [f'Sample_{batch_idx}'] * labels.size(0))
             
-            logits = model(nhfe)
+            logits = model(nhfe)  # (B, N_Ch)
             loss = criterion(logits, labels)
             
             total_loss += loss.item()
-            pred = logits.argmax(dim=1)
-            correct += (pred == labels).sum().item()
+            
+            # Get probabilities for display (not used for ranking)
+            probs = torch.sigmoid(logits)  # (B, N_Ch)
+            
+            # Calculate Top-K metrics
+            if return_topk:
+                for i in range(labels.size(0)):
+                    # Get true SOZ indices
+                    true_soz = soz_indices_list[i] if isinstance(soz_indices_list, list) and i < len(soz_indices_list) else torch.where(labels[i] > 0.5)[0].cpu().tolist()
+                    true_soz_set = set(true_soz)
+                    
+                    if not true_soz_set:
+                        continue  # Skip if no true SOZ channels
+                    
+                    # Top-3: select top 3 channels by logits
+                    _, top3_indices = logits[i].topk(k=3, dim=0)
+                    pred_top3 = set(top3_indices.cpu().tolist())
+                    
+                    # Top-5: select top 5 channels by logits
+                    _, top5_indices = logits[i].topk(k=5, dim=0)
+                    pred_top5 = set(top5_indices.cpu().tolist())
+                    
+                    # Hit Rate: at least one true SOZ in Top-K
+                    if true_soz_set & pred_top3:  # Intersection is non-empty
+                        hits_at_3 += 1
+                    
+                    if true_soz_set & pred_top5:  # Intersection is non-empty
+                        hits_at_5 += 1
+                    
+                    # Recall@K: how many true channels found in Top-K
+                    found_at_3 = len(true_soz_set & pred_top3)
+                    found_at_5 = len(true_soz_set & pred_top5)
+                    recall_at_3_sum += found_at_3 / len(true_soz_set) if len(true_soz_set) > 0 else 0.0
+                    recall_at_5_sum += found_at_5 / len(true_soz_set) if len(true_soz_set) > 0 else 0.0
+            
+            # Print details for each sample
+            if print_details:
+                for i in range(labels.size(0)):
+                    # Get true SOZ channels
+                    true_soz = soz_indices_list[i] if isinstance(soz_indices_list, list) and i < len(soz_indices_list) else torch.where(labels[i] > 0.5)[0].cpu().tolist()
+                    true_soz_set = set(true_soz)
+                    
+                    # Get Top-K predictions
+                    _, top3_indices = logits[i].topk(k=3, dim=0)
+                    top3_list = top3_indices.cpu().tolist()
+                    top3_probs = probs[i][top3_indices].cpu().tolist()
+                    
+                    _, top5_indices = logits[i].topk(k=5, dim=0)
+                    top5_list = top5_indices.cpu().tolist()
+                    top5_probs = probs[i][top5_indices].cpu().tolist()
+                    
+                    # Get channel names
+                    if channel_names:
+                        true_ch_names = [channel_names[idx] if idx < len(channel_names) else f'Ch{idx}' for idx in true_soz]
+                    else:
+                        true_ch_names = [f'Ch{idx}' for idx in true_soz]
+                    
+                    # Check hits
+                    hit_at_3 = bool(true_soz_set & set(top3_list))
+                    hit_at_5 = bool(true_soz_set & set(top5_list))
+                    
+                    # Calculate recall@K
+                    found_at_3 = len(true_soz_set & set(top3_list))
+                    found_at_5 = len(true_soz_set & set(top5_list))
+                    recall_3 = found_at_3 / len(true_soz_set) if len(true_soz_set) > 0 else 0.0
+                    recall_5 = found_at_5 / len(true_soz_set) if len(true_soz_set) > 0 else 0.0
+                    
+                    patient_id = patient_ids[i] if isinstance(patient_ids, list) else patient_ids
+                    print(f"\n  Patient: {patient_id}")
+                    print(f"    Target: [{', '.join(true_ch_names) if true_ch_names else 'None'}]")
+                    
+                    # Format Top-3 predictions
+                    top3_ch_names = []
+                    for idx, prob in zip(top3_list, top3_probs):
+                        ch_name = channel_names[idx] if channel_names and idx < len(channel_names) else f'Ch{idx}'
+                        is_true = " [GT]" if idx in true_soz_set else ""
+                        top3_ch_names.append(f"{ch_name} ({prob:.3f}){is_true}")
+                    print(f"    Top-3 Preds: [{', '.join(top3_ch_names)}]")
+                    print(f"    -> Hit@3: {'YES' if hit_at_3 else 'NO'}, Recall@3: {recall_3:.3f} ({found_at_3}/{len(true_soz_set)})")
+                    
+                    # Format Top-5 predictions
+                    top5_ch_names = []
+                    for idx, prob in zip(top5_list, top5_probs):
+                        ch_name = channel_names[idx] if channel_names and idx < len(channel_names) else f'Ch{idx}'
+                        is_true = " [GT]" if idx in true_soz_set else ""
+                        top5_ch_names.append(f"{ch_name} ({prob:.3f}){is_true}")
+                    print(f"    Top-5 Preds: [{', '.join(top5_ch_names)}]")
+                    print(f"    -> Hit@5: {'YES' if hit_at_5 else 'NO'}, Recall@5: {recall_5:.3f} ({found_at_5}/{len(true_soz_set)})")
+            
             total += labels.size(0)
     
-    return total_loss / len(dataloader), correct / total
+    avg_loss = total_loss / len(dataloader)
+    
+    # Calculate F1_score if requested
+    f1_macro = None
+    f1_micro = None
+    if return_f1 or return_topk:
+        # Collect all predictions and labels for F1 calculation
+        all_pred_labels = []
+        all_true_labels = []
+        
+        # Re-run through dataloader to collect predictions for F1 calculation
+        model.eval()
+        with torch.no_grad():
+            for batch in dataloader:
+                nhfe = batch['nhfe'].to(device)
+                labels = batch['label'].to(device)
+                logits = model(nhfe)
+                
+                # Apply sigmoid and threshold for binary predictions
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).float()
+                
+                all_pred_labels.append(preds.cpu().numpy())
+                all_true_labels.append(labels.cpu().numpy())
+        
+        if len(all_pred_labels) > 0:
+            from sklearn.metrics import f1_score
+            all_preds = np.concatenate(all_pred_labels, axis=0)
+            all_labels = np.concatenate(all_true_labels, axis=0)
+            f1_macro = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+            f1_micro = f1_score(all_labels, all_preds, average='micro', zero_division=0)
+    
+    if return_topk:
+        hit_rate_3 = hits_at_3 / total if total > 0 else 0.0
+        hit_rate_5 = hits_at_5 / total if total > 0 else 0.0
+        recall_3 = recall_at_3_sum / total if total > 0 else 0.0
+        recall_5 = recall_at_5_sum / total if total > 0 else 0.0
+        if return_f1:
+            return avg_loss, hit_rate_3, hit_rate_5, recall_3, recall_5, f1_macro, f1_micro
+        else:
+            return avg_loss, hit_rate_3, hit_rate_5, recall_3, recall_5
+    else:
+        if return_f1:
+            return avg_loss, f1_macro, f1_micro
+        else:
+            return (avg_loss,)
+
+
+def _calculate_iou(true_indices: List[int], pred_indices: List[int]) -> float:
+    """Calculate Intersection over Union for channel sets"""
+    if not true_indices or not pred_indices:
+        return 0.0
+    
+    true_set = set(true_indices)
+    pred_set = set(pred_indices)
+    
+    intersection = len(true_set & pred_set)
+    union = len(true_set | pred_set)
+    
+    if union == 0:
+        return 0.0
+    
+    return intersection / union
 
 
 def train_stgnn(
@@ -473,7 +710,7 @@ def train_stgnn(
     epochs = config.get('training', {}).get('epochs', 50)
     lr = config.get('training', {}).get('learning_rate', 0.001)  # Increased to 1e-3
     device = torch.device(config.get('training', {}).get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
-    weight_decay = config.get('training', {}).get('weight_decay', 1e-4)  # L2 regularization
+    # Note: weight_decay is now hardcoded to 1e-2 in optimizer for stronger regularization
     
     # Model parameters
     n_channels = 21
@@ -518,32 +755,59 @@ def train_stgnn(
                 return self.base_dataset[self.base_idx]
         
         debug_dataset = RepeatDataset(dataset, repeat=10)
-        train_loader = DataLoader(debug_dataset, batch_size=10, shuffle=False, num_workers=0)
+        
+        # Custom collate function for debug mode
+        def debug_collate_fn(batch):
+            nhfe = torch.stack([item['nhfe'] for item in batch])
+            labels = torch.stack([item['label'] for item in batch])
+            soz_indices = [item['soz_indices'] for item in batch]
+            patient_ids = [item['patient_id'] for item in batch]
+            return {
+                'nhfe': nhfe,
+                'label': labels,
+                'soz_indices': soz_indices,
+                'patient_id': patient_ids
+            }
+        
+        train_loader = DataLoader(debug_dataset, batch_size=10, shuffle=False, num_workers=0, collate_fn=debug_collate_fn)
         val_loader = train_loader  # Same for validation
         
-        # Create model
+        # Create model with reduced capacity and stronger regularization
         print("\n[2/4] Creating model...")
         model = STGNN_SOZ_Locator(
             n_channels=n_channels,
             n_bands=n_bands,
-            time_steps=time_steps
+            time_steps=time_steps,
+            temporal_hidden_dim=32,  # Reduced from default 128
+            graph_hidden_dim=32,  # Reduced from default 128
+            dropout=0.6  # Increased from default 0.2
         ).to(device)
         
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         
-        # Loss and optimizer with weight decay
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        # Loss and optimizer with stronger weight decay
+        # Use BCEWithLogitsLoss for multi-label classification
+        pos_weight = torch.tensor([10.0] * n_channels, device=device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-2)  # Increased to 1e-2
         
         # Training loop for debug
         print("\n[3/4] Training (DEBUG_OVERFIT mode)...")
         print("Expected: Loss should drop to ~0.00 within 50 epochs if model works correctly")
         
         for epoch in range(epochs):
-            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-            val_loss, val_acc = validate(model, val_loader, criterion, device)
+            train_loss, train_iou = train_epoch(
+                model, train_loader, criterion, optimizer, device,
+                use_augmentation=True  # Enable data augmentation
+            )
+            val_loss, val_hit_rate_3, val_hit_rate_5, val_recall_3, val_recall_5, val_f1_macro, val_f1_micro = validate(
+                model, val_loader, criterion, device,
+                return_topk=True,
+                return_f1=True,
+                channel_names=dataset.channel_names
+            )
             
-            print(f"Epoch {epoch+1}/{epochs}: Loss={train_loss:.4f}, Acc={train_acc:.4f}")
+            print(f"Epoch {epoch+1}/{epochs}: Loss={train_loss:.4f}, IOU={train_iou:.4f}, Hit@5={val_hit_rate_5:.4f}, Recall@5={val_recall_5:.4f}, F1_score(macro)={val_f1_macro:.4f}, F1_score(micro)={val_f1_micro:.4f}")
             
             if train_loss < 0.01:
                 print(f"✓ Model can overfit! Loss dropped to {train_loss:.4f}")
@@ -579,21 +843,43 @@ def train_stgnn(
             train_dataset = Subset(dataset, train_idx)
             test_dataset = Subset(dataset, test_idx)
             
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-            test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+            # Custom collate function to handle soz_indices (list of lists)
+            def collate_fn(batch):
+                nhfe = torch.stack([item['nhfe'] for item in batch])
+                labels = torch.stack([item['label'] for item in batch])
+                soz_indices = [item['soz_indices'] for item in batch]
+                patient_ids = [item['patient_id'] for item in batch]
+                return {
+                    'nhfe': nhfe,
+                    'label': labels,
+                    'soz_indices': soz_indices,
+                    'patient_id': patient_ids
+                }
+            
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
+            test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate_fn)
             
             print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
             
             # Re-initialize model for each fold (CRITICAL!)
+            # Use reduced capacity and stronger regularization to prevent overfitting
             model = STGNN_SOZ_Locator(
                 n_channels=n_channels,
                 n_bands=n_bands,
-                time_steps=time_steps
+                time_steps=time_steps,
+                temporal_hidden_dim=32,  # Reduced from default 128
+                graph_hidden_dim=32,  # Reduced from default 128
+                dropout=0.6  # Increased from default 0.2
             ).to(device)
             
-            # Loss and optimizer with weight decay
-            criterion = nn.CrossEntropyLoss()
-            optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+            # Loss and optimizer with stronger weight decay
+            # Use BCEWithLogitsLoss for multi-label classification
+            # Calculate pos_weight to handle class imbalance
+            # pos_weight = (num_negative / num_positive) for each class
+            # Approximate: if on average 2-3 channels are active out of 21, pos_weight ≈ 21/2.5 ≈ 8.4
+            pos_weight = torch.tensor([10.0] * n_channels, device=device)  # Roughly 21/2.1
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-2)  # Increased to 1e-2
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
             
             # Training loop
@@ -602,7 +888,10 @@ def train_stgnn(
             max_patience = 10
             
             for epoch in range(epochs):
-                train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+                train_loss, train_iou = train_epoch(
+                    model, train_loader, criterion, optimizer, device, 
+                    use_augmentation=True  # Enable data augmentation
+                )
                 
                 # Early stopping
                 if train_loss < best_loss:
@@ -614,34 +903,125 @@ def train_stgnn(
                 scheduler.step(train_loss)
                 
                 if epoch % 10 == 0 or epoch == epochs - 1:
-                    print(f"Epoch {epoch+1}/{epochs}: Loss={train_loss:.4f}, Acc={train_acc:.4f}")
+                    print(f"Epoch {epoch+1}/{epochs}: Loss={train_loss:.4f}, IOU={train_iou:.4f}")
                 
                 if patience_counter >= max_patience:
                     print(f"Early stopping at epoch {epoch+1}")
                     break
             
-            # Evaluate on test sample
-            test_loss, test_acc = validate(model, test_loader, criterion, device)
-            accuracies.append(test_acc)
-            print(f"Fold {fold+1} Test Acc: {test_acc:.4f}")
+            # Evaluate on test sample with Top-K ranking metrics
+            print(f"\n  Evaluating test sample (Fold {fold+1}/{total_samples}):")
+            test_loss, hit_rate_3, hit_rate_5, recall_3, recall_5, test_f1_macro, test_f1_micro = validate(
+                model, test_loader, criterion, device, 
+                return_topk=True,
+                return_f1=True,
+                print_details=True,  # Print patient info and predictions
+                channel_names=dataset.channel_names,  # Pass channel names for printing
+                top_k=5
+            )
+            accuracies.append({
+                'hit_rate_3': hit_rate_3,
+                'hit_rate_5': hit_rate_5,
+                'recall_3': recall_3,
+                'recall_5': recall_5,
+                'f1_score_macro': test_f1_macro,
+                'f1_score_micro': test_f1_micro
+            })
+            print(f"\n  Fold {fold+1} Test Results:")
+            print(f"    Hit Rate @ 3: {hit_rate_3:.4f}, Hit Rate @ 5: {hit_rate_5:.4f}")
+            print(f"    Recall @ 3: {recall_3:.4f}, Recall @ 5: {recall_5:.4f}")
+            print(f"    F1_score (macro): {test_f1_macro:.4f}, F1_score (micro): {test_f1_micro:.4f}")
         
         # Print LOOCV results
         print("\n" + "=" * 80)
-        print("LOOCV Results")
+        print("LOOCV Results (Multi-Label Ranking)")
         print("=" * 80)
-        print(f"Individual accuracies: {accuracies}")
-        print(f"Mean accuracy: {np.mean(accuracies):.4f} ± {np.std(accuracies):.4f}")
-        print(f"Best: {np.max(accuracies):.4f}, Worst: {np.min(accuracies):.4f}")
+        
+        # Extract metrics
+        hit_rate_3_scores = [acc['hit_rate_3'] for acc in accuracies]
+        hit_rate_5_scores = [acc['hit_rate_5'] for acc in accuracies]
+        recall_3_scores = [acc['recall_3'] for acc in accuracies]
+        recall_5_scores = [acc['recall_5'] for acc in accuracies]
+        f1_macro_scores = [acc.get('f1_score_macro', 0.0) for acc in accuracies]
+        f1_micro_scores = [acc.get('f1_score_micro', 0.0) for acc in accuracies]
+        
+        print(f"Hit Rate @ 3 (At least one true SOZ in Top-3):")
+        print(f"  Individual: {[f'{x:.4f}' for x in hit_rate_3_scores]}")
+        print(f"  Mean: {np.mean(hit_rate_3_scores):.4f} ± {np.std(hit_rate_3_scores):.4f}")
+        print(f"  Best: {np.max(hit_rate_3_scores):.4f}, Worst: {np.min(hit_rate_3_scores):.4f}")
+        
+        print(f"\nHit Rate @ 5 (At least one true SOZ in Top-5):")
+        print(f"  Individual: {[f'{x:.4f}' for x in hit_rate_5_scores]}")
+        print(f"  Mean: {np.mean(hit_rate_5_scores):.4f} ± {np.std(hit_rate_5_scores):.4f}")
+        print(f"  Best: {np.max(hit_rate_5_scores):.4f}, Worst: {np.min(hit_rate_5_scores):.4f}")
+        
+        print(f"\nRecall @ 3 (Fraction of true SOZ channels found in Top-3):")
+        print(f"  Individual: {[f'{x:.4f}' for x in recall_3_scores]}")
+        print(f"  Mean: {np.mean(recall_3_scores):.4f} ± {np.std(recall_3_scores):.4f}")
+        print(f"  Best: {np.max(recall_3_scores):.4f}, Worst: {np.min(recall_3_scores):.4f}")
+        
+        print(f"\nRecall @ 5 (Fraction of true SOZ channels found in Top-5):")
+        print(f"  Individual: {[f'{x:.4f}' for x in recall_5_scores]}")
+        print(f"  Mean: {np.mean(recall_5_scores):.4f} ± {np.std(recall_5_scores):.4f}")
+        print(f"  Best: {np.max(recall_5_scores):.4f}, Worst: {np.min(recall_5_scores):.4f}")
+        
+        print(f"\nF1_score (macro):")
+        print(f"  Individual: {[f'{x:.4f}' for x in f1_macro_scores]}")
+        print(f"  Mean: {np.mean(f1_macro_scores):.4f} ± {np.std(f1_macro_scores):.4f}")
+        print(f"  Best: {np.max(f1_macro_scores):.4f}, Worst: {np.min(f1_macro_scores):.4f}")
+        
+        print(f"\nF1_score (micro):")
+        print(f"  Individual: {[f'{x:.4f}' for x in f1_micro_scores]}")
+        print(f"  Mean: {np.mean(f1_micro_scores):.4f} ± {np.std(f1_micro_scores):.4f}")
+        print(f"  Best: {np.max(f1_micro_scores):.4f}, Worst: {np.min(f1_micro_scores):.4f}")
         
         # Save results
         results = {
             'method': 'LOOCV',
             'total_samples': total_samples,
-            'individual_accuracies': accuracies,
-            'mean_accuracy': float(np.mean(accuracies)),
-            'std_accuracy': float(np.std(accuracies)),
-            'best_accuracy': float(np.max(accuracies)),
-            'worst_accuracy': float(np.min(accuracies))
+            'individual_results': accuracies,
+            'hit_rate_3': {
+                'individual': hit_rate_3_scores,
+                'mean': float(np.mean(hit_rate_3_scores)),
+                'std': float(np.std(hit_rate_3_scores)),
+                'best': float(np.max(hit_rate_3_scores)),
+                'worst': float(np.min(hit_rate_3_scores))
+            },
+            'hit_rate_5': {
+                'individual': hit_rate_5_scores,
+                'mean': float(np.mean(hit_rate_5_scores)),
+                'std': float(np.std(hit_rate_5_scores)),
+                'best': float(np.max(hit_rate_5_scores)),
+                'worst': float(np.min(hit_rate_5_scores))
+            },
+            'recall_3': {
+                'individual': recall_3_scores,
+                'mean': float(np.mean(recall_3_scores)),
+                'std': float(np.std(recall_3_scores)),
+                'best': float(np.max(recall_3_scores)),
+                'worst': float(np.min(recall_3_scores))
+            },
+            'recall_5': {
+                'individual': recall_5_scores,
+                'mean': float(np.mean(recall_5_scores)),
+                'std': float(np.std(recall_5_scores)),
+                'best': float(np.max(recall_5_scores)),
+                'worst': float(np.min(recall_5_scores))
+            },
+            'f1_score_macro': {
+                'individual': f1_macro_scores,
+                'mean': float(np.mean(f1_macro_scores)),
+                'std': float(np.std(f1_macro_scores)),
+                'best': float(np.max(f1_macro_scores)),
+                'worst': float(np.min(f1_macro_scores))
+            },
+            'f1_score_micro': {
+                'individual': f1_micro_scores,
+                'mean': float(np.mean(f1_micro_scores)),
+                'std': float(np.std(f1_micro_scores)),
+                'best': float(np.max(f1_micro_scores)),
+                'worst': float(np.min(f1_micro_scores))
+            }
         }
         
         output_path = Path(output_dir)
@@ -671,71 +1051,131 @@ def train_stgnn(
         generator=torch.Generator().manual_seed(42)
     )
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    # Custom collate function to handle soz_indices (list of lists)
+    def collate_fn(batch):
+        nhfe = torch.stack([item['nhfe'] for item in batch])
+        labels = torch.stack([item['label'] for item in batch])
+        soz_indices = [item['soz_indices'] for item in batch]
+        patient_ids = [item['patient_id'] for item in batch]
+        return {
+            'nhfe': nhfe,
+            'label': labels,
+            'soz_indices': soz_indices,
+            'patient_id': patient_ids
+        }
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
     
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
     
-    # Create model
+    # Create model with reduced capacity and stronger regularization
     print("\n[2/4] Creating model...")
     model = STGNN_SOZ_Locator(
         n_channels=n_channels,
         n_bands=n_bands,
-        time_steps=time_steps
+        time_steps=time_steps,
+        temporal_hidden_dim=32,  # Reduced from default 128
+        graph_hidden_dim=32,  # Reduced from default 128
+        dropout=0.6  # Increased from default 0.2
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Loss and optimizer with weight decay
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Loss and optimizer with stronger weight decay
+    # Use BCEWithLogitsLoss for multi-label classification
+    # Calculate pos_weight to handle class imbalance
+    # pos_weight = (num_negative / num_positive) for each class
+    # Approximate: if on average 2-3 channels are active out of 21, pos_weight ≈ 21/2.5 ≈ 8.4
+    pos_weight = torch.tensor([10.0] * n_channels, device=device)  # Roughly 21/2.1
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-2)  # Increased to 1e-2
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     # Training loop
     print("\n[3/4] Training...")
-    best_val_acc = 0.0
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    best_val_f1 = 0.0
+    history = {
+        'train_loss': [], 
+        'train_iou': [], 
+        'val_loss': [], 
+        'val_hit_rate_3': [], 
+        'val_hit_rate_5': [], 
+        'val_recall_3': [], 
+        'val_recall_5': [],
+        'val_f1_score_macro': [],
+        'val_f1_score_micro': []
+    }
     
     for epoch in range(epochs):
         print(f"\nEpoch {epoch+1}/{epochs}")
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
+        train_loss, train_iou = train_epoch(
+            model, train_loader, criterion, optimizer, device, 
+            use_augmentation=True  # Enable data augmentation
+        )
+        val_loss, val_hit_rate_3, val_hit_rate_5, val_recall_3, val_recall_5, val_f1_macro, val_f1_micro = validate(
+            model, val_loader, criterion, device,
+            return_topk=True,
+            return_f1=True,
+            channel_names=dataset.channel_names
+        )
         
         scheduler.step(val_loss)
         
         history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
+        history['train_iou'].append(train_iou)
         history['val_loss'].append(val_loss)
-        history['val_acc'].append(val_acc)
+        history['val_hit_rate_3'].append(val_hit_rate_3)
+        history['val_hit_rate_5'].append(val_hit_rate_5)
+        history['val_recall_3'].append(val_recall_3)
+        history['val_recall_5'].append(val_recall_5)
+        history['val_f1_score_macro'].append(val_f1_macro)
+        history['val_f1_score_micro'].append(val_f1_micro)
         
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"Train Loss: {train_loss:.4f}, Train IOU: {train_iou:.4f}")
+        print(f"Val Loss: {val_loss:.4f}, Hit@3: {val_hit_rate_3:.4f}, Hit@5: {val_hit_rate_5:.4f}, Recall@3: {val_recall_3:.4f}, Recall@5: {val_recall_5:.4f}")
+        print(f"Val F1_score (macro): {val_f1_macro:.4f}, Val F1_score (micro): {val_f1_micro:.4f}")
         
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Save best model (based on Hit Rate @ 5)
+        if val_hit_rate_5 > best_val_f1:  # Reuse variable name for compatibility
+            best_val_f1 = val_hit_rate_5
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'epoch': epoch,
-                'val_acc': val_acc,
+                'val_hit_rate_5': val_hit_rate_5,
+                'val_hit_rate_3': val_hit_rate_3,
+                'val_recall_3': val_recall_3,
+                'val_recall_5': val_recall_5,
                 'history': history
             }, output_path / 'best_model.pth')
-            print(f"Saved best model (val_acc: {val_acc:.4f})")
+            print(f"Saved best model (val_hit_rate_5: {val_hit_rate_5:.4f})")
     
     # Test
     print("\n[4/4] Testing...")
-    test_loss, test_acc = validate(model, test_loader, criterion, device)
-    print(f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
+    test_loss, test_hit_rate_3, test_hit_rate_5, test_recall_3, test_recall_5, test_f1_macro, test_f1_micro = validate(
+        model, test_loader, criterion, device,
+        return_topk=True,
+        return_f1=True,
+        channel_names=dataset.channel_names
+    )
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Hit@3: {test_hit_rate_3:.4f}, Hit@5: {test_hit_rate_5:.4f}, Recall@3: {test_recall_3:.4f}, Recall@5: {test_recall_5:.4f}")
+    print(f"Test F1_score (macro): {test_f1_macro:.4f}, Test F1_score (micro): {test_f1_micro:.4f}")
     
     # Save results
     results = {
         'test_loss': test_loss,
-        'test_acc': test_acc,
-        'best_val_acc': best_val_acc,
+        'test_hit_rate_3': test_hit_rate_3,
+        'test_hit_rate_5': test_hit_rate_5,
+        'test_recall_3': test_recall_3,
+        'test_recall_5': test_recall_5,
+        'test_f1_score_macro': test_f1_macro,
+        'test_f1_score_micro': test_f1_micro,
+        'best_val_hit_rate_5': best_val_f1,
         'history': history
     }
     
@@ -752,8 +1192,10 @@ if __name__ == '__main__':
 
     if len(sys.argv) == 1:
         sys.argv.extend([
-            '--csv_path', r'E:/output/segment_results/nhfe_channel_label.csv',
-            '--data_root', 'E:/output/segment_results',
+            # '--csv_path', r'E:/output/segment_results/nhfe_channel_label.csv',
+            '--csv_path', r'E:\code_learn\SUAT\workspace\EEG-projects\EEG_SUAT_NEW\results\window_detection\nhfe_channel_label_quant70.0_0.6_50_0.05.csv',
+            # '--data_root', 'E:/output/segment_results',
+            '--data_root', 'E:/output/multi_segment_nhfe',
             '--raw_data_root', r'E:\DataSet\EEG\EEG dataset_SUAT_processed'
         ])
     

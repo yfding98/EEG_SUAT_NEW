@@ -75,10 +75,13 @@ HEMI_TO_CHANNEL_IDX = {
 
 class ChannelToRegionAggregation(nn.Module):
     """
-    将通道级别特征聚合到脑区级别
+    将通道级别 logits 聚合到脑区级别 logits
     
-    输入: (B, 19) 通道级别特征
-    输出: (B, 5) 脑区级别特征
+    注意：此模块现在作用于 logits（未经 sigmoid），
+    输出也是 logits，以便与 BCEWithLogitsLoss 配合使用。
+    
+    输入: (B, 19) 通道级别 logits
+    输出: (B, 5) 脑区级别 logits
     """
     
     def __init__(self, aggregation: str = 'max'):
@@ -376,11 +379,12 @@ class STGNNAdapter(nn.Module):
         # 构建输出
         outputs = {'channel': channel_logits}
         
-        # 脑区级别预测
-        channel_probs = torch.sigmoid(channel_logits)
-        outputs['onset_zone'] = self.region_aggregation(channel_probs)
+        # 脑区级别预测 - 对 logits 进行聚合，输出也是 logits
+        # 注意：region_aggregation 现在作用于 logits，而不是 probs
+        outputs['onset_zone'] = self.region_aggregation(channel_logits)
         
-        # 半球级别预测
+        # 半球级别预测 - 保持使用 probs，因为 hemi 使用 CrossEntropyLoss
+        channel_probs = torch.sigmoid(channel_logits)
         outputs['hemi'] = self.hemi_aggregation(channel_probs)
         
         if return_all or self.output_type == 'all':

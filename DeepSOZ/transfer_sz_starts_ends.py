@@ -10,7 +10,13 @@ E:\code_learn\SUAT\workspace\EEG-projects\EEG_SUAT_NEW\DeepSOZ 下的 detected_e
 
 # 读取两个 CSV 文件
 df_process = pd.read_csv(r'E:\output\segment_results_norm\new_data_process.csv', encoding='utf-8')
-df_ensemble = pd.read_csv(r'E:\code_learn\SUAT\workspace\EEG-projects\EEG_SUAT_NEW\DeepSOZ\detected_ensemble.csv', encoding='utf-8')
+# 或者尝试自动检测编码
+import chardet
+with open(r'E:\code_learn\SUAT\workspace\EEG-projects\EEG_SUAT_NEW\DeepSOZ\converted_manifest_validated.csv', 'rb') as f:
+    result = chardet.detect(f.read())
+    encoding = result['encoding']
+    print(f"文件编码为：{encoding}")
+df_ensemble = pd.read_csv(r'E:\code_learn\SUAT\workspace\EEG-projects\EEG_SUAT_NEW\DeepSOZ\converted_manifest_validated.csv', encoding=encoding)
 
 # 解析 segments 字段（字符串转为列表）
 def parse_segments(seg_str):
@@ -47,6 +53,8 @@ for _, row in df_process.iterrows():
     if len(segments) < 2:
         # 至少需要一个基线 + 一个发作段
         continue
+
+    mask_segments = row['mask_segments']
     base_line = segments[0]
     seizure_segments = segments[1:]
     nsz = len(seizure_segments)
@@ -57,6 +65,7 @@ for _, row in df_process.iterrows():
         'sz_starts': sz_starts,
         'sz_ends': sz_ends,
         'base_line': base_line_str,
+        'mask_segments': mask_segments,
         'nsz': nsz
     }
 
@@ -71,6 +80,7 @@ for _, row in df_ensemble.iterrows():
         row['sz_ends'] = update_info['sz_ends']
         row['base_line'] = update_info['base_line']
         row['nsz'] = update_info['nsz']
+        row['mask_segments'] = update_info['mask_segments']
         updated_rows.append(row)
     # 如果没有匹配项，则跳过（不保留）
 
@@ -81,7 +91,7 @@ df_updated = pd.DataFrame(updated_rows)
 df_updated = df_updated.reset_index(drop=True)
 
 # 保存到新文件
-output_file = 'detected_ensemble_updated_with_baseline.csv'
+output_file = 'detected_ensemble_updated.csv'
 df_updated.to_csv(output_file, index=False, encoding='utf-8')
 
 print(f"已成功生成更新后的文件：{output_file}")

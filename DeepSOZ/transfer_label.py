@@ -18,15 +18,24 @@ def convert_private_excel_to_tuh(source_excel_path, target_csv_template, output_
     # 3. 确定目标文件支持的通道
     # 您的标准19通道: ['fp1', 'fp2', 'f7', 'f3', 'fz', 'f4', 'f8', 't3', 'c3', 'cz','c4', 't4', 't5', 'p3', 'pz', 'p4', 't6', 'o1', 'o2']
     # TUH 格式通常还包含: ['oz', 'a1', 'a2']
-    # 我们只填充目标文件中存在的列
-    target_channel_cols = [
+    # 私有数据集额外通道: ['sph-l', 'sph-r'] (标准19通道之外)
+    standard_19_channel_cols = [
         'fp1', 'fp2', 'f7', 'f3', 'fz', 'f4', 'f8', 't3', 'c3', 'cz',
         'c4', 't4', 't5', 'p3', 'pz', 'p4', 't6', 'o1', 'o2',
-        'oz', 'a1', 'a2'
     ]
-    # 过滤出模板中实际存在的列
-    valid_channel_cols = [c for c in target_channel_cols if c in target_columns]
-
+    # 私有数据集的额外通道
+    extra_channel_cols = ['sph-l', 'sph-r']
+    
+    # 过滤出模板中实际存在的标准通道列
+    valid_channel_cols = [c for c in standard_19_channel_cols if c in target_columns]
+    # 额外通道无论模板是否存在都添加
+    valid_channel_cols.extend(extra_channel_cols)
+    
+    # 更新目标列：添加额外通道到输出列表中
+    output_columns = target_columns.copy()
+    for ch in extra_channel_cols:
+        if ch not in output_columns:
+            output_columns.append(ch)
     output_rows = []
 
     # 4. 遍历患者数据 (从第3行开始，即索引2，因为0和1是表头)
@@ -60,14 +69,14 @@ def convert_private_excel_to_tuh(source_excel_path, target_csv_template, output_
                 continue
 
             # --- 构建新的一行 ---
-            new_entry = {col: np.nan for col in target_columns}
+            new_entry = {col: np.nan for col in output_columns}
 
             # 填充元数据
             new_entry['pt_id'] = name
             new_entry['hemi'] = hemi_side
             new_entry['fn'] = f"{name}_SZ{sz_idx + 1}"  # 生成文件名标识
             new_entry['nsz'] = 1
-            new_entry['nchns'] = 19  # 默认为19通道
+            new_entry['nchns'] = 21  # 标准19通道 + Sph-L + Sph-R
 
             # 填充 Comments (包含所有原始描述，包括 SP1/SP2 信息)
             # 即使 SP1/SP2 不能映射到列，也会保留在这里
@@ -96,10 +105,11 @@ def convert_private_excel_to_tuh(source_excel_path, target_csv_template, output_
                     # 再次清理可能的内部空格
                     elec_clean = elec.replace(' ', '')
 
-                    # 尝试映射 SP1/SP2 到 Sph-L/Sph-R (如果目标表支持)
-                    # 或者反之
-                    if elec_clean == 'sph-l': elec_clean = 'sp1'
-                    if elec_clean == 'sph-r': elec_clean = 'sp2'
+                    # 映射 SP1/SP2 到 Sph-L/Sph-R
+                    if elec_clean in ('sp1', 'sp-l'):
+                        elec_clean = 'sph-l'
+                    elif elec_clean in ('sp2', 'sp-r'):
+                        elec_clean = 'sph-r'
 
                     # 检查该电极是否在目标格式的列中
                     if elec_clean in valid_channel_cols:
@@ -111,7 +121,7 @@ def convert_private_excel_to_tuh(source_excel_path, target_csv_template, output_
             output_rows.append(new_entry)
 
     # 5. 保存结果
-    df_output = pd.DataFrame(output_rows, columns=target_columns)
+    df_output = pd.DataFrame(output_rows, columns=output_columns)
     df_output.to_csv(output_csv_path, index=False,encoding='utf-8')
     print(f"转换完成！文件已保存至: {output_csv_path}")
     print(f"共处理了 {len(output_rows)} 条发作记录。")
