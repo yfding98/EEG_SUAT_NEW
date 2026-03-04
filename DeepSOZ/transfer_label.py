@@ -3,6 +3,43 @@ import numpy as np
 import os
 
 
+def parse_electrodes(electrodes_text: str, valid_channel_cols: list) -> list:
+    """
+    解析电极文本，返回有效的电极列表
+    
+    Args:
+        electrodes_text: 电极描述文本，如 "F7, T3, SP1"
+        valid_channel_cols: 有效的通道列名列表
+    
+    Returns:
+        有效电极名称列表
+    """
+    if not isinstance(electrodes_text, str) or pd.isna(electrodes_text):
+        return []
+    
+    # 统一分隔符：处理中文逗号、顿号、空格
+    txt = electrodes_text.replace('，', ',').replace('、', ',').replace(' ', ',')
+    # 分割并去除空格
+    elec_list = [e.strip().lower() for e in txt.split(',') if e.strip()]
+    
+    parsed = []
+    for elec in elec_list:
+        # 清理可能的内部空格
+        elec_clean = elec.replace(' ', '')
+        
+        # 映射 SP1/SP2 到 Sph-L/Sph-R
+        if elec_clean in ('sp1', 'sp-l', 'spl'):
+            elec_clean = 'sph-l'
+        elif elec_clean in ('sp2', 'sp-r', 'spr'):
+            elec_clean = 'sph-r'
+        
+        # 检查该电极是否在有效通道列表中
+        if elec_clean in valid_channel_cols:
+            parsed.append(elec_clean)
+    
+    return parsed
+
+
 def convert_private_excel_to_tuh(source_excel_path, target_csv_template, output_csv_path):
     print(f"正在读取源文件: {source_excel_path} ...")
     # 1. 读取 Excel 文件
@@ -94,29 +131,29 @@ def convert_private_excel_to_tuh(source_excel_path, target_csv_template, output_
             for ch in valid_channel_cols:
                 new_entry[ch] = 0
 
-            # 解析显著电极并填充
-            if isinstance(electrodes_raw, str):
-                # 统一分隔符：处理中文逗号、顿号
-                txt = electrodes_raw.replace('，', ',').replace('、', ',')
-                # 分割并去除空格
-                elec_list = [e.strip().lower() for e in txt.split(',')]
-
-                for elec in elec_list:
-                    # 再次清理可能的内部空格
-                    elec_clean = elec.replace(' ', '')
-
-                    # 映射 SP1/SP2 到 Sph-L/Sph-R
-                    if elec_clean in ('sp1', 'sp-l'):
-                        elec_clean = 'sph-l'
-                    elif elec_clean in ('sp2', 'sp-r'):
-                        elec_clean = 'sph-r'
-
-                    # 检查该电极是否在目标格式的列中
-                    if elec_clean in valid_channel_cols:
-                        new_entry[elec_clean] = 1
-                    else:
-                        # 如果是 SP1/SP2 且目标表没有这两列，则忽略（已记录在 Comments 中）
-                        pass
+            # 解析显著电极 (Significant Electrodes)
+            sig_electrodes = parse_electrodes(electrodes_raw, valid_channel_cols)
+            
+            # 解析早期扩散电极 (Early Spread Electrodes)
+            spread_electrodes = parse_electrodes(spread_desc, valid_channel_cols)
+            
+            # 合并：显著电极 + 早期扩散 = 活跃通道
+            active_electrodes = set(sig_electrodes) | set(spread_electrodes)
+            
+            # 标注活跃通道
+            for elec in active_electrodes:
+                new_entry[elec] = 1
+            
+            # 记录来源信息（可选：用于调试）
+            if sig_electrodes or spread_electrodes:
+                source_info = []
+                if sig_electrodes:
+                    source_info.append(f"Significant: {','.join(sig_electrodes)}")
+                if spread_electrodes:
+                    source_info.append(f"Spread: {','.join(spread_electrodes)}")
+                # 可以将来源信息追加到Comments
+                if 'Comments' in new_entry and new_entry['Comments']:
+                    new_entry['Comments'] += f"; Active Channels: {', '.join(source_info)}"
 
             output_rows.append(new_entry)
 

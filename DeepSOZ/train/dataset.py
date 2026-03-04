@@ -62,6 +62,15 @@ STANDARD_19_CHANNELS = [
     'O1', 'O2'
 ]
 
+# 21电极通道列表（标准19 + Sph-L + Sph-R蝶骨电极）
+STANDARD_21_CHANNELS = [
+    'FP1', 'FP2', 'F7', 'F3', 'FZ', 'F4', 'F8',
+    'T3', 'C3', 'CZ', 'C4', 'T4',
+    'T5', 'P3', 'PZ', 'P4', 'T6',
+    'O1', 'O2',
+    'SPHL', 'SPHR'  # 蝶骨电极：Sph-L在F7和T3之间，Sph-R在F8和T4之间
+]
+
 # 通道名映射（处理各种变体）
 CHANNEL_NAME_MAP = {
     # 大小写变体
@@ -70,6 +79,10 @@ CHANNEL_NAME_MAP = {
     # 10-10到10-20系统映射
     'T7': 'T3', 'T8': 'T4',
     'P7': 'T5', 'P8': 'T6',
+    # 蝶骨电极变体名称
+    'Sph-L': 'SPHL', 'SPH-L': 'SPHL', 'SphL': 'SPHL', 'sph-l': 'SPHL', 'sph_l': 'SPHL',
+    'Sph-R': 'SPHR', 'SPH-R': 'SPHR', 'SphR': 'SPHR', 'sph-r': 'SPHR', 'sph_r': 'SPHR',
+    'Sph1': 'SPHL', 'Sph2': 'SPHR',  # 可能的别名
     # 带参考的通道名
     'EEG FP1': 'FP1', 'EEG FP2': 'FP2',
     'EEG F7': 'F7', 'EEG F3': 'F3', 'EEG FZ': 'FZ', 'EEG F4': 'F4', 'EEG F8': 'F8',
@@ -78,13 +91,22 @@ CHANNEL_NAME_MAP = {
     'EEG O1': 'O1', 'EEG O2': 'O2',
 }
 
-# 脑区映射
+# 脑区映射（19电极）
 BRAIN_REGION_MAP = {
     'frontal': ['FP1', 'FP2', 'F3', 'F4', 'F7', 'F8', 'FZ'],
     'temporal': ['T3', 'T4', 'T5', 'T6'],
     'central': ['C3', 'C4', 'CZ'],
     'parietal': ['P3', 'P4', 'PZ'],
     'occipital': ['O1', 'O2']
+}
+
+# 5脑区映射（21电极）- 用户定义
+BRAIN_REGION_MAP_21 = {
+    'left_frontal': ['FP1', 'F7', 'F3', 'FZ'],
+    'left_temporal': ['F7', 'SPHL', 'T3', 'T5', 'O1', 'C3', 'P3'],
+    'parietal': ['FZ', 'CZ', 'C3', 'C4', 'P3', 'PZ', 'P4'],
+    'right_frontal': ['FP2', 'F4', 'F8', 'FZ'],
+    'right_temporal': ['F8', 'SPHR', 'T4', 'T6', 'O2', 'C4', 'P4'],
 }
 
 # 半球映射
@@ -94,12 +116,19 @@ HEMISPHERE_MAP = {
     'M': ['FZ', 'CZ', 'PZ']
 }
 
+# 21电极半球映射
+HEMISPHERE_MAP_21 = {
+    'L': ['FP1', 'F3', 'F7', 'T3', 'C3', 'T5', 'P3', 'O1', 'SPHL'],
+    'R': ['FP2', 'F4', 'F8', 'T4', 'C4', 'T6', 'P4', 'O2', 'SPHR'],
+    'M': ['FZ', 'CZ', 'PZ']
+}
+
 
 # ==============================================================================
 # 信号处理函数
 # ==============================================================================
 
-# 标准18导联TCP双极导联对
+# 标准18导联TCP双极导联对（19电极）
 # 参考临床EEG标准双极纵向蒙太奇
 BIPOLAR_PAIRS_18 = [
     # 左颞链 (4对)
@@ -114,8 +143,52 @@ BIPOLAR_PAIRS_18 = [
     ('FZ', 'CZ'), ('CZ', 'PZ'),
 ]
 
-# 双极导联通道名称
+# 双极导联通道名称（18导联）
 BIPOLAR_CHANNEL_NAMES = [f"{a}-{c}" for a, c in BIPOLAR_PAIRS_18]
+
+# ==============================================================================
+# 21电极双极导联定义（26导联，5脑区）
+# ==============================================================================
+BIPOLAR_PAIRS_26 = [
+    # 左额 (4对)
+    ('FP1', 'F7'), ('FP1', 'F3'), ('F7', 'F3'), ('F3', 'FZ'),
+    # 左颞 (6对)
+    ('F7', 'SPHL'), ('SPHL', 'T3'), ('T3', 'T5'), ('T5', 'O1'), ('T3', 'C3'), ('T5', 'P3'),
+    # 顶叶 (6对)
+    ('FZ', 'CZ'), ('C3', 'CZ'), ('P3', 'PZ'), ('CZ', 'PZ'), ('CZ', 'C4'), ('PZ', 'P4'),
+    # 右额 (4对)
+    ('FP2', 'F4'), ('FP2', 'F8'), ('F4', 'F8'), ('FZ', 'F4'),
+    # 右颞 (6对)
+    ('F8', 'SPHR'), ('SPHR', 'T4'), ('C4', 'T4'), ('T4', 'T6'), ('P4', 'T6'), ('T6', 'O2'),
+]
+
+# 双极导联通道名称（26导联）
+BIPOLAR_CHANNEL_NAMES_26 = [f"{a}-{c}" for a, c in BIPOLAR_PAIRS_26]
+
+# 5脑区双极导联映射
+BIPOLAR_REGION_DEFINITIONS_21 = {
+    'left_frontal': ['FP1-F7', 'FP1-F3', 'F7-F3', 'F3-FZ'],
+    'left_temporal': ['F7-SPHL', 'SPHL-T3', 'T3-T5', 'T5-O1', 'T3-C3', 'T5-P3'],
+    'parietal': ['FZ-CZ', 'C3-CZ', 'P3-PZ', 'CZ-PZ', 'CZ-C4', 'PZ-P4'],
+    'right_frontal': ['FP2-F4', 'FP2-F8', 'F4-F8', 'FZ-F4'],
+    'right_temporal': ['F8-SPHR', 'SPHR-T4', 'C4-T4', 'T4-T6', 'P4-T6', 'T6-O2'],
+}
+
+# 横向导联排列（用于可视化对称性分析）
+TRANSVERSE_MONTAGE = [
+    # 前额排
+    ('FP1', 'FP2'),
+    # 前头部排
+    ('F7', 'F3'), ('F3', 'FZ'), ('FZ', 'F4'), ('F4', 'F8'),
+    # 中央排
+    ('T3', 'C3'), ('C3', 'CZ'), ('CZ', 'C4'), ('C4', 'T4'),
+    # 后颞/顶排
+    ('T5', 'P3'), ('P3', 'PZ'), ('PZ', 'P4'), ('P4', 'T6'),
+    # 枕部排
+    ('O1', 'O2'),
+]
+
+TRANSVERSE_CHANNEL_NAMES = [f"{a}-{c}" for a, c in TRANSVERSE_MONTAGE]
 
 
 def convert_to_bipolar(

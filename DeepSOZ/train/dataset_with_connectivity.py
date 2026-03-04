@@ -47,7 +47,9 @@ from dataset import (
     extract_segment_with_mask_removal,
     convert_to_bipolar,
     STANDARD_19_CHANNELS,
-    BIPOLAR_PAIRS_18
+    BIPOLAR_PAIRS_18,
+    BIPOLAR_PAIRS_26,
+    STANDARD_21_CHANNELS,
 )
 
 from connectivity import (
@@ -65,6 +67,149 @@ from config import DataConfig, get_config
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# 5脑区双极导联标签映射 (region_5)
+# ==============================================================================
+
+# 5脑区双极导联映射
+REGION_5_BIPOLAR_LEADS = {
+    'left_frontal': ['FP1-F7', 'FP1-F3', 'F7-F3', 'F3-FZ'],
+    'left_temporal': ['F7-SPHL', 'SPHL-T3', 'T3-T5', 'T5-O1', 'T3-C3', 'T5-P3'],
+    'parietal': ['FZ-CZ', 'C3-CZ', 'P3-PZ', 'CZ-PZ', 'CZ-C4', 'PZ-P4'],
+    'right_frontal': ['FP2-F4', 'FP2-F8', 'F4-F8', 'FZ-F4'],
+    'right_temporal': ['F8-SPHR', 'SPHR-T4', 'C4-T4', 'T4-T6', 'P4-T6', 'T6-O2'],
+}
+
+# 双极导联到所涉及电极的映射
+BIPOLAR_LEAD_ELECTRODES = {
+    # 左额
+    'FP1-F7': ['fp1', 'f7'], 'FP1-F3': ['fp1', 'f3'], 
+    'F7-F3': ['f7', 'f3'], 'F3-FZ': ['f3', 'fz'],
+    # 左颞
+    'F7-SPHL': ['f7', 'sphl'], 'SPHL-T3': ['sphl', 't3'],
+    'T3-T5': ['t3', 't5'], 'T5-O1': ['t5', 'o1'],
+    'T3-C3': ['t3', 'c3'], 'T5-P3': ['t5', 'p3'],
+    # 顶叶
+    'FZ-CZ': ['fz', 'cz'], 'C3-CZ': ['c3', 'cz'],
+    'P3-PZ': ['p3', 'pz'], 'CZ-PZ': ['cz', 'pz'],
+    'CZ-C4': ['cz', 'c4'], 'PZ-P4': ['pz', 'p4'],
+    # 右额
+    'FP2-F4': ['fp2', 'f4'], 'FP2-F8': ['fp2', 'f8'],
+    'F4-F8': ['f4', 'f8'], 'FZ-F4': ['fz', 'f4'],
+    # 右颞
+    'F8-SPHR': ['f8', 'sphr'], 'SPHR-T4': ['sphr', 't4'],
+    'C4-T4': ['c4', 't4'], 'T4-T6': ['t4', 't6'],
+    'P4-T6': ['p4', 't6'], 'T6-O2': ['t6', 'o2'],
+}
+
+# chain标签的电极映射
+CHAIN_ELECTRODES = {
+    'left_temporal': ['fp1', 'f7', 't3', 't5', 'o1'],
+    'right_temporal': ['fp2', 'f8', 't4', 't6', 'o2'],
+    'left_parasagittal': ['fp1', 'f3', 'c3', 'p3', 'o1'],
+    'right_parasagittal': ['fp2', 'f4', 'c4', 'p4', 'o2'],
+    'midline': ['fz', 'cz', 'pz'],
+}
+
+
+def parse_region5_label(row: pd.Series) -> np.ndarray:
+    """
+    解析5脑区(双极导联)标签
+    
+    根据通道级别SOZ标注，推断出每个脑区是否为SOZ
+    判断逻辑：如果某双极导联的任一组成电极是SOZ，则该导联是SOZ
+              如果某脑区的任一双极导联是SOZ，则该脑区是SOZ
+    
+    Args:
+        row: DataFrame行，包含通道级别标签
+    
+    Returns:
+        5维向量 [left_frontal, left_temporal, parietal, right_frontal, right_temporal]
+    """
+    region_names = ['left_frontal', 'left_temporal', 'parietal', 
+                    'right_frontal', 'right_temporal']
+    region_labels = np.zeros(len(region_names), dtype=np.float32)
+    
+    # 读取通道级别SOZ（包括21电极）
+    all_channel_names = ['fp1', 'fp2', 'f7', 'f3', 'fz', 'f4', 'f8',
+                         't3', 'c3', 'cz', 'c4', 't4',
+                         't5', 'p3', 'pz', 'p4', 't6',
+                         'o1', 'o2', 'sphl', 'sphr']
+    
+    soz_channels = set()
+    for ch in all_channel_names:
+        col = ch if ch in row.index else ch.upper()
+        if col in row.index:
+            try:
+                if pd.notna(row[col]) and int(row[col]) == 1:
+                    soz_channels.add(ch.lower())
+            except:
+                pass
+    
+    # 根据SOZ通道计算每个脑区的标签
+    for region_idx, region_name in enumerate(region_names):
+        if region_name not in REGION_5_BIPOLAR_LEADS:
+            continue
+        
+        region_bipolar_leads = REGION_5_BIPOLAR_LEADS[region_name]
+        region_is_soz = False
+        
+        for lead in region_bipolar_leads:
+            if lead in BIPOLAR_LEAD_ELECTRODES:
+                electrodes = BIPOLAR_LEAD_ELECTRODES[lead]
+                # 如果任一电极是SOZ，则该导联是SOZ
+                if any(elec.lower() in soz_channels for elec in electrodes):
+                    region_is_soz = True
+                    break
+        
+        if region_is_soz:
+            region_labels[region_idx] = 1.0
+    
+    return region_labels
+
+
+def parse_chain_label(row: pd.Series) -> np.ndarray:
+    """
+    解析五链分区标签
+    
+    Args:
+        row: DataFrame行，包含通道级别标签
+    
+    Returns:
+        5维向量 [left_temporal, right_temporal, left_parasagittal, right_parasagittal, midline]
+    """
+    chain_names = ['left_temporal', 'right_temporal', 'left_parasagittal', 
+                   'right_parasagittal', 'midline']
+    chain_labels = np.zeros(len(chain_names), dtype=np.float32)
+    
+    # 读取通道级别SOZ
+    channel_names = ['fp1', 'fp2', 'f7', 'f3', 'fz', 'f4', 'f8',
+                     't3', 'c3', 'cz', 'c4', 't4',
+                     't5', 'p3', 'pz', 'p4', 't6',
+                     'o1', 'o2']
+    
+    soz_channels = set()
+    for ch in channel_names:
+        col = ch if ch in row.index else ch.upper()
+        if col in row.index:
+            try:
+                if pd.notna(row[col]) and int(row[col]) == 1:
+                    soz_channels.add(ch.lower())
+            except:
+                pass
+    
+    # 根据SOZ通道计算chain标签
+    for chain_idx, chain_name in enumerate(chain_names):
+        if chain_name not in CHAIN_ELECTRODES:
+            continue
+        chain_electrodes = CHAIN_ELECTRODES[chain_name]
+        # 如果该链中任何电极是SOZ，则该链为正
+        if any(elec.lower() in soz_channels for elec in chain_electrodes):
+            chain_labels[chain_idx] = 1.0
+    
+    return chain_labels
 
 
 # ==============================================================================
@@ -357,6 +502,8 @@ class MultiModalEEGDataset(Dataset):
             'onset_zone': parse_onset_zone_label(row.get('onset_zone')),
             'hemi': parse_hemi_label(row.get('hemi')),
             'channel': parse_channel_labels(row, channel_columns),
+            'chain': parse_chain_label(row),
+            'region_5': parse_region5_label(row),
         }
     
     def _build_samples_with_sliding_window(self) -> List[Dict]:
@@ -462,13 +609,23 @@ class MultiModalEEGDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """获取一个样本"""
         sample = self.samples[idx]
+        bipolar_eeg_data = None  # 双极导联数据
+        bipolar_connectivity = None  # 双极导联连接性
+        bipolar_graph_metrics = None  # 双极导联图指标
         
         try:
             # 加载和预处理数据
             result = self._load_and_preprocess(sample)
-            eeg_data = result['eeg_data']
-            connectivity = result['connectivity']
-            graph_metrics = result['graph_metrics']
+            eeg_data = result['eeg_data']  # 原始单极数据
+            connectivity = result['connectivity']  # 基于原始数据
+            graph_metrics = result['graph_metrics']  # 基于原始数据
+            # 获取双极导联相关数据（如果有）
+            if 'bipolar_eeg_data' in result:
+                bipolar_eeg_data = result['bipolar_eeg_data']
+            if 'bipolar_connectivity' in result:
+                bipolar_connectivity = result['bipolar_connectivity']
+            if 'bipolar_graph_metrics' in result:
+                bipolar_graph_metrics = result['bipolar_graph_metrics']
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -476,12 +633,27 @@ class MultiModalEEGDataset(Dataset):
             
             # 返回零数据
             n_windows = int(self.segment_length / self.window_length)
-            n_channels = 19
+            use_21_channels = getattr(self.config, 'use_21_channels', False)
+            use_bipolar = getattr(self.config, 'use_bipolar', False)
+            
+            # 原始单极通道数
+            n_raw_channels = 21 if use_21_channels else 19
+            # 双极导联通道数
+            n_bipolar_channels = 26 if use_21_channels else 18
+            
             n_samples = int(self.config.target_fs * self.window_length)
             
-            eeg_data = np.zeros((n_windows, n_channels, n_samples))
-            connectivity = np.zeros((len(self.connectivity_types), n_channels, n_channels))
-            graph_metrics = np.zeros((n_channels, len(self.GRAPH_METRIC_TYPES)))
+            # eeg_data 始终是原始单极数据
+            eeg_data = np.zeros((n_windows, n_raw_channels, n_samples))
+            # connectivity 和 graph_metrics 基于原始数据
+            connectivity = np.zeros((len(self.connectivity_types), n_raw_channels, n_raw_channels))
+            graph_metrics = np.zeros((n_raw_channels, len(self.GRAPH_METRIC_TYPES)))
+            
+            # 如果启用了双极导联，创建空的双极导联数据
+            if use_bipolar:
+                bipolar_eeg_data = np.zeros((n_windows, n_bipolar_channels, n_samples))
+                bipolar_connectivity = np.zeros((len(self.connectivity_types), n_bipolar_channels, n_bipolar_channels))
+                bipolar_graph_metrics = np.zeros((n_bipolar_channels, len(self.GRAPH_METRIC_TYPES)))
         
         # 获取标签
         labels = sample['labels'][self.label_type]
@@ -496,16 +668,26 @@ class MultiModalEEGDataset(Dataset):
         if self.transform is not None:
             eeg_tensor = self.transform(eeg_tensor)
         
-        return {
-            'eeg_data': eeg_tensor,
-            'connectivity': connectivity_tensor,
-            'graph_metrics': graph_metrics_tensor,
+        result_dict = {
+            'eeg_data': eeg_tensor,  # 原始单极数据
+            'connectivity': connectivity_tensor,  # 基于原始数据
+            'graph_metrics': graph_metrics_tensor,  # 基于原始数据
             'labels': labels_tensor,
             'pt_id': sample['pt_id'],
             'fn': sample['fn'],
             'sz_idx': sample['sz_idx'],
             'win_idx': sample['win_idx'],
         }
+        
+        # 如果有双极导联相关数据，也返回
+        if bipolar_eeg_data is not None:
+            result_dict['bipolar_eeg_data'] = torch.FloatTensor(bipolar_eeg_data)
+        if bipolar_connectivity is not None:
+            result_dict['bipolar_connectivity'] = torch.FloatTensor(bipolar_connectivity)
+        if bipolar_graph_metrics is not None:
+            result_dict['bipolar_graph_metrics'] = torch.FloatTensor(bipolar_graph_metrics)
+        
+        return result_dict
     
     def _load_and_preprocess(self, sample: Dict) -> Dict[str, np.ndarray]:
         """
@@ -526,16 +708,44 @@ class MultiModalEEGDataset(Dataset):
         
         # 1. 读取EDF
         raw_data, fs, ch_names = read_edf(edf_path)
+        original_fs = fs  # 保存原始采样率，用于后续处理原始单极数据
         
-        # 2. 提取标准19通道
-        data, found_channels = extract_standard_channels(raw_data, ch_names)
-        n_channels = data.shape[0]
+        # 2. 根据配置提取标准通道（19或21）
+        use_21_channels = getattr(self.config, 'use_21_channels', False)
+        if use_21_channels:
+            target_channels = STANDARD_21_CHANNELS
+        else:
+            target_channels = STANDARD_19_CHANNELS
+        data, found_channels = extract_standard_channels(raw_data, ch_names, target_channels)
+        n_channels_raw = data.shape[0]
+        
+        # 保存原始单极数据（在双极转换之前）- 注意：此时还是原始采样率
+        raw_unipolar_data = data.copy()
+        raw_channel_names = found_channels.copy()
+        n_channels_raw = data.shape[0]
         
         # 2.5. 可选：转换为TCP双极导联
-        if hasattr(self.config, 'use_bipolar') and self.config.use_bipolar:
-            data, found_channels = convert_to_bipolar(data, found_channels)
+        # 注意：双极导联数据和原始数据都会继续处理，不互相覆盖
+        bipolar_data = None
+        bipolar_channel_names = None
+        use_bipolar = hasattr(self.config, 'use_bipolar') and self.config.use_bipolar
         
-        # 3. 预处理每个通道（在完整数据上进行）
+        if use_bipolar:
+            # 根据use_21_channels选择双极导联对
+            use_21_channels = getattr(self.config, 'use_21_channels', False)
+            if use_21_channels:
+                bipolar_pairs = BIPOLAR_PAIRS_26
+                logger.debug("使用26通道双极导联 (21电极)")
+            else:
+                bipolar_pairs = BIPOLAR_PAIRS_18
+                logger.debug("使用18通道双极导联 (19电极)")
+            bipolar_data, bipolar_channel_names = convert_to_bipolar(data, found_channels, bipolar_pairs)
+            n_channels_bipolar = bipolar_data.shape[0]
+        
+        # 原始单极数据的通道数
+        n_channels = data.shape[0]
+        
+        # ========== 3. 预处理原始单极数据 ==========
         processed_data = np.zeros_like(data)
         for i in range(data.shape[0]):
             filtered = bandpass_filter(
@@ -546,64 +756,121 @@ class MultiModalEEGDataset(Dataset):
             clipped = clip_amplitude(filtered, self.config.clip_std)
             processed_data[i] = clipped
         
-        # 4. 重采样
-        if fs != self.config.target_fs:
-            n_samples_new = int(processed_data.shape[1] * self.config.target_fs / fs)
+        # ========== 3b. 预处理双极导联数据（如果启用） ==========
+        processed_bipolar = None
+        if use_bipolar and bipolar_data is not None:
+            processed_bipolar = np.zeros_like(bipolar_data)
+            for i in range(bipolar_data.shape[0]):
+                filtered = bandpass_filter(
+                    bipolar_data[i], fs,
+                    f_low=self.config.filter_low,
+                    f_high=self.config.filter_high
+                )
+                clipped = clip_amplitude(filtered, self.config.clip_std)
+                processed_bipolar[i] = clipped
+        
+        # ========== 4. 重采样 ==========
+        target_fs = self.config.target_fs
+        if fs != target_fs:
+            # 重采样原始单极数据
+            n_samples_new = int(processed_data.shape[1] * target_fs / fs)
             resampled_data = np.zeros((processed_data.shape[0], n_samples_new))
             for i in range(processed_data.shape[0]):
-                resampled_data[i] = resample_signal(processed_data[i], fs, self.config.target_fs)
+                resampled_data[i] = resample_signal(processed_data[i], fs, target_fs)
             processed_data = resampled_data
-            fs = self.config.target_fs
+            
+            # 重采样双极导联数据
+            if processed_bipolar is not None:
+                n_samples_new_bipolar = int(processed_bipolar.shape[1] * target_fs / fs)
+                resampled_bipolar = np.zeros((processed_bipolar.shape[0], n_samples_new_bipolar))
+                for i in range(processed_bipolar.shape[0]):
+                    resampled_bipolar[i] = resample_signal(processed_bipolar[i], fs, target_fs)
+                processed_bipolar = resampled_bipolar
+            
+            fs = target_fs
         
-        # 5. 提取完整片段 + 移除范围内的坏段（获得清洗后的连续数据）
+        # ========== 5. 提取片段 + 移除坏段 ==========
+        # 原始单极数据
         clean_segment, actual_clean_duration = extract_segment_with_mask_removal(
             processed_data, fs,
             segment_start, segment_end,
             mask_segments
         )
         
+        # 双极导联数据
+        clean_bipolar_segment = None
+        if processed_bipolar is not None:
+            clean_bipolar_segment, _ = extract_segment_with_mask_removal(
+                processed_bipolar, fs,
+                segment_start, segment_end,
+                mask_segments
+            )
+        
         # 检查清洗后的数据是否足够
         if clean_segment.shape[1] == 0:
             logger.warning(f"片段清洗后没有数据")
             n_samples = int(self.config.target_fs * self.window_length)
-            return {
+            # 始终返回基于原始数据的特征
+            result = {
                 'eeg_data': np.zeros((1, n_channels, n_samples)),
                 'connectivity': np.zeros((len(self.connectivity_types), n_channels, n_channels)),
                 'graph_metrics': np.zeros((n_channels, len(self.GRAPH_METRIC_TYPES)))
             }
+            # 如果启用了双极导联，额外返回双极导联相关数据
+            if use_bipolar:
+                result['bipolar_eeg_data'] = np.zeros((1, n_channels_bipolar, n_samples))
+                result['bipolar_connectivity'] = np.zeros((len(self.connectivity_types), n_channels_bipolar, n_channels_bipolar))
+                result['bipolar_graph_metrics'] = np.zeros((n_channels_bipolar, len(self.GRAPH_METRIC_TYPES)))
+            return result
         
-        # 6. 从清洗后的数据中提取预定义的窗口
+        # ========== 6. 提取窗口数据 ==========
         win_start_sample = int(clean_win_start * fs)
         win_end_sample = int(clean_win_end * fs)
-        
-        # 边界检查
         win_start_sample = max(0, win_start_sample)
         win_end_sample = min(clean_segment.shape[1], win_end_sample)
         
-        # 确保窗口长度正确
-        expected_samples = int(self.window_length * fs)
+        expected_samples = int(self.segment_length * fs)
         actual_samples = win_end_sample - win_start_sample
         
+        # 原始单极数据窗口
         if actual_samples < expected_samples:
-            # 数据不足，需要填充
             window_data = np.zeros((n_channels, expected_samples))
             window_data[:, :actual_samples] = clean_segment[:, win_start_sample:win_end_sample]
         else:
             window_data = clean_segment[:, win_start_sample:win_start_sample + expected_samples]
         
-        # 7. 标准化 (使用baseline或segment自身)
+        # 双极导联数据窗口
+        bipolar_window_data = None
+        if clean_bipolar_segment is not None:
+            bipolar_win_end = min(clean_bipolar_segment.shape[1], win_end_sample)
+            bipolar_actual = bipolar_win_end - win_start_sample
+            if bipolar_actual < expected_samples:
+                bipolar_window_data = np.zeros((n_channels_bipolar, expected_samples))
+                bipolar_window_data[:, :bipolar_actual] = clean_bipolar_segment[:, win_start_sample:bipolar_win_end]
+            else:
+                bipolar_window_data = clean_bipolar_segment[:, win_start_sample:win_start_sample + expected_samples]
+        
+        # ========== 7. 标准化 ==========
         if base_line_start is not None and base_line_end is not None:
             bl_start = int(base_line_start * fs)
             bl_end = int(base_line_end * fs)
             if bl_end <= processed_data.shape[1]:
                 baseline_segment = processed_data[:, bl_start:bl_end]
                 window_data = (window_data - np.mean(baseline_segment)) / (np.std(baseline_segment) + 1e-16)
+                if bipolar_window_data is not None and processed_bipolar is not None:
+                    bipolar_baseline = processed_bipolar[:, bl_start:bl_end]
+                    bipolar_window_data = (bipolar_window_data - np.mean(bipolar_baseline)) / (np.std(bipolar_baseline) + 1e-16)
             else:
                 window_data = (window_data - np.mean(window_data)) / (np.std(window_data) + 1e-16)
+                if bipolar_window_data is not None:
+                    bipolar_window_data = (bipolar_window_data - np.mean(bipolar_window_data)) / (np.std(bipolar_window_data) + 1e-16)
         else:
             window_data = (window_data - np.mean(window_data)) / (np.std(window_data) + 1e-16)
+            if bipolar_window_data is not None:
+                bipolar_window_data = (bipolar_window_data - np.mean(bipolar_window_data)) / (np.std(bipolar_window_data) + 1e-16)
         
-        # 8. 内部窗口划分（用于EEGNet）- 在单个segment_length窗口内再划分
+        # ========== 8. 窗口划分 ==========
+        # 原始单极数据窗口划分
         windows = adaptive_apply_windows(
             window_data, fs,
             window_len=self.window_length,
@@ -611,13 +878,33 @@ class MultiModalEEGDataset(Dataset):
             min_windows=1
         )  # (n_windows, n_channels, n_samples_per_window)
         
-        # 9. 计算连接性特征（基于整个清洗后的片段）
+        # 双极导联数据窗口划分
+        bipolar_windows = None
+        if bipolar_window_data is not None:
+            bipolar_windows = adaptive_apply_windows(
+                bipolar_window_data, fs,
+                window_len=self.window_length,
+                overlap=self.window_overlap,
+                min_windows=1
+            )
+            logger.debug(f"双极导联数据: {bipolar_windows.shape} (n_windows, {n_channels_bipolar}通道, n_samples)")
+        
+        # ========== 9. 计算连接性特征 ==========
+        # 始终基于原始单极数据计算 connectivity
         if self.compute_online:
             connectivity = self._compute_connectivity_online(clean_segment, fs)
         else:
             connectivity = self._load_precomputed_connectivity(sample)
         
-        # 10. 计算图网络指标
+        # 如果启用了双极导联，额外计算基于双极导联数据的 connectivity
+        bipolar_connectivity = None
+        if use_bipolar and clean_bipolar_segment is not None:
+            if self.compute_online:
+                bipolar_connectivity = self._compute_connectivity_online(clean_bipolar_segment, fs)
+            # 预计算模式暂不支持双极导联，使用在线计算
+        
+        # ========== 10. 计算图网络指标 ==========
+        # 基于原始数据的 graph_metrics
         if connectivity.shape[0] > 0:
             avg_connectivity = connectivity.mean(axis=0)
             graph_metrics = compute_graph_metrics_from_connectivity(
@@ -627,11 +914,33 @@ class MultiModalEEGDataset(Dataset):
         else:
             graph_metrics = np.zeros((n_channels, len(self.GRAPH_METRIC_TYPES)))
         
-        return {
-            'eeg_data': windows,
-            'connectivity': connectivity,
-            'graph_metrics': graph_metrics
+        # 基于双极导联数据的 graph_metrics
+        bipolar_graph_metrics = None
+        if bipolar_connectivity is not None and bipolar_connectivity.shape[0] > 0:
+            avg_bipolar_conn = bipolar_connectivity.mean(axis=0)
+            bipolar_graph_metrics = compute_graph_metrics_from_connectivity(
+                avg_bipolar_conn,
+                self.GRAPH_METRIC_TYPES
+            )
+        
+        # ========== 构建返回结果 ==========
+        # eeg_data 始终保存原始单极数据（方便统一处理）
+        # connectivity 和 graph_metrics 始终基于原始单极数据
+        result = {
+            'eeg_data': windows,  # 原始单极数据
+            'connectivity': connectivity,  # 基于原始数据
+            'graph_metrics': graph_metrics  # 基于原始数据
         }
+        
+        # 如果启用了双极导联，添加双极导联相关数据
+        if bipolar_windows is not None:
+            result['bipolar_eeg_data'] = bipolar_windows
+        if bipolar_connectivity is not None:
+            result['bipolar_connectivity'] = bipolar_connectivity
+        if bipolar_graph_metrics is not None:
+            result['bipolar_graph_metrics'] = bipolar_graph_metrics
+        
+        return result
     
     def _compute_connectivity_online(
         self, 

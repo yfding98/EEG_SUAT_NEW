@@ -33,11 +33,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import get_config, Config
 from dataset import (
-    PrivateEEGDataset, create_dataloader, STANDARD_19_CHANNELS,
+    PrivateEEGDataset, create_dataloader, 
+    STANDARD_19_CHANNELS, STANDARD_21_CHANNELS,
+    BIPOLAR_CHANNEL_NAMES, BIPOLAR_CHANNEL_NAMES_26,
     create_cross_validation_splits
 )
+from dataset_with_connectivity import MultiModalEEGDataset, create_multimodal_dataloader
 from model_wrapper import create_model
 from eegnet_model import create_eegnet_model
+from multi_branch_model import create_multi_branch_model
 from trainer import get_device, set_seed
 
 import logging
@@ -49,13 +53,13 @@ logger = logging.getLogger(__name__)
 # 常量定义
 # ==============================================================================
 
-# 脑区名称
-ONSET_ZONE_NAMES = ['frontal', 'temporal', 'central', 'parietal', 'occipital']
+# 脑区名称（新的5脑区定义）
+ONSET_ZONE_NAMES = ['left_frontal', 'left_temporal', 'parietal', 'right_frontal', 'right_temporal']
 
 # 半球名称
 HEMI_NAMES = ['L', 'R', 'B', 'U']
 
-# 通道名称
+# 通道名称（默认，会在运行时根据配置更新）
 CHANNEL_NAMES = STANDARD_19_CHANNELS
 
 
@@ -107,7 +111,15 @@ def evaluate_samples_detailed(
             sz_idxs = batch['sz_idx']
             
             # 前向传播
-            outputs = model(data)
+            # 检查是否为多模态数据输入（MultiBranchModel需要多个输入）
+            if isinstance(batch, dict) and 'connectivity' in batch and 'graph_metrics' in batch:
+                eeg_data = batch['eeg_data'].to(device)
+                connectivity = batch['connectivity'].to(device)
+                graph_metrics = batch['graph_metrics'].to(device)
+                outputs = model(eeg_data, connectivity, graph_metrics)
+            else:
+                outputs = model(data)
+
             if isinstance(outputs, dict):
                 outputs = outputs.get(task_type.split('_')[0], outputs.get('channel'))
             
@@ -597,7 +609,10 @@ def run_evaluation(
     n_folds: int = 5,
     batch_size: int = 4,
     device: str = 'cuda',
-    seed: int = 42
+    seed: int = 42,
+    # Multi-branch specific args
+    fusion_type: str = 'attention',
+    segment_length: float = 20.0
 ):
     """
     运行样本级别评估
@@ -626,12 +641,27 @@ def run_evaluation(
         config.data.edf_data_roots = data_roots
     
     # 根据config中的use_bipolar设置正确的通道数
+    use_21_channels = getattr(config.data, 'use_21_channels', False)
+    global CHANNEL_NAMES
+    
     if config.data.use_bipolar:
-        config.model.n_channels = 18
-        logger.info("使用TCP双极导联模式，通道数: 18")
+        if use_21_channels:
+            config.model.n_channels = 26
+            CHANNEL_NAMES = BIPOLAR_CHANNEL_NAMES_26
+            logger.info("使用TCP双极导联模式（21电极），通道数: 26")
+        else:
+            config.model.n_channels = 18
+            CHANNEL_NAMES = BIPOLAR_CHANNEL_NAMES
+            logger.info("使用TCP双极导联模式（19电极），通道数: 18")
     else:
-        config.model.n_channels = 19
-        logger.info("使用单极导联模式，通道数: 19")
+        if use_21_channels:
+            config.model.n_channels = 21
+            CHANNEL_NAMES = STANDARD_21_CHANNELS
+            logger.info("使用单极导联模式（21电极），通道数: 21")
+        else:
+            config.model.n_channels = 19
+            CHANNEL_NAMES = STANDARD_19_CHANNELS
+            logger.info("使用单极导联模式（19电极），通道数: 19")
     
     # 设置输出目录
     if output_dir is None:
@@ -653,20 +683,45 @@ def run_evaluation(
         logger.info(f"使用 Fold {fold} 的验证集，共 {len(patient_ids)} 个患者")
     
     # 创建数据集
-    dataset = PrivateEEGDataset(
-        manifest_path=config.data.manifest_path,
-        data_roots=config.data.edf_data_roots,
-        label_type=task_type,
-        patient_ids=patient_ids,
-        config=config.data
-    )
-    
-    data_loader = create_dataloader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0  # 评估时使用单线程避免问题
-    )
+    if model_type == 'multi_branch':
+        logger.info("创建多模态数据集用于Multi-Branch模型评估...")
+        # 确定连接性类型 (这里默认使用训练时的全集，或者可以通过args传入)
+        connectivity_types = ['plv', 'wpli', 'aec', 'pearson', 'granger', 'transfer_entropy']
+        
+        dataset = MultiModalEEGDataset(
+            manifest_path=config.data.manifest_path,
+            data_roots=config.data.edf_data_roots,
+            label_type=task_type,
+            patient_ids=patient_ids,
+            config=config.data,
+            segment_length=segment_length,
+            segment_overlap=0.0, # 评估时不重叠
+            connectivity_types=connectivity_types,
+            compute_online=True,
+            include_directed=True
+        )
+        
+        data_loader = create_multimodal_dataloader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0 # 评估时使用单线程避免问题
+        )
+    else:
+        dataset = PrivateEEGDataset(
+            manifest_path=config.data.manifest_path,
+            data_roots=config.data.edf_data_roots,
+            label_type=task_type,
+            patient_ids=patient_ids,
+            config=config.data
+        )
+        
+        data_loader = create_dataloader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0  # 评估时使用单线程避免问题
+        )
     
     logger.info(f"数据集大小: {len(dataset)} 样本")
     
@@ -677,7 +732,7 @@ def run_evaluation(
             'n_channels': config.model.n_channels,
             'n_samples': config.model.time_steps,
             'n_windows': config.data.n_windows,
-            'n_classes': 5 if task_type == 'onset_zone' else (4 if task_type == 'hemi' else 19),
+            'n_classes': 5 if task_type == 'onset_zone' else (4 if task_type == 'hemi' else config.model.n_channels),
             'dropout': 0.5,
             'F1': 8,
             'D': 2,
@@ -687,6 +742,28 @@ def run_evaluation(
         }
         model = create_eegnet_model(task_type, model_config)
         logger.info("使用 EEGNet 模型架构")
+    elif model_type == 'multi_branch':
+        # Detect dimensions from first batch
+        sample_batch = next(iter(data_loader))
+        n_windows = sample_batch['eeg_data'].shape[1]
+        n_samples = sample_batch['eeg_data'].shape[3]
+        n_connectivity_types = sample_batch['connectivity'].shape[1]
+        n_graph_features = sample_batch['graph_metrics'].shape[2]
+        
+        logger.info(f"检测到输入维度: n_windows={n_windows}, n_samples={n_samples}")
+
+        model_config = {
+            'n_channels': config.model.n_channels,
+            'n_samples': n_samples,
+            'n_windows': n_windows,
+            'n_classes': 5 if task_type in ['onset_zone', 'region_5'] else (4 if task_type == 'hemi' else config.model.n_channels),
+            'n_connectivity_types': n_connectivity_types,
+            'n_graph_features': n_graph_features,
+            'fusion_type': fusion_type,
+            'dropout': 0.5
+        }
+        model = create_multi_branch_model(model_config)
+        logger.info(f"使用 Multi-Branch Fusion 模型架构 (Fusion: {fusion_type})")
     else:
         # STGNN模型配置（默认）
         model_config = {
@@ -737,10 +814,10 @@ def parse_args():
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='模型检查点路径')
     parser.add_argument('--task-type', type=str, default='onset_zone',
-                        choices=['channel', 'hemi', 'onset_zone'],
+                        choices=['channel', 'hemi', 'onset_zone', 'region_5'],
                         help='任务类型')
     parser.add_argument('--model-type', type=str, default='stgnn',
-                        choices=['stgnn', 'eegnet'],
+                        choices=['stgnn', 'eegnet', 'multi_branch'],
                         help='模型架构类型')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='输出目录')
@@ -758,6 +835,10 @@ def parse_args():
                         help='设备')
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
+    parser.add_argument('--fusion-type', type=str, default='attention',
+                        help='Fusion type for multi-branch model')
+    parser.add_argument('--segment-length', type=float, default=20.0,
+                        help='Segment length for multi-branch model')
     
     return parser.parse_args()
 
@@ -776,7 +857,9 @@ def main():
         n_folds=args.n_folds,
         batch_size=args.batch_size,
         device=args.device,
-        seed=args.seed
+        seed=args.seed,
+        fusion_type=args.fusion_type,
+        segment_length=args.segment_length
     )
 
 

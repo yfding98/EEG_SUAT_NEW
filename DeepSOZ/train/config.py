@@ -25,10 +25,10 @@ DEEPSOZ_ROOT = PROJECT_ROOT / "DeepSOZ"
 class DataConfig:
     """数据配置"""
     # 数据路径
-    manifest_path: str = str(DATA_ROOT / "detected_ensemble_updated_with_baseline.csv")
+    manifest_path: str = str(DATA_ROOT / "detected_ensemble_updated.csv")
     edf_data_roots: List[str] = field(default_factory=lambda: [
-        # r"E:\DataSet\EEG\private_data",  # 主数据目录
-        r"E:\DataSet\EEG\EEG dataset_SUAT",  # 备用目录
+        r"E:\DataSet\EEG\EEG dataset_SUAT",  # 本地目录
+        # r"/mnt/hd1/dyf/dataset/EEG dataset_SUAT",  # 服务器的原始数据目录
     ])
     
     # 标准19通道（DeepSOZ顺序）
@@ -81,6 +81,70 @@ class DataConfig:
         # 中线链
         ('FZ', 'CZ'), ('CZ', 'PZ'),
     ])
+
+    preprocessed_dir = str(DATA_ROOT / "preprocessed")
+    
+    # ==========================================================================
+    # 21电极配置（包含Sph-L和Sph-R蝶骨电极）
+    # ==========================================================================
+    use_21_channels: bool = True  # 是否使用21电极模式
+    
+    # 21电极通道列表（标准19 + Sph-L + Sph-R）
+    channel_names_21: List[str] = field(default_factory=lambda: [
+        'fp1', 'fp2', 'f7', 'f3', 'fz', 'f4', 'f8', 
+        't3', 'c3', 'cz', 'c4', 't4', 
+        't5', 'p3', 'pz', 'p4', 't6', 
+        'o1', 'o2',
+        'sphl', 'sphr'  # 蝶骨电极：Sph-L在F7和T3之间，Sph-R在F8和T4之间
+    ])
+    
+    # 5脑区双极导联定义（用户自定义）
+    # 共26对双极导联
+    bipolar_pairs_21: List[Tuple[str, str]] = field(default_factory=lambda: [
+        # 左额 (4对)
+        ('FP1', 'F7'), ('FP1', 'F3'), ('F7', 'F3'), ('F3', 'FZ'),
+        # 左颞 (6对)
+        ('F7', 'SPHL'), ('SPHL', 'T3'), ('T3', 'T5'), ('T5', 'O1'), ('T3', 'C3'), ('T5', 'P3'),
+        # 顶叶 (6对)
+        ('FZ', 'CZ'), ('C3', 'CZ'), ('P3', 'PZ'), ('CZ', 'PZ'), ('CZ', 'C4'), ('PZ', 'P4'),
+        # 右额 (4对)
+        ('FP2', 'F4'), ('FP2', 'F8'), ('F4', 'F8'), ('FZ', 'F4'),
+        # 右颞 (6对)
+        ('F8', 'SPHR'), ('SPHR', 'T4'), ('C4', 'T4'), ('T4', 'T6'), ('P4', 'T6'), ('T6', 'O2'),
+    ])
+    
+    # 5脑区电极映射（用于标签生成）
+    brain_region_electrodes_21: dict = field(default_factory=lambda: {
+        'left_frontal': ['fp1', 'f7', 'f3', 'fz'],
+        'left_temporal': ['f7', 'sphl', 't3', 't5', 'o1', 'c3', 'p3'],
+        'parietal': ['fz', 'cz', 'c3', 'c4', 'p3', 'pz', 'p4'],
+        'right_frontal': ['fp2', 'f4', 'f8', 'fz'],
+        'right_temporal': ['f8', 'sphr', 't4', 't6', 'o2', 'c4', 'p4'],
+    })
+    
+    # 5脑区双极导联映射（用于可视化）
+    brain_region_bipolar_21: dict = field(default_factory=lambda: {
+        'left_frontal': ['FP1-F7', 'FP1-F3', 'F7-F3', 'F3-FZ'],
+        'left_temporal': ['F7-SPHL', 'SPHL-T3', 'T3-T5', 'T5-O1', 'T3-C3', 'T5-P3'],
+        'parietal': ['FZ-CZ', 'C3-CZ', 'P3-PZ', 'CZ-PZ', 'CZ-C4', 'PZ-P4'],
+        'right_frontal': ['FP2-F4', 'FP2-F8', 'F4-F8', 'FZ-F4'],
+        'right_temporal': ['F8-SPHR', 'SPHR-T4', 'C4-T4', 'T4-T6', 'P4-T6', 'T6-O2'],
+    })
+    
+    # 横向导联排列（用于可视化对称性分析）
+    transverse_montage_21: List[Tuple[str, str]] = field(default_factory=lambda: [
+        # 前额排
+        ('FP1', 'FP2'),
+        # 前头部排
+        ('F7', 'F3'), ('F3', 'FZ'), ('FZ', 'F4'), ('F4', 'F8'),
+        # 中央排
+        ('T3', 'C3'), ('C3', 'CZ'), ('CZ', 'C4'), ('C4', 'T4'),
+        # 后颞/顶排
+        ('T5', 'P3'), ('P3', 'PZ'), ('PZ', 'P4'), ('P4', 'T6'),
+        # 枕部排
+        ('O1', 'O2'),
+    ])
+
 
 
 @dataclass
@@ -250,6 +314,35 @@ class ChannelConfig:
 
 
 @dataclass
+class MultiBranchConfig:
+    """多分支融合模型配置"""
+    # 融合特征维度（各分支统一输出维度，必须是16的倍数以配合EEGNet）
+    fusion_feature_dim: int = 32  # 各分支输出统一到这个维度
+    
+    # EEGNet分支配置
+    eegnet_F1: int = 8  # 时间卷积滤波器数量
+    eegnet_D: int = 2   # 深度乘数
+    eegnet_F2: int = 16  # 分离卷积滤波器数量
+    eegnet_kernel_length: int = 64  # 时间卷积核长度
+    eegnet_temporal_agg: str = 'attention'  # 时间聚合方式
+    
+    # GAT分支配置
+    gat_hidden_dim: int = 16  # GAT隐藏层维度
+    gat_n_heads: int = 2  # 注意力头数
+    gat_n_layers: int = 2  # GAT层数
+    
+    # Graph Metrics MLP分支配置
+    mlp_hidden_dim: int = 64  # MLP隐藏层维度
+    
+    # 融合配置
+    fusion_type: str = 'attention'  # 融合策略: 'concat', 'attention', 'gated'
+    fusion_dim: int = 64  # 融合后的输出维度
+    
+    # Dropout
+    dropout: float = 0.5
+
+
+@dataclass
 class Config:
     """完整配置"""
     data: DataConfig = field(default_factory=DataConfig)
@@ -259,6 +352,7 @@ class Config:
     onset_zone: OnsetZoneConfig = field(default_factory=OnsetZoneConfig)
     hemi: HemiConfig = field(default_factory=HemiConfig)
     channel: ChannelConfig = field(default_factory=ChannelConfig)
+    multi_branch: MultiBranchConfig = field(default_factory=MultiBranchConfig)  # 新增
     
     def __post_init__(self):
         """初始化后检查和创建目录"""

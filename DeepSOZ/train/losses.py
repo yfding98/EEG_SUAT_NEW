@@ -26,11 +26,24 @@ class FocalLoss(nn.Module):
     Focal Loss - 处理类别不平衡
     
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    
+    Args:
+        alpha: 正类权重。可以是：
+            - float: 所有类别使用相同权重
+            - list/tensor: 每个类别使用不同权重，如 [1.0, 1.0, 1.5, 1.0, 3.0] 
+        gamma: 聚焦参数，越大越关注难分类样本。建议范围 [2.0, 5.0]
+        reduction: 'mean', 'sum', 'none'
     """
     
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean'):
+    def __init__(self, alpha=0.25, gamma: float = 2.0, reduction: str = 'mean'):
         super().__init__()
-        self.alpha = alpha
+        # 支持 list/tensor 类型的 alpha（每个类别不同权重）
+        if isinstance(alpha, (list, tuple)):
+            self.register_buffer('alpha', torch.tensor(alpha, dtype=torch.float32))
+        elif isinstance(alpha, torch.Tensor):
+            self.register_buffer('alpha', alpha.float())
+        else:
+            self.alpha = alpha  # float 标量
         self.gamma = gamma
         self.reduction = reduction
     
@@ -40,9 +53,20 @@ class FocalLoss(nn.Module):
             inputs: (B, C) 预测logits
             targets: (B, C) 目标标签 (0/1)
         """
+        inputs, targets = ensure_same_device(inputs, targets)
+        
         BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         pt = torch.exp(-BCE_loss)
-        F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+        
+        # 处理 alpha
+        if isinstance(self.alpha, torch.Tensor):
+            # 确保 alpha 在正确设备上，并扩展到 (1, C) 以便广播
+            alpha = self.alpha.to(inputs.device)
+            if alpha.dim() == 1:
+                alpha = alpha.unsqueeze(0)  # (1, C)
+            F_loss = alpha * (1 - pt) ** self.gamma * BCE_loss
+        else:
+            F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
         
         if self.reduction == 'mean':
             return F_loss.mean()
@@ -379,29 +403,49 @@ class SOZLocalizationLoss(nn.Module):
 
 class OnsetZoneLoss(nn.Module):
     """
-    onset_zone脑区级别损失函数
+    onset_zone/chain 多标签分类损失函数
     
-    多标签分类损失（5个脑区: frontal, temporal, central, parietal, occipital）
+    支持动态类别数量和每类别不同权重
+    
+    Args:
+        loss_type: 'bce', 'focal', 'dice'
+        pos_weight: 正类权重。可以是：
+            - float: 所有类别使用相同权重
+            - list/tensor: 每个类别不同权重，如 [2.0, 2.0, 3.0, 2.0, 5.0]
+        focal_alpha: Focal Loss 的 alpha 参数。可以是 float 或 list/tensor
+        focal_gamma: Focal Loss 的 gamma 参数。越大越关注难分类样本
+        label_smoothing: 标签平滑系数
+        n_classes: 类别数（默认5，可根据label_type调整）
     """
     
     def __init__(
         self,
         loss_type: str = 'bce',
-        pos_weight: float = 2.0,
-        focal_alpha: float = 0.25,
+        pos_weight=2.0,  # float 或 list/tensor
+        focal_alpha=0.25,  # float 或 list/tensor
         focal_gamma: float = 2.0,
-        label_smoothing: float = 0.1
+        label_smoothing: float = 0.1,
+        n_classes: int = 5
     ):
         super().__init__()
         
-        self.n_classes = 5
+        self.n_classes = n_classes
+        self.loss_type = loss_type
         
         if loss_type == 'focal':
+            # focal_alpha 可以是 float 或 list/tensor（每类别不同）
             self.loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
         elif loss_type == 'dice':
             self.loss = DiceLoss()
         else:
-            pw = torch.ones(self.n_classes) * pos_weight
+            # 处理 pos_weight
+            if isinstance(pos_weight, (list, tuple)):
+                pw = torch.tensor(pos_weight, dtype=torch.float32)
+            elif isinstance(pos_weight, torch.Tensor):
+                pw = pos_weight.float()
+            else:
+                pw = torch.ones(n_classes) * pos_weight
+            
             if label_smoothing > 0:
                 self.loss = LabelSmoothingBCE(smoothing=label_smoothing, pos_weight=pw)
             else:
@@ -411,8 +455,8 @@ class OnsetZoneLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pred: (B, 5) 脑区预测
-            target: (B, 5) 脑区标签
+            pred: (B, n_classes) 预测logits
+            target: (B, n_classes) 目标标签
         """
         pred, target = ensure_same_device(pred, target)
         return self.loss(pred, target)

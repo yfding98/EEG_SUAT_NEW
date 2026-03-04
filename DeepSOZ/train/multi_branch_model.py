@@ -153,7 +153,7 @@ class EEGNetBranch(nn.Module):
     """
     EEGNet分支 - 处理多窗口EEG数据
     
-    支持时间注意力聚合
+    支持时间注意力聚合和输出维度投影
     """
     
     def __init__(
@@ -166,7 +166,8 @@ class EEGNetBranch(nn.Module):
         D: int = 2,
         F2: int = 16,
         kernel_length: int = 64,
-        temporal_aggregation: str = 'attention'
+        temporal_aggregation: str = 'attention',
+        output_dim: int = None  # 新增：统一输出维度，None表示使用原始维度
     ):
         super().__init__()
         
@@ -184,15 +185,26 @@ class EEGNetBranch(nn.Module):
             kernel_length=kernel_length
         )
         
-        self.feature_dim = self.backbone.output_dim
+        self.backbone_dim = self.backbone.output_dim
         
         # 时间聚合
         if temporal_aggregation == 'attention':
             self.temporal_attention = nn.Sequential(
-                nn.Linear(self.feature_dim, self.feature_dim // 4),
+                nn.Linear(self.backbone_dim, max(1, self.backbone_dim // 4)),
                 nn.Tanh(),
-                nn.Linear(self.feature_dim // 4, 1),
+                nn.Linear(max(1, self.backbone_dim // 4), 1),
             )
+        
+        # 输出投影层（将backbone输出投影到统一维度）
+        self._output_dim = output_dim if output_dim is not None else self.backbone_dim
+        if output_dim is not None and output_dim != self.backbone_dim:
+            self.output_proj = nn.Sequential(
+                nn.Linear(self.backbone_dim, output_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            )
+        else:
+            self.output_proj = None
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -202,14 +214,14 @@ class EEGNetBranch(nn.Module):
             x: (B, n_windows, C, T) 多窗口EEG数据
         
         Returns:
-            features: (B, feature_dim)
+            features: (B, output_dim)
         """
         B, n_windows, C, T = x.shape
         
         # 展开处理每个窗口
         x = x.view(B * n_windows, 1, C, T)
         features = self.backbone(x)
-        features = features.view(B, n_windows, -1)  # (B, n_windows, feature_dim)
+        features = features.view(B, n_windows, -1)  # (B, n_windows, backbone_dim)
         
         # 时间聚合
         if self.temporal_aggregation == 'mean':
@@ -219,15 +231,19 @@ class EEGNetBranch(nn.Module):
         elif self.temporal_aggregation == 'attention':
             attn_weights = self.temporal_attention(features)  # (B, n_windows, 1)
             attn_weights = F.softmax(attn_weights, dim=1)
-            aggregated = (features * attn_weights).sum(dim=1)  # (B, feature_dim)
+            aggregated = (features * attn_weights).sum(dim=1)  # (B, backbone_dim)
         else:
             aggregated = features.mean(dim=1)
+        
+        # 投影到统一维度
+        if self.output_proj is not None:
+            aggregated = self.output_proj(aggregated)
         
         return aggregated
     
     @property
     def output_dim(self) -> int:
-        return self.feature_dim
+        return self._output_dim
 
 
 # ==============================================================================
@@ -343,10 +359,13 @@ class GATBranch(nn.Module):
         
         # GAT层
         self.gat_layers = nn.ModuleList()
+        # 计算最后一层的输出维度（concat=False时取平均，所以输出是out_features）
+        last_layer_out = hidden_dim  # 最后一层每个head输出hidden_dim，然后取平均
+        
         for i in range(n_layers):
             in_dim = hidden_dim * n_heads
-            out_dim = hidden_dim if i < n_layers - 1 else output_dim // n_heads
-            concat = i < n_layers - 1
+            out_dim = hidden_dim  # 每层都输出hidden_dim
+            concat = i < n_layers - 1  # 只有最后一层concat=False
             
             self.gat_layers.append(
                 GraphAttentionLayer(
@@ -357,6 +376,9 @@ class GATBranch(nn.Module):
                     concat=concat
                 )
             )
+        
+        # 最后一层concat=False后输出维度是hidden_dim，需要投影到output_dim
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
         
         self._output_dim = output_dim
         self.dropout = nn.Dropout(dropout)
@@ -403,7 +425,10 @@ class GATBranch(nn.Module):
             x = F.elu(x)
         
         # 全局池化
-        features = x.mean(dim=1)  # (B, output_dim)
+        features = x.mean(dim=1)  # (B, hidden_dim)
+        
+        # 投影到output_dim
+        features = self.output_proj(features)  # (B, output_dim)
         
         return features
     
@@ -628,6 +653,7 @@ class MultiBranchFusionModel(nn.Module):
         n_classes: 分类类别数
         n_connectivity_types: 连接性矩阵类型数
         n_graph_features: 图指标数量
+        fusion_feature_dim: 各分支统一输出维度（必须是16的倍数）
         fusion_type: 融合策略 ('concat', 'attention', 'gated')
         fusion_dim: 融合后特征维度
         dropout: dropout率
@@ -643,6 +669,7 @@ class MultiBranchFusionModel(nn.Module):
         n_classes: int = 5,
         n_connectivity_types: int = 6,
         n_graph_features: int = 5,
+        fusion_feature_dim: int = 64,  # 新增：各分支统一输出维度
         fusion_type: str = 'attention',
         fusion_dim: int = 128,
         dropout: float = 0.5,
@@ -654,12 +681,13 @@ class MultiBranchFusionModel(nn.Module):
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.fusion_type = fusion_type
+        self.fusion_feature_dim = fusion_feature_dim
         
         # 默认配置
         eegnet_config = eegnet_config or {}
         gat_config = gat_config or {}
         
-        # 分支1: EEGNet
+        # 分支1: EEGNet - 输出投影到fusion_feature_dim
         self.eegnet_branch = EEGNetBranch(
             n_channels=n_channels,
             n_samples=n_samples,
@@ -669,34 +697,35 @@ class MultiBranchFusionModel(nn.Module):
             D=eegnet_config.get('D', 2),
             F2=eegnet_config.get('F2', 16),
             kernel_length=eegnet_config.get('kernel_length', 64),
-            temporal_aggregation=eegnet_config.get('temporal_aggregation', 'attention')
+            temporal_aggregation=eegnet_config.get('temporal_aggregation', 'attention'),
+            output_dim=fusion_feature_dim  # 统一输出维度
         )
         
-        # 分支2: GAT
+        # 分支2: GAT - 输出投影到fusion_feature_dim
         self.gat_branch = GATBranch(
             n_channels=n_channels,
             n_connectivity_types=n_connectivity_types,
             hidden_dim=gat_config.get('hidden_dim', 32),
-            output_dim=gat_config.get('output_dim', 64),
+            output_dim=fusion_feature_dim,  # 统一输出维度
             n_heads=gat_config.get('n_heads', 4),
             n_layers=gat_config.get('n_layers', 2),
             dropout=dropout
         )
         
-        # 分支3: Graph Metrics MLP
+        # 分支3: Graph Metrics MLP - 输出投影到fusion_feature_dim
         self.graph_metrics_branch = GraphMetricsBranch(
             n_channels=n_channels,
             n_graph_features=n_graph_features,
             hidden_dim=64,
-            output_dim=32,
+            output_dim=fusion_feature_dim,  # 统一输出维度
             dropout=dropout
         )
         
-        # 各分支输出维度
+        # 各分支输出维度（现在都是fusion_feature_dim）
         branch_dims = [
-            self.eegnet_branch.output_dim,
-            self.gat_branch.output_dim,
-            self.graph_metrics_branch.output_dim
+            fusion_feature_dim,
+            fusion_feature_dim,
+            fusion_feature_dim
         ]
         
         # 融合模块
@@ -775,7 +804,9 @@ def create_multi_branch_model(config: Dict = None) -> MultiBranchFusionModel:
     创建多分支融合模型
     
     Args:
-        config: 模型配置字典
+        config: 模型配置字典，包含:
+            - fusion_feature_dim: 各分支统一输出维度（默认64，必须是16的倍数）
+            - 其他参数...
     
     Returns:
         model: MultiBranchFusionModel实例
@@ -789,6 +820,7 @@ def create_multi_branch_model(config: Dict = None) -> MultiBranchFusionModel:
         n_classes=config.get('n_classes', 5),
         n_connectivity_types=config.get('n_connectivity_types', 6),
         n_graph_features=config.get('n_graph_features', 5),
+        fusion_feature_dim=config.get('fusion_feature_dim', 64),  # 统一分支输出维度
         fusion_type=config.get('fusion_type', 'attention'),
         fusion_dim=config.get('fusion_dim', 128),
         dropout=config.get('dropout', 0.5),

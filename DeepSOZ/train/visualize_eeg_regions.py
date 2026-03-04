@@ -39,6 +39,7 @@ from dataset import (
 )
 from connectivity import compute_all_connectivity
 from connectivity_viz import visualize_all_connectivity
+from connectivity_viz_bipolar import visualize_bipolar_connectivity
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +63,94 @@ REGION_CHANNEL_NAMES = {
     'parietal': ['P3', 'PZ', 'P4'],
     'occipital': ['O1', 'O2']
 }
+
+# ==============================================================================
+# 双极导联五链区域定义
+# ==============================================================================
+
+# 双极导联标准18通道顺序（与dataset.py中BIPOLAR_PAIRS_18一致）
+BIPOLAR_18_CHANNEL_NAMES = [
+    'FP1-F7', 'F7-T3', 'T3-T5', 'T5-O1',      # 左颞链 (0-3)
+    'FP2-F8', 'F8-T4', 'T4-T6', 'T6-O2',      # 右颞链 (4-7)
+    'FP1-F3', 'F3-C3', 'C3-P3', 'P3-O1',      # 左副矢状链 (8-11)
+    'FP2-F4', 'F4-C4', 'C4-P4', 'P4-O2',      # 右副矢状链 (12-15)
+    'FZ-CZ', 'CZ-PZ'                           # 中线链 (16-17)
+]
+
+# 双极导联链区域到通道索引的映射
+BIPOLAR_CHAIN_TO_CHANNEL_IDX = {
+    'left_temporal': [0, 1, 2, 3],       # 左颞链: FP1-F7, F7-T3, T3-T5, T5-O1
+    'right_temporal': [4, 5, 6, 7],      # 右颞链: FP2-F8, F8-T4, T4-T6, T6-O2
+    'left_parasagittal': [8, 9, 10, 11], # 左副矢状链: FP1-F3, F3-C3, C3-P3, P3-O1
+    'right_parasagittal': [12, 13, 14, 15], # 右副矢状链: FP2-F4, F4-C4, C4-P4, P4-O2
+    'midline': [16, 17]                  # 中线链: FZ-CZ, CZ-PZ
+}
+
+# 双极导联链区域对应的通道名称
+BIPOLAR_CHAIN_CHANNEL_NAMES = {
+    'left_temporal': ['FP1-F7', 'F7-T3', 'T3-T5', 'T5-O1'],
+    'right_temporal': ['FP2-F8', 'F8-T4', 'T4-T6', 'T6-O2'],
+    'left_parasagittal': ['FP1-F3', 'F3-C3', 'C3-P3', 'P3-O1'],
+    'right_parasagittal': ['FP2-F4', 'F4-C4', 'C4-P4', 'P4-O2'],
+    'midline': ['FZ-CZ', 'CZ-PZ']
+}
+
+# 双极导联链区域显示名称
+BIPOLAR_CHAIN_DISPLAY_NAMES = {
+    'left_temporal': '左颞链 (L-Temp)',
+    'right_temporal': '右颞链 (R-Temp)',
+    'left_parasagittal': '左副矢状链 (L-Para)',
+    'right_parasagittal': '右副矢状链 (R-Para)',
+    'midline': '中线链 (Midline)'
+}
+
+# 单极电极到双极通道的映射（用于SOZ标记）
+# 格式: {单极电极: [(双极通道名, 链名), ...]}
+UNIPOLAR_TO_BIPOLAR_MAP = {
+    'FP1': [('FP1-F7', 'left_temporal'), ('FP1-F3', 'left_parasagittal')],
+    'FP2': [('FP2-F8', 'right_temporal'), ('FP2-F4', 'right_parasagittal')],
+    'F7': [('FP1-F7', 'left_temporal'), ('F7-T3', 'left_temporal')],
+    'F3': [('FP1-F3', 'left_parasagittal'), ('F3-C3', 'left_parasagittal')],
+    'FZ': [('FZ-CZ', 'midline')],
+    'F4': [('FP2-F4', 'right_parasagittal'), ('F4-C4', 'right_parasagittal')],
+    'F8': [('FP2-F8', 'right_temporal'), ('F8-T4', 'right_temporal')],
+    'T3': [('F7-T3', 'left_temporal'), ('T3-T5', 'left_temporal')],
+    'C3': [('F3-C3', 'left_parasagittal'), ('C3-P3', 'left_parasagittal')],
+    'CZ': [('FZ-CZ', 'midline'), ('CZ-PZ', 'midline')],
+    'C4': [('F4-C4', 'right_parasagittal'), ('C4-P4', 'right_parasagittal')],
+    'T4': [('F8-T4', 'right_temporal'), ('T4-T6', 'right_temporal')],
+    'T5': [('T3-T5', 'left_temporal'), ('T5-O1', 'left_temporal')],
+    'P3': [('C3-P3', 'left_parasagittal'), ('P3-O1', 'left_parasagittal')],
+    'PZ': [('CZ-PZ', 'midline')],
+    'P4': [('C4-P4', 'right_parasagittal'), ('P4-O2', 'right_parasagittal')],
+    'T6': [('T4-T6', 'right_temporal'), ('T6-O2', 'right_temporal')],
+    'O1': [('T5-O1', 'left_temporal'), ('P3-O1', 'left_parasagittal')],
+    'O2': [('T6-O2', 'right_temporal'), ('P4-O2', 'right_parasagittal')]
+}
+
+
+def get_soz_bipolar_info(soz_channels: set) -> Tuple[set, set]:
+    """
+    根据SOZ单极电极获取相关的双极通道和链
+    
+    Args:
+        soz_channels: SOZ单极电极名称集合 (如 {'FP1', 'F7'})
+    
+    Returns:
+        soz_chains: 包含SOZ的链名称集合
+        soz_bipolar_channels: 包含SOZ电极的双极通道名称集合
+    """
+    soz_chains = set()
+    soz_bipolar_channels = set()
+    
+    for ch in soz_channels:
+        ch_upper = ch.upper()
+        if ch_upper in UNIPOLAR_TO_BIPOLAR_MAP:
+            for bipolar_ch, chain_name in UNIPOLAR_TO_BIPOLAR_MAP[ch_upper]:
+                soz_chains.add(chain_name)
+                soz_bipolar_channels.add(bipolar_ch)
+    
+    return soz_chains, soz_bipolar_channels
 
 
 def normalize_data(data: np.ndarray, global_min: float = None, global_max: float = None) -> np.ndarray:
@@ -113,7 +202,8 @@ def plot_waveform(
     title: str,
     save_path: str,
     global_min: float = None,
-    global_max: float = None
+    global_max: float = None,
+    soz_channels: set = None
 ):
     """
     绘制脑区通道的原始波形图
@@ -126,9 +216,13 @@ def plot_waveform(
         save_path: 保存路径
         global_min: 全局最小值（用于所有通道统一归一化）
         global_max: 全局最大值（用于所有通道统一归一化）
+        soz_channels: SOZ通道名称集合（这些通道的Y轴标签显示为红色）
     """
     n_channels, n_samples = region_data.shape
     time = np.arange(n_samples) / fs
+    
+    if soz_channels is None:
+        soz_channels = set()
     
     fig, axes = plt.subplots(n_channels, 1, figsize=(14, 2 * n_channels), sharex=True)
     if n_channels == 1:
@@ -138,7 +232,13 @@ def plot_waveform(
         # 使用全局归一化
         normalized_data = normalize_data(region_data[i], global_min, global_max)
         ax.plot(time, normalized_data, 'b-', linewidth=0.5)
-        ax.set_ylabel(ch_name, fontsize=10, rotation=0, ha='right', va='center')
+        
+        # 判断是否为SOZ通道（红色标签）
+        is_soz = ch_name.upper() in {ch.upper() for ch in soz_channels}
+        label_color = 'red' if is_soz else 'black'
+        ax.set_ylabel(ch_name, fontsize=10, rotation=0, ha='right', va='center', 
+                     color=label_color, fontweight='bold' if is_soz else 'normal')
+        
         ax.set_ylim(-0.1, 1.1)
         ax.grid(True, alpha=0.3)
         ax.set_yticks([0, 0.5, 1.0])
@@ -158,7 +258,8 @@ def plot_heatmap(
     title: str,
     save_path: str,
     global_min: float = None,
-    global_max: float = None
+    global_max: float = None,
+    soz_channels: set = None
 ):
     """
     绘制脑区通道的RGB热力图
@@ -171,8 +272,12 @@ def plot_heatmap(
         save_path: 保存路径
         global_min: 全局最小值（用于所有通道统一归一化）
         global_max: 全局最大值（用于所有通道统一归一化）
+        soz_channels: SOZ通道名称集合（这些通道的Y轴标签显示为红色）
     """
     n_channels, n_samples = region_data.shape
+    
+    if soz_channels is None:
+        soz_channels = set()
     
     # 为每个通道创建热力图（使用全局归一化）
     heatmaps = []
@@ -195,7 +300,13 @@ def plot_heatmap(
     
     for i, (ax, ch_name, heatmap) in enumerate(zip(axes, channel_names, heatmaps)):
         ax.imshow(heatmap, aspect='auto', extent=[time_extent[0], time_extent[1], 0, 1])
-        ax.set_ylabel(ch_name, fontsize=10, rotation=0, ha='right', va='center')
+        
+        # 判断是否为SOZ通道（红色标签）
+        is_soz = ch_name.upper() in {ch.upper() for ch in soz_channels}
+        label_color = 'red' if is_soz else 'black'
+        ax.set_ylabel(ch_name, fontsize=10, rotation=0, ha='right', va='center',
+                     color=label_color, fontweight='bold' if is_soz else 'normal')
+        
         ax.set_yticks([])
         ax.set_xlim(time_extent)
     
@@ -269,7 +380,7 @@ def process_and_visualize(
         logger.warning(f"无发作时间: {row.get('fn')}")
         return
     
-    # 解析SOZ脑区
+    # 解析SOZ脑区（用于单极导联模式）
     onset_zone_str = row.get('onset_zone', '')
     soz_regions = set()
     if pd.notna(onset_zone_str) and onset_zone_str:
@@ -277,6 +388,33 @@ def process_and_visualize(
             part = part.strip()
             if part in REGION_TO_CHANNEL_IDX:
                 soz_regions.add(part)
+    
+    # 解析通道级别SOZ（用于双极导联模式）
+    # 从CSV中读取每个通道列的值，值为1表示该通道是SOZ
+    soz_unipolar_channels = set()
+    channel_names_in_csv = ['fp1', 'fp2', 'f7', 'f3', 'fz', 'f4', 'f8',
+                             't3', 'c3', 'cz', 'c4', 't4',
+                             't5', 'p3', 'pz', 'p4', 't6',
+                             'o1', 'o2']
+    for ch in channel_names_in_csv:
+        ch_value = row.get(ch, 0)
+        if ch_value is None:
+            ch_value = row.get(ch.upper(), 0)
+        try:
+            if pd.notna(ch_value) and int(ch_value) == 1:
+                soz_unipolar_channels.add(ch.upper())
+        except (ValueError, TypeError):
+            pass
+    
+    # 如果有通道级别SOZ，获取双极导联的SOZ信息
+    if soz_unipolar_channels:
+        soz_chains, soz_bipolar_channels = get_soz_bipolar_info(soz_unipolar_channels)
+        logger.info(f"SOZ单极电极: {soz_unipolar_channels}")
+        logger.info(f"SOZ双极通道: {soz_bipolar_channels}")
+        logger.info(f"SOZ链区域: {soz_chains}")
+    else:
+        soz_chains = set()
+        soz_bipolar_channels = set()
     
     try:
         # 1. 读取EDF
@@ -344,32 +482,84 @@ def process_and_visualize(
             
             # 按脑区可视化
             if use_bipolar:
-                # 双极导联暂时跳过脑区划分，统一可视化
+                # 双极导联按五个链区域分别可视化
                 title_base = f"{pt_id} - {fn} - SZ{sz_idx+1} ({sz_start:.1f}s - {sz_end:.1f}s)"
                 
-                # 波形图
-                waveform_path = patient_dir / "all_channels_waveform.png"
-                plot_waveform(
-                    seizure_segment,
-                    found_channels,
-                    fs,
-                    f"{title_base} - All Channels Waveform",
-                    str(waveform_path),
-                    global_min=global_min,
-                    global_max=global_max
-                )
+                # 遍历五个链区域
+                for chain_name, channel_indices in BIPOLAR_CHAIN_TO_CHANNEL_IDX.items():
+                    # 获取该链区域的数据
+                    chain_data = seizure_segment[channel_indices, :]
+                    chain_ch_names = BIPOLAR_CHAIN_CHANNEL_NAMES[chain_name]
+                    chain_display_name = BIPOLAR_CHAIN_DISPLAY_NAMES[chain_name]
+                    
+                    # 检查该链是否包含SOZ
+                    is_soz_chain = chain_name in soz_chains
+                    soz_marker = " [SOZ]" if is_soz_chain else ""
+                    
+                    # 获取该链中的SOZ通道（用于红色标签）
+                    chain_soz_channels = set()
+                    for ch in chain_ch_names:
+                        if ch.upper() in {c.upper() for c in soz_bipolar_channels}:
+                            chain_soz_channels.add(ch)
+                    
+                    title_chain = f"{title_base} - {chain_display_name}{soz_marker}"
+                    
+                    # 波形图
+                    waveform_suffix = "_soz" if is_soz_chain else ""
+                    waveform_path = patient_dir / f"{chain_name}{waveform_suffix}_waveform.png"
+                    plot_waveform(
+                        chain_data,
+                        chain_ch_names,
+                        fs,
+                        f"{title_chain} - Waveform",
+                        str(waveform_path),
+                        global_min=global_min,
+                        global_max=global_max,
+                        soz_channels=chain_soz_channels
+                    )
+                    
+                    # 热力图
+                    heatmap_path = patient_dir / f"{chain_name}{waveform_suffix}_heatmap.png"
+                    plot_heatmap(
+                        chain_data,
+                        chain_ch_names,
+                        fs,
+                        f"{title_chain} - Heatmap",
+                        str(heatmap_path),
+                        global_min=global_min,
+                        global_max=global_max,
+                        soz_channels=chain_soz_channels
+                    )
                 
-                # 热力图
-                heatmap_path = patient_dir / "all_channels_heatmap.png"
-                plot_heatmap(
-                    seizure_segment,
-                    found_channels,
-                    fs,
-                    f"{title_base} - All Channels Heatmap",
-                    str(heatmap_path),
-                    global_min=global_min,
-                    global_max=global_max
-                )
+                # ===============================================================
+                # 双极导联脑网络连接性特征计算与可视化
+                # ===============================================================
+                if seizure_segment.shape[0] == 18:
+                    logger.info("计算双极导联脑网络连接性特征...")
+                    
+                    try:
+                        connectivity_dict = compute_all_connectivity(
+                            seizure_segment, 
+                            fs=fs,
+                            freq_band=(8, 13),
+                            include_directed=True
+                        )
+                        
+                        connectivity_dir = patient_dir / "connectivity_bipolar"
+                        
+                        visualize_bipolar_connectivity(
+                            connectivity_dict,
+                            output_dir=str(connectivity_dir),
+                            prefix=f"SZ{sz_idx+1}",
+                            percentile=70.0,
+                            zscore_threshold=3.0,
+                            max_lines=60
+                        )
+                        
+                        logger.info(f"双极导联连接性可视化完成: {connectivity_dir}")
+                        
+                    except Exception as conn_e:
+                        logger.warning(f"双极导联连接性计算失败: {conn_e}")
             else:
                 # 单极导联按脑区可视化
                 for region_name, channel_indices in REGION_TO_CHANNEL_IDX.items():
@@ -464,7 +654,7 @@ def main():
                         help='输出目录（默认创建时间戳目录）')
     parser.add_argument('--max-records', type=int, default=None,
                         help='最大处理记录数（调试用）')
-    parser.add_argument('--bipolar', action='store_true',
+    parser.add_argument('--bipolar', type=bool, default=True,
                         help='使用TCP双极导联')
     args = parser.parse_args()
     
@@ -482,7 +672,10 @@ def main():
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = Path(__file__).parent / "visualizations" / timestamp
+        if args.bipolar:
+            output_dir = Path(__file__).parent / "visualizations" / f"{timestamp}_{args.format}_bipolar"
+        else:
+            output_dir = Path(__file__).parent / "visualizations" / f"{timestamp}_{args.format}"
     
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"输出目录: {output_dir}")
