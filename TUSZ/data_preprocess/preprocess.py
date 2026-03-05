@@ -1034,7 +1034,304 @@ def process_private_file(row: pd.Series, cfg: PreprocessConfig) -> List[Dict]:
 
 
 # ==============================================================================
-# 主处理流程
+# 统一处理: combined_manifest.csv
+# ==============================================================================
+
+# combined_manifest.csv 的22个TCP通道列名 (与config.py TCP_BIPOLAR_PAIRS对齐)
+COMBINED_TCP_COLUMNS = [
+    'FP1_F7', 'F7_T3', 'T3_T5', 'T5_O1',       # 左颞链 0-3
+    'FP2_F8', 'F8_T4', 'T4_T6', 'T6_O2',       # 右颞链 4-7
+    'FP1_F3', 'F3_C3', 'C3_P3', 'P3_O1',       # 左副矢状链 8-11
+    'FP2_F4', 'F4_C4', 'C4_P4', 'P4_O2',       # 右副矢状链 12-15
+    'A1_T3', 'T3_C3', 'C3_CZ', 'CZ_C4',        # 中央链 16-21
+    'C4_T4', 'T4_A2',
+]
+
+# combined_manifest列顺序 → config.py TCP_BIPOLAR_PAIRS 顺序 的映射
+# combined_manifest: 左颞(0-3), 右颞(4-7), 左副矢(8-11), 右副矢(12-15), 中央(16-21)
+# config.py:        左颞(0-3), 右颞(4-7), 中央(8-13), 左副矢(14-17), 右副矢(18-21)
+_CSV_TO_CFG_ORDER = [
+    0, 1, 2, 3,       # 左颞 → 左颞
+    4, 5, 6, 7,       # 右颞 → 右颞
+    16, 17, 18, 19, 20, 21,  # 中央 (CSV idx 16-21 → cfg idx 8-13)
+    8, 9, 10, 11,     # 左副矢 (CSV idx 8-11 → cfg idx 14-17)
+    12, 13, 14, 15,   # 右副矢 (CSV idx 12-15 → cfg idx 18-21)
+]
+
+
+def get_combined_channel_labels(row: pd.Series) -> np.ndarray:
+    """
+    从 combined_manifest.csv 行直接读取22通道SOZ标签
+
+    combined_manifest 的列顺序与 config.py 的 TCP_BIPOLAR_PAIRS 不同，
+    需要重新映射到 config.py 的顺序。
+
+    Returns:
+        (22,) float32 — 按 config.py TCP_BIPOLAR_PAIRS 顺序排列
+    """
+    # 先按 CSV 列顺序读取
+    csv_labels = np.array(
+        [int(float(row.get(col, 0))) for col in COMBINED_TCP_COLUMNS],
+        dtype=np.float32,
+    )  # (22,) 按CSV列顺序
+
+    # 映射到 config.py TCP 顺序
+    cfg_labels = np.zeros(N_TCP_CHANNELS, dtype=np.float32)
+    for cfg_idx, csv_idx in enumerate(_CSV_TO_CFG_ORDER):
+        cfg_labels[cfg_idx] = csv_labels[csv_idx]
+
+    return cfg_labels
+
+
+def process_combined_row(row: pd.Series, cfg: PreprocessConfig) -> List[Dict]:
+    """
+    处理 combined_manifest.csv 中的一行
+
+    根据 source 列自动分发到 TUSZ 或私有数据的处理逻辑。
+    标签统一从22个TCP列直接读取。
+
+    Args:
+        row: combined_manifest.csv 中的一行
+        cfg: 预处理配置
+
+    Returns:
+        样本字典列表 (每个窗口一个)
+    """
+    source = str(row.get('source', 'tusz')).strip().lower()
+    results = []
+
+    # ── 标签（统一从22列读取）──
+    ch_labels = get_combined_channel_labels(row)
+    reg_labels = get_channel_to_region_labels(ch_labels)
+
+    # ── 解析发作时间 ──
+    try:
+        sz_start = float(row['sz_start'])
+        sz_end = float(row['sz_end'])
+    except (KeyError, ValueError, TypeError):
+        logger.debug(f"无效发作时间: patient={row.get('patient_id', '?')}")
+        return results
+    if sz_end <= sz_start:
+        return results
+
+    # ── 定位文件 ──
+    edf_rel = str(row.get('edf_path', ''))
+    if source == 'tusz':
+        edf_path = str(Path(cfg.tusz_data_root) / edf_rel)
+    else:
+        # 私有数据: 尝试多个数据根目录
+        edf_path = None
+        for root in cfg.private_data_roots:
+            candidate = Path(root) / edf_rel
+            if candidate.exists():
+                edf_path = str(candidate)
+                break
+        if edf_path is None:
+            # 尝试 find_private_file (兼容 .set 路径)
+            edf_path = find_private_file(edf_rel, cfg.private_data_roots, cfg.private_file_format)
+        if edf_path is None:
+            logger.warning(f"找不到文件: {edf_rel} (source={source})")
+            return results
+
+    if not Path(edf_path).exists():
+        logger.warning(f"文件不存在: {edf_path}")
+        return results
+
+    # ── 1. 读取 ──
+    try:
+        raw_data, ch_names, fs = read_data_file(edf_path)
+    except Exception as e:
+        logger.error(f"读取失败 {edf_path}: {e}")
+        return results
+
+    # ── 2. 提取标准电极 ──
+    electrode_data, name_to_idx = extract_standard_electrodes(raw_data, ch_names)
+
+    # ── 3-5. 滤波/裁剪/重采样 ──
+    electrode_data, cur_fs = preprocess_electrode_data(electrode_data, fs, cfg)
+
+    file_dur = electrode_data.shape[1] / cur_fs
+
+    # ── 6. 提取发作段 ──
+    if source == 'tusz':
+        # TUSZ: 带缓冲区
+        seg_s = max(0, sz_start - cfg.pre_seizure_buffer)
+        seg_e = min(file_dur, sz_end + cfg.post_seizure_buffer)
+    else:
+        # 私有数据: 精确发作段
+        seg_s = max(0, sz_start)
+        seg_e = min(file_dur, sz_end)
+
+    seizure_seg = electrode_data[:, int(seg_s * cur_fs):int(seg_e * cur_fs)]
+
+    # 私有数据坏段剔除
+    if source == 'private':
+        mask_segs = parse_mask_segments(row.get('mask_segments', None))
+        if mask_segs:
+            seizure_seg, _ = remove_bad_segments(
+                seizure_seg, cur_fs, mask_segs,
+                seg_start=seg_s, seg_end=seg_e,
+            )
+            if seizure_seg.shape[1] == 0:
+                logger.debug(f"坏段剔除后无数据: {edf_path}")
+                return results
+
+    # ── 提取基线 ──
+    baseline_seg = None
+    if source == 'tusz':
+        # TUSZ: 从非发作间隔提取（简化：只用一个发作事件）
+        baseline_seg = extract_tusz_baseline(
+            electrode_data, cur_fs,
+            [sz_start], [sz_end], 0,
+            cfg.baseline_duration,
+        )
+    else:
+        baseline_seg = extract_private_baseline(
+            electrode_data, cur_fs, row, cfg.baseline_duration,
+        )
+
+    # ── 7. TCP转换 ──
+    sz_tcp, ch_mask = convert_to_tcp_bipolar(seizure_seg, name_to_idx)
+
+    # ── 8. 标准化 ──
+    has_bl = False
+    bl_mu, bl_sd = None, None
+    bl_tcp = None
+
+    if baseline_seg is not None and baseline_seg.shape[1] > 0:
+        bl_tcp, _ = convert_to_tcp_bipolar(baseline_seg, name_to_idx)
+        bl_mu, bl_sd = compute_baseline_stats(bl_tcp)
+        sz_tcp = normalize_by_baseline(sz_tcp, bl_mu, bl_sd)
+        has_bl = True
+    else:
+        sz_tcp = normalize_zscore(sz_tcp)
+
+    # ── 9. 窗口分割 ──
+    windows = segment_into_windows(sz_tcp, cfg.target_fs, cfg.window_len, cfg.window_overlap)
+
+    patient_id = str(row.get('patient_id', 'unknown'))
+    split = str(row.get('split', 'train'))
+    # 用 edf_path 的 stem 作为 file_id
+    file_id = Path(edf_rel).stem if edf_rel else 'unknown'
+
+    for w_idx in range(windows.shape[0]):
+        results.append({
+            'eeg_data': windows[w_idx].astype(np.float32),
+            'channel_labels': ch_labels,
+            'region_labels': reg_labels,
+            'channel_mask': ch_mask,
+            'is_seizure': True,
+            'patient_id': patient_id,
+            'file_id': file_id,
+            'seizure_idx': 0,
+            'window_idx': w_idx,
+            'data_type': source,
+            'split': split,
+        })
+
+    # ── 基线窗口 ──
+    if cfg.include_baseline and has_bl and bl_tcp is not None:
+        bl_norm = normalize_by_baseline(bl_tcp, bl_mu, bl_sd)
+        bl_windows = segment_into_windows(
+            bl_norm, cfg.target_fs, cfg.window_len, cfg.window_overlap,
+        )
+
+        zero_ch = np.zeros(N_TCP_CHANNELS, dtype=np.float32)
+        zero_reg = np.zeros(N_REGIONS, dtype=np.float32)
+
+        for w_idx in range(bl_windows.shape[0]):
+            results.append({
+                'eeg_data': bl_windows[w_idx].astype(np.float32),
+                'channel_labels': zero_ch,
+                'region_labels': zero_reg,
+                'channel_mask': ch_mask,
+                'is_seizure': False,
+                'patient_id': patient_id,
+                'file_id': file_id,
+                'seizure_idx': 0,
+                'window_idx': w_idx,
+                'data_type': source,
+                'split': split,
+            })
+
+    return results
+
+
+def preprocess_combined(cfg: PreprocessConfig) -> List[Dict]:
+    """
+    使用 combined_manifest.csv 统一处理 TUSZ + 私有数据
+
+    根据每行的 source 列自动选择处理逻辑和数据根目录。
+
+    保存结构:
+        {output_root}/{source}/{patient_id}/{patient_id}_{file}_sz0_w0.npz
+
+    Args:
+        cfg: PreprocessConfig (必须设置 combined_manifest)
+
+    Returns:
+        index_rows: 所有保存样本的索引信息列表
+    """
+    logger.info("=" * 60)
+    logger.info("统一处理 combined_manifest.csv")
+    logger.info("=" * 60)
+    logger.info(f"  Manifest:    {cfg.combined_manifest}")
+    logger.info(f"  TUSZ根:      {cfg.tusz_data_root}")
+    logger.info(f"  私有数据根:   {cfg.private_data_roots}")
+    logger.info(f"  输出:        {cfg.output_root}")
+    logger.info(f"  参数: fs={cfg.target_fs}Hz, filter={cfg.highpass_fc}-{cfg.lowpass_fc}Hz, "
+                f"clip=+/-{cfg.clip_n_std}std, window={cfg.window_len}s@{cfg.window_overlap*100:.0f}%")
+
+    df = pd.read_csv(cfg.combined_manifest)
+    logger.info(f"  总记录: {len(df)}")
+
+    # 按source统计
+    for src in df['source'].unique():
+        sub = df[df['source'] == src]
+        logger.info(f"    {src}: {len(sub)} 行, {sub['patient_id'].nunique()} 患者")
+
+    out_root = Path(cfg.output_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    index_rows: List[Dict] = []
+    stats = {'total': 0, 'ok': 0, 'fail': 0, 'tusz_ok': 0, 'private_ok': 0}
+
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Combined"):
+        source = str(row.get('source', 'tusz')).strip().lower()
+
+        try:
+            samples = process_combined_row(row, cfg)
+            if samples:
+                # 保存到 {output_root}/{source}/ 目录
+                out_dir = out_root / source
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                for s in samples:
+                    idx_row = _save_sample_to_patient_dir(s, out_dir, cfg.output_root)
+                    if idx_row:
+                        index_rows.append(idx_row)
+                    stats['total'] += 1
+
+                stats['ok'] += 1
+                if source == 'tusz':
+                    stats['tusz_ok'] += 1
+                else:
+                    stats['private_ok'] += 1
+            else:
+                stats['fail'] += 1
+        except Exception as e:
+            logger.error(f"异常 patient={row.get('patient_id', '?')}: {e}")
+            stats['fail'] += 1
+
+    logger.info(f"\n统一处理完成:")
+    logger.info(f"  文件成功={stats['ok']} (TUSZ={stats['tusz_ok']}, "
+                f"Private={stats['private_ok']}), 失败={stats['fail']}, 样本={stats['total']}")
+
+    return index_rows
+
+
+# ==============================================================================
+# 主处理流程 (旧模式 — 分别处理)
 # ==============================================================================
 
 def preprocess_tusz(cfg: PreprocessConfig) -> List[Dict]:
@@ -1685,9 +1982,13 @@ def parse_args():
         """
     )
 
-    p.add_argument('--data-type', default='tusz', choices=['tusz', 'private', 'both'])
+    p.add_argument('--data-type', default='tusz', choices=['tusz', 'private', 'both', 'combined'])
     p.add_argument('--output-root', default=r'F:\process_dataset',
                    help='输出根目录 (默认: F:/process_dataset)')
+
+    # combined_manifest 统一模式
+    p.add_argument('--combined-manifest', default='',
+                   help='combined_manifest.csv 路径 (与 --data-type combined 配合使用)')
 
     # 预处理参数
     p.add_argument('--target-fs', type=float, default=200.0)
@@ -1744,6 +2045,8 @@ def main():
         base_cfg_kwargs['private_manifest'] = args.private_manifest
     if args.private_format:
         base_cfg_kwargs['private_file_format'] = args.private_format
+    if args.combined_manifest:
+        base_cfg_kwargs['combined_manifest'] = args.combined_manifest
 
     all_index_rows: List[Dict] = []
 
@@ -1751,25 +2054,44 @@ def main():
     meta_cfg = PreprocessConfig(**{**base_cfg_kwargs, 'data_type': 'tusz'})
     _save_global_metadata(meta_cfg)
 
-    # ---- 处理 TUSZ ----
-    if args.data_type in ('tusz', 'both'):
-        tusz_cfg = PreprocessConfig(**{**base_cfg_kwargs, 'data_type': 'tusz'})
-        tusz_rows = preprocess_tusz(tusz_cfg)
-        if tusz_rows:
-            _save_index_csv(tusz_rows, args.output_root, 'tusz')
-            all_index_rows.extend(tusz_rows)
+    # ---- combined_manifest 统一模式 ----
+    if args.data_type == 'combined':
+        if not args.combined_manifest:
+            logger.error("使用 --data-type combined 时必须指定 --combined-manifest")
+            sys.exit(1)
+        combined_cfg = PreprocessConfig(**{**base_cfg_kwargs, 'data_type': 'combined'})
+        combined_rows = preprocess_combined(combined_cfg)
+        if combined_rows:
+            # 按source分开保存索引
+            df_idx = pd.DataFrame(combined_rows)
+            for src in df_idx['source'].unique():
+                src_rows = df_idx[df_idx['source'] == src].to_dict('records')
+                _save_index_csv(src_rows, args.output_root, src)
+            # 保存合并索引
+            _save_index_csv(combined_rows, args.output_root, 'all')
+            all_index_rows.extend(combined_rows)
 
-    # ---- 处理 私有数据 ----
-    if args.data_type in ('private', 'both'):
-        priv_cfg = PreprocessConfig(**{**base_cfg_kwargs, 'data_type': 'private'})
-        priv_rows = preprocess_private(priv_cfg)
-        if priv_rows:
-            _save_index_csv(priv_rows, args.output_root, 'private')
-            all_index_rows.extend(priv_rows)
+    else:
 
-    # ---- 保存合并索引 ----
-    if all_index_rows:
-        _save_index_csv(all_index_rows, args.output_root, 'all')
+        # ---- 处理 TUSZ ----
+        if args.data_type in ('tusz', 'both'):
+            tusz_cfg = PreprocessConfig(**{**base_cfg_kwargs, 'data_type': 'tusz'})
+            tusz_rows = preprocess_tusz(tusz_cfg)
+            if tusz_rows:
+                _save_index_csv(tusz_rows, args.output_root, 'tusz')
+                all_index_rows.extend(tusz_rows)
+
+        # ---- 处理 私有数据 ----
+        if args.data_type in ('private', 'both'):
+            priv_cfg = PreprocessConfig(**{**base_cfg_kwargs, 'data_type': 'private'})
+            priv_rows = preprocess_private(priv_cfg)
+            if priv_rows:
+                _save_index_csv(priv_rows, args.output_root, 'private')
+                all_index_rows.extend(priv_rows)
+
+        # ---- 保存合并索引 ----
+        if all_index_rows:
+            _save_index_csv(all_index_rows, args.output_root, 'all')
 
     # ---- 打印总结 ----
     logger.info("=" * 60)

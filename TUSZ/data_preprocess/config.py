@@ -355,6 +355,9 @@ class PreprocessConfig:
     output_root: str = r'F:\process_dataset'   # 预处理根目录
     output_dir: str = ''   # 具体子目录 (自动设置)
 
+    # ---- 统一 Manifest ----
+    combined_manifest: str = ''  # combined_manifest.csv 路径
+
     def __post_init__(self):
         if not self.tusz_manifest:
             self.tusz_manifest = (

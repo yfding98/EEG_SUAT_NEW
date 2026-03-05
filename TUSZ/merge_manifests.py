@@ -15,8 +15,8 @@ merge_manifests.py
 输出字段（unified_manifest.csv）:
   ─ 通用元信息 ─
   source          : 'tusz' / 'private'
-  patient_id      : 患者ID
-  edf_path        : EDF文件路径（相对/绝对）
+  patient_id      : 患者ID (TUSZ: patient_id字段; 私有: fn字段)
+  edf_path        : EDF文件路径 (TUSZ: edf_path字段; 私有: loc字段)
   split           : train/dev/eval  （private 均设为 'private'）
   duration        : 文件时长（秒）
   sz_start        : 发作开始时间（秒）
@@ -26,8 +26,10 @@ merge_manifests.py
   hemisphere      : L/R/B/M/U
 
   ─ SOZ 标注 ─
-  onset_channels  : 逗号分隔的双极导联名，如 "FP1-F7,F8-T4"
-  soz_bipolar     : 等同 onset_channels（保留原始形式，分隔符统一为逗号）
+  onset_channels  : 单极电极名, 分号分隔
+                    TUSZ: 从双极导联拆分去重, 如 "T4-T6,T6-O2" → "T4;T6;O2"
+                    私有: 直接使用 soz_unipolar 列
+  soz_bipolar     : 双极导联名（逗号分隔），如 "FP1-F7,F8-T4"
 
   ─ 22个 TCP 双极导联 0/1 列 (与 eeg_pipeline.py TCP_PAIRS 顺序一致) ─
   FP1_F7, F7_T3, T3_T5, T5_O1,
@@ -93,10 +95,25 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
         onset_ch_str = str(r['onset_channels']) if pd.notna(r['onset_channels']) else ''
         bipolar_01 = bipolar_str_to_01(onset_ch_str)
 
-        # 规范化 onset_channels（去除空格）
-        onset_norm = ','.join(
+        # 规范化 soz_bipolar（去除空格，逗号分隔）
+        soz_bipolar_norm = ','.join(
             c.strip() for c in onset_ch_str.split(',') if c.strip()
         )
+
+        # onset_channels: 拆分双极导联为独立电极，去重，分号分隔
+        # 例: "T4-T6,T6-O2" → "T4;T6;O2"
+        electrodes = []
+        for bp_ch in onset_ch_str.split(','):
+            bp_ch = bp_ch.strip().upper()
+            if bp_ch and '-' in bp_ch:
+                for elec in bp_ch.split('-'):
+                    e = elec.strip()
+                    if e and e not in electrodes:
+                        electrodes.append(e)
+            elif bp_ch:
+                if bp_ch not in electrodes:
+                    electrodes.append(bp_ch)
+        onset_channels_unipolar = ';'.join(electrodes)
 
         n_events = int(r['n_seizure_events'])
         n_pairs = min(len(starts), len(ends))
@@ -117,8 +134,8 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
                 'sz_duration':      sz_dur,
                 'n_seizure_events': n_events,
                 'hemisphere':       r.get('hemisphere', 'U'),
-                'onset_channels':   onset_norm,
-                'soz_bipolar':      onset_norm,
+                'onset_channels':   onset_channels_unipolar,
+                'soz_bipolar':      soz_bipolar_norm,
             }
             row.update(bipolar_01)
             rows.append(row)
@@ -146,11 +163,20 @@ def process_private(private_path: str) -> pd.DataFrame:
         soz_bp = str(r.get('soz_bipolar', ''))
         bipolar_01 = bipolar_str_to_01(soz_bp)
 
-        # 统一为逗号分隔
+        # soz_bipolar: 统一为逗号分隔
         if ';' in soz_bp:
-            onset_norm = ','.join(c.strip() for c in soz_bp.split(';') if c.strip())
+            soz_bipolar_norm = ','.join(c.strip() for c in soz_bp.split(';') if c.strip())
         else:
-            onset_norm = soz_bp.strip()
+            soz_bipolar_norm = soz_bp.strip()
+
+        # onset_channels: 使用 soz_unipolar 列（分号分隔的单极通道名）
+        soz_uni = str(r.get('soz_unipolar', ''))
+        if soz_uni and soz_uni.strip() and soz_uni.strip().lower() != 'nan':
+            onset_channels = ';'.join(
+                c.strip().upper() for c in soz_uni.split(';') if c.strip()
+            )
+        else:
+            onset_channels = ''
 
         # 时间字段
         try:
@@ -174,13 +200,15 @@ def process_private(private_path: str) -> pd.DataFrame:
         hemi_raw = str(r.get('hemi', '')).strip()
         hemisphere = HEMI_MAP.get(hemi_raw, HEMI_MAP.get(hemi_raw.capitalize(), 'U'))
 
-        # edf 路径（fn 字段）
-        fn = str(r.get('fn', '')) or str(r.get('loc', ''))
+        # edf_path ← loc 字段（数据文件相对路径）
+        edf_path = str(r.get('loc', ''))
+        # patient_id ← fn 字段（患者文件标识）
+        patient_id = str(r.get('fn', ''))
 
         row = {
             'source':           'private',
-            'patient_id':       str(r.get('pt_id', '')),
-            'edf_path':         fn,
+            'patient_id':       patient_id,
+            'edf_path':         edf_path,
             'split':            'private',
             'duration':         r.get('duration', float('nan')),
             'sz_start':         sz_start,
@@ -188,8 +216,8 @@ def process_private(private_path: str) -> pd.DataFrame:
             'sz_duration':      sz_dur,
             'n_seizure_events': nsz,
             'hemisphere':       hemisphere,
-            'onset_channels':   onset_norm,
-            'soz_bipolar':      onset_norm,
+            'onset_channels':   onset_channels,
+            'soz_bipolar':      soz_bipolar_norm,
         }
         row.update(bipolar_01)
         rows.append(row)
