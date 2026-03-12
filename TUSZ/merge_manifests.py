@@ -126,7 +126,7 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
             row = {
                 'source':           'tusz',
                 'patient_id':       r['patient_id'],
-                'edf_path':         r['edf_path'],
+                'edf_path':         str(r['edf_path']).replace('\\', '/'),
                 'split':            r['split'],
                 'duration':         r['duration'],
                 'sz_start':         sz_start,
@@ -201,7 +201,7 @@ def process_private(private_path: str) -> pd.DataFrame:
         hemisphere = HEMI_MAP.get(hemi_raw, HEMI_MAP.get(hemi_raw.capitalize(), 'U'))
 
         # edf_path ← loc 字段（数据文件相对路径）
-        edf_path = str(r.get('loc', ''))
+        edf_path = str(r.get('loc', '')).replace('\\', '/')
         # patient_id ← fn 字段（患者文件标识）
         patient_id = str(r.get('fn', ''))
 

@@ -133,6 +133,7 @@ class PipelineConfig:
     # ---- 最小数据要求 ----
     min_pre_sec: float = 3.0
     min_post_sec: float = 3.0
+    min_valid_channels: int = 18   # 有效双极导联最低数 (22通道中)
 
     # ---- 路径 ----
     output_root: str = r'F:\process_dataset'
@@ -583,6 +584,15 @@ class EEGPipeline:
 
         # (e) TCP双极转换: 21ch → 22ch
         bipolar, ch_mask = self.to_tcp_bipolar(window)
+
+        # 有效导联数检查
+        n_valid = int(ch_mask.sum())
+        if n_valid < self.cfg.min_valid_channels:
+            logger.debug(
+                f"有效导联不足: {n_valid}/{N_TCP} < {self.cfg.min_valid_channels}, "
+                f"edf={event.edf_path}"
+            )
+            return None
 
         # (f) 标准化: 基于双极基线期 z-score
         bipolar = self.normalize_by_baseline(bipolar, bl_n)

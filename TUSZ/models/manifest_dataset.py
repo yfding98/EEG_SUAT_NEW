@@ -144,6 +144,8 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         soz_only: bool = False,
         label_mode: str = 'bipolar',       # 'bipolar' or 'monopolar'
         pipeline_cfg: 'PipelineConfig' = None,
+        exclude_montages: Optional[List[str]] = None,
+        min_valid_channels: int = 0,
     ):
         if not _HAS_TORCH:
             raise ImportError("PyTorch is required")
@@ -171,6 +173,8 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         # 加载 manifest
         self._load_manifest(
             manifest_path, source_filter, split_filter, patient_ids, soz_only,
+            exclude_montages=exclude_montages or ['03_tcp_ar_a'],
+            min_valid_channels=min_valid_channels,
         )
 
     def _load_manifest(
@@ -180,6 +184,8 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         split_filter: Optional[List[str]],
         patient_ids: Optional[List[str]],
         soz_only: bool,
+        exclude_montages: Optional[List[str]] = None,
+        min_valid_channels: int = 0,
     ):
         df = pd.read_csv(path)
         n0 = len(df)
@@ -196,6 +202,38 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         # 过滤无效行
         df = df.dropna(subset=['sz_start', 'sz_end'])
         df = df[df['sz_end'] > df['sz_start']]
+
+        # 过滤指定 montage (通过 edf_path 路径中的关键字匹配)
+        if exclude_montages:
+            before_montage = len(df)
+            edf_paths = df['edf_path'].astype(str)
+            mask = ~edf_paths.apply(
+                lambda p: any(m in p for m in exclude_montages)
+            )
+            df = df[mask]
+            n_excluded = before_montage - len(df)
+            if n_excluded > 0:
+                logger.info(
+                    f"  Montage 过滤: 排除 {n_excluded} 行 "
+                    f"(montages={exclude_montages})"
+                )
+
+        # 最低有效导联数过滤 (基于 CSV 中 22 个 TCP 0/1 列判定)
+        if min_valid_channels > 0:
+            before_ch = len(df)
+            # 使用 TCP 列判断：非零列数即为有效通道（近似，实际由 channel_mask 决定）
+            valid_cols = [c for c in TCP_COL_NAMES if c in df.columns]
+            if valid_cols:
+                n_valid = (df[valid_cols] != 0).sum(axis=1)
+                # 注：此处仅针对 SOZ 阳性样本有效，SOZ 全0的样本不应被此过滤
+                # 因此仅对实际需要时使用
+                df = df[n_valid >= min_valid_channels]
+                n_ch_excluded = before_ch - len(df)
+                if n_ch_excluded > 0:
+                    logger.info(
+                        f"  通道数过滤: 排除 {n_ch_excluded} 行 "
+                        f"(min_valid_channels={min_valid_channels})"
+                    )
 
         if soz_only:
             # 至少一个双极导联为1

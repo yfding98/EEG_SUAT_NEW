@@ -1295,11 +1295,11 @@ def parse_args() -> TrainConfig:
 
     # 数据 (Manifest模式 — 优先级更高)
     parser.add_argument(
-        '--manifest', type=str, default='',
+        '--manifest', type=str, default=r'E:\code_learn\SUAT\workspace\EEG-projects\EEG_SUAT_NEW\TUSZ\combined_manifest.csv',
         help='combined_manifest.csv 路径 (若提供则用 ManifestSOZDataset)',
     )
     parser.add_argument(
-        '--source', type=str, default='both',
+        '--source', type=str, default='tusz',
         choices=['tusz', 'private', 'both'],
         help='数据源过滤',
     )
@@ -1308,7 +1308,7 @@ def parse_args() -> TrainConfig:
         help='TUSZ EDF root',
     )
     parser.add_argument(
-        '--private-data-root', type=str, default='',
+        '--private-data-root', type=str, default=r'E:\DataSet\EEG\EEG dataset_SUAT',
         help='Private EDF root',
     )
     parser.add_argument(
@@ -1341,7 +1341,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument('--cv-mode', choices=['lopo', 'kfold'], default='lopo')
 
     # 模型
-    parser.add_argument('--labram-checkpoint', type=str, default='')
+    parser.add_argument('--labram-checkpoint', type=str, default=r'E:\code_learn\SUAT\workspace\EEG-projects\LaBraM\checkpoints\labram-base.pth')
     parser.add_argument('--embed-dim', type=int, default=128)
 
     args = parser.parse_args()

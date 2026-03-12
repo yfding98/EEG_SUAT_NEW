@@ -1982,12 +1982,12 @@ def parse_args():
         """
     )
 
-    p.add_argument('--data-type', default='tusz', choices=['tusz', 'private', 'both', 'combined'])
+    p.add_argument('--data-type', default='private', choices=['tusz', 'private', 'both', 'combined'])
     p.add_argument('--output-root', default=r'F:\process_dataset',
                    help='输出根目录 (默认: F:/process_dataset)')
 
     # combined_manifest 统一模式
-    p.add_argument('--combined-manifest', default='',
+    p.add_argument('--combined-manifest', default=r'E:\code_learn\SUAT\workspace\EEG-projects\EEG_SUAT_NEW\TUSZ\combined_manifest.csv',
                    help='combined_manifest.csv 路径 (与 --data-type combined 配合使用)')
 
     # 预处理参数
@@ -2003,13 +2003,13 @@ def parse_args():
     p.add_argument('--baseline-duration', type=float, default=30.0)
 
     # TUSZ路径
-    p.add_argument('--tusz-root', default=None)
+    p.add_argument('--tusz-root', default=r"F:\dataset\TUSZ\v2.0.3\edf")
     p.add_argument('--tusz-manifest', default=None)
 
     # 私有数据路径
-    p.add_argument('--private-roots', nargs='+', default=None)
+    p.add_argument('--private-roots', nargs='+', default=[r"E:\DataSet\EEG\EEG dataset_SUAT",])
     p.add_argument('--private-manifest', default=None)
-    p.add_argument('--private-format', default='set', choices=['set', 'edf'])
+    p.add_argument('--private-format', default='edf', choices=['set', 'edf'])
 
     return p.parse_args()
 

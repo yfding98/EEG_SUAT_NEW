@@ -47,6 +47,7 @@ from __future__ import annotations
 import math
 import logging
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -111,27 +112,31 @@ class ModelConfig:
     # ---- 输入 ----
     n_channels: int = 22          # TCP导联数
     n_patches: int = 20           # 每导联补丁数
-    patch_len: int = 100          # 每补丁采样点数
+    patch_len: int = 200          # LaBraM原始patch长度 (200采样点 @200Hz = 1s)
     n_nodes: int = 440            # n_channels * n_patches
 
-    # ---- Patch Embedding ----
-    embed_dim: int = 128          # D
-
-    # ---- LaBraM Backbone ----
+    # ---- LaBraM Backbone (对齐 labram-base checkpoint) ----
+    embed_dim: int = 200          # 对齐 LaBraM-base
+    out_chans: int = 8            # TemporalConv 输出通道数
     labram_checkpoint: str = ''   # 预训练权重路径 (空=随机初始化)
-    n_transformer_layers: int = 14  # 总Transformer层数
-    n_frozen_layers: int = 12     # 冻结底层数
-    n_heads_transformer: int = 8  # Transformer注意力头数
+    checkpoint_type: str = 'labram-base'  # 'labram-base' 或 'vqnsp'
+    n_transformer_layers: int = 12  # 对齐 LaBraM-base (12层)
+    n_frozen_layers: int = 10     # 冻结底层数
+    n_heads_transformer: int = 10 # 对齐 LaBraM-base (10头)
     ff_mult: float = 4.0          # FFN扩展倍数
-    transformer_dropout: float = 0.1
+    transformer_dropout: float = 0.0  # LaBraM原始无基础dropout
+    drop_path_rate: float = 0.0   # DropPath rate (线性递增)
+    init_values: float = 0.1      # LayerScale init值 (labram-base用)
+    use_qk_norm: bool = True      # QK normalization (labram-base用)
 
     # ---- TimeFilter ----
     tf_n_heads: int = 4           # 多头投影距离的头数 H
     tf_alpha: float = 0.15        # k-NN保留比例 α
-    tf_n_filters: int = 3         # 过滤器数目
+    tf_n_filters: int = 3         # 过滤器数目 (S/T/ST)
     spatial_dist_thresh: float = 0.55  # 球面距离阈值 (≈5cm)
-    top_p: float = 0.85           # Top-p 动态路由
-    noisy_gating: bool = True     # 含噪门控
+    top_p: float = 0.5            # Top-p 动态路由 (对齐原始TimeFilter)
+    temporal_k: int = 3           # Temporal过滤器允许的最大补丁距离 ±k
+    n_timefilter_blocks: int = 2  # TimeFilter block堆叠数
 
     # ---- GAT ----
     gat_layers: int = 2
@@ -153,462 +158,727 @@ class ModelConfig:
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
     domain_loss_weight: float = 0.1
+    moe_loss_weight: float = 0.01  # MoE辅助损失权重
 
     # ---- TCP pairs (允许外部覆盖) ----
     tcp_pairs: List[Tuple[str, str]] = field(default_factory=lambda: list(TCP_PAIRS))
 
 
 # =============================================================================
-# 1. Patch Embedding + 2D Position Encoding
+# 1. TemporalConv Patch Embedding (原始LaBraM结构)
 # =============================================================================
 
-class PatchEmbedding(nn.Module):
+class TemporalConv(nn.Module):
     """
-    [B, C, P, L] → [B, N, D]
+    LaBraM原始的时域卷积嵌入层
 
-    C=22 channels, P=20 patches, L=100 samples → N=440 nodes, D=128
+    输入: [B, N_electrodes, N_patches, patch_size]
+    输出: [B, N_electrodes * N_patches, embed_dim]
+
+    三层Conv2d提取局部时频特征, 比单层Linear更能捕获EEG波形模式。
     """
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, in_chans: int = 1, out_chans: int = 8):
         super().__init__()
-        self.cfg = cfg
-        self.proj = nn.Linear(cfg.patch_len, cfg.embed_dim)
-        self.norm = nn.LayerNorm(cfg.embed_dim)
-
-        # 可学习的2D位置编码: channel_embed + patch_embed
-        self.channel_embed = nn.Embedding(cfg.n_channels, cfg.embed_dim)
-        self.patch_embed = nn.Embedding(cfg.n_patches, cfg.embed_dim)
-
-        # 预计算展开后的 (channel_idx, patch_idx)
-        ch_ids = torch.arange(cfg.n_channels).unsqueeze(1).expand(-1, cfg.n_patches).reshape(-1)
-        pa_ids = torch.arange(cfg.n_patches).unsqueeze(0).expand(cfg.n_channels, -1).reshape(-1)
-        self.register_buffer('ch_ids', ch_ids)   # (440,)
-        self.register_buffer('pa_ids', pa_ids)    # (440,)
+        self.conv1 = nn.Conv2d(in_chans, out_chans, kernel_size=(1, 15), stride=(1, 8), padding=(0, 7))
+        self.gelu1 = nn.GELU()
+        self.norm1 = nn.GroupNorm(4, out_chans)
+        self.conv2 = nn.Conv2d(out_chans, out_chans, kernel_size=(1, 3), padding=(0, 1))
+        self.gelu2 = nn.GELU()
+        self.norm2 = nn.GroupNorm(4, out_chans)
+        self.conv3 = nn.Conv2d(out_chans, out_chans, kernel_size=(1, 3), padding=(0, 1))
+        self.norm3 = nn.GroupNorm(4, out_chans)
+        self.gelu3 = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [B, 22, 20, 100]
+            x: [B, N, A, T]  (N=electrodes, A=patches, T=patch_size)
         Returns:
-            [B, 440, D]
+            [B, N*A, D]  where D = T_out * out_chans
         """
-        B, C, P, L = x.shape
-        x = x.reshape(B, C * P, L)           # [B, 440, 100]
-        x = self.proj(x)                      # [B, 440, D]
-        x = self.norm(x)
-
-        # 加上2D位置编码
-        pos = self.channel_embed(self.ch_ids) + self.patch_embed(self.pa_ids)  # [440, D]
-        x = x + pos.unsqueeze(0)              # [B, 440, D]
+        B, N, A, T = x.shape
+        x = x.reshape(B, N * A, T)          # [B, N*A, T]
+        x = x.unsqueeze(1)                    # [B, 1, N*A, T]
+        x = self.gelu1(self.norm1(self.conv1(x)))
+        x = self.gelu2(self.norm2(self.conv2(x)))
+        x = self.gelu3(self.norm3(self.conv3(x)))
+        # x: [B, C_out, N*A, T_out] → [B, N*A, T_out * C_out]
+        x = x.permute(0, 2, 3, 1).contiguous()  # [B, N*A, T_out, C_out]
+        x = x.reshape(B, N * A, -1)              # [B, N*A, D]
         return x
 
 
 # =============================================================================
-# 2. LaBraM Backbone (Transformer Encoder)
+# 2. LaBraM Backbone (原始Transformer结构)
 # =============================================================================
 
-class TransformerBlock(nn.Module):
-    """标准 Pre-LN Transformer Block"""
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample."""
 
-    def __init__(self, dim: int, n_heads: int, ff_mult: float = 4.0, dropout: float = 0.1):
+    def __init__(self, drop_prob: float = 0.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ff = nn.Sequential(
-            nn.Linear(dim, int(dim * ff_mult)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(dim * ff_mult), dim),
-            nn.Dropout(dropout),
-        )
+        self.drop_prob = drop_prob
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x)
-        h, _ = self.attn(h, h, h)
-        x = x + h
-        x = x + self.ff(self.norm2(x))
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        if keep_prob > 0.0:
+            random_tensor.div_(keep_prob)
+        return x * random_tensor
+
+
+class Mlp(nn.Module):
+    """LaBraM原始MLP: fc1 → GELU → fc2 → Dropout (注意fc1后无dropout)"""
+
+    def __init__(self, in_features: int, hidden_features: int = None,
+                 out_features: int = None, drop: float = 0.0):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class Attention(nn.Module):
+    """
+    LaBraM原始Attention
+
+    支持两种模式 (对应两个checkpoint):
+    - labram-base: qkv_bias=False, qk_norm=LayerNorm  → gamma_1/gamma_2
+    - vqnsp:       qkv_bias=True (q_bias+v_bias), qk_norm=None
+    """
+
+    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False,
+                 qk_norm=None, qk_scale=None, attn_drop: float = 0.0,
+                 proj_drop: float = 0.0, attn_head_dim: int = None):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        if attn_head_dim is not None:
+            head_dim = attn_head_dim
+        all_head_dim = head_dim * self.num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, all_head_dim * 3, bias=False)
+        if qkv_bias:
+            self.q_bias = nn.Parameter(torch.zeros(all_head_dim))
+            self.v_bias = nn.Parameter(torch.zeros(all_head_dim))
+        else:
+            self.q_bias = None
+            self.v_bias = None
+
+        if qk_norm is not None:
+            self.q_norm = qk_norm(head_dim)
+            self.k_norm = qk_norm(head_dim)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(all_head_dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv_bias = None
+        if self.q_bias is not None:
+            qkv_bias = torch.cat([
+                self.q_bias,
+                torch.zeros_like(self.v_bias, requires_grad=False),
+                self.v_bias,
+            ])
+        qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # [B, H, N, d_h]
+
+        if self.q_norm is not None:
+            q = self.q_norm(q).type_as(v)
+        if self.k_norm is not None:
+            k = self.k_norm(k).type_as(v)
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)   # [B, H, N, N]
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class Block(nn.Module):
+    """
+    LaBraM原始Transformer Block
+
+    Pre-LN + DropPath + 可选LayerScale(gamma_1/gamma_2)
+    """
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0,
+                 qkv_bias: bool = False, qk_norm=None, qk_scale=None,
+                 drop: float = 0.0, attn_drop: float = 0.0,
+                 drop_path: float = 0.0, init_values: float = 0.0,
+                 norm_layer=nn.LayerNorm, attn_head_dim: int = None):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_norm=qk_norm,
+            qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
+            attn_head_dim=attn_head_dim,
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, drop=drop)
+
+        if init_values > 0:
+            self.gamma_1 = nn.Parameter(init_values * torch.ones(dim), requires_grad=True)
+            self.gamma_2 = nn.Parameter(init_values * torch.ones(dim), requires_grad=True)
+        else:
+            self.gamma_1, self.gamma_2 = None, None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.gamma_1 is None:
+            x = x + self.drop_path(self.attn(self.norm1(x)))
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+        else:
+            x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x)))
+            x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
         return x
 
 
 class LaBraMBackbone(nn.Module):
     """
-    LaBraM-style Transformer Backbone
+    LaBraM Backbone — 忠实于原始论文结构, 可加载预训练权重
 
-    底层 n_frozen 层冻结参数 (通用EEG表征),
-    顶层 (n_total - n_frozen) 层可训练 (任务适配).
+    结构:
+        TemporalConv → pos_embed + time_embed → N层 Block → LayerNorm
 
-    若提供 checkpoint_path 则加载预训练权重。
+    支持两种checkpoint:
+        - labram-base.pth (student.*前缀, LayerScale+QKNorm)
+        - vqnsp.pth       (encoder.*前缀, QKVBias, 无LayerScale)
+
+    底层 n_frozen 层冻结参数, 顶层可训练。
+    不含 cls_token 和分类头 (用于下游密集预测)。
     """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
+        D = cfg.embed_dim
+        norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
-        self.layers = nn.ModuleList([
-            TransformerBlock(
-                dim=cfg.embed_dim,
-                n_heads=cfg.n_heads_transformer,
-                ff_mult=cfg.ff_mult,
-                dropout=cfg.transformer_dropout,
+        # Patch embedding
+        self.patch_embed = TemporalConv(in_chans=1, out_chans=cfg.out_chans)
+
+        # 位置编码 (空间 + 时间)
+        max_electrodes = max(129, cfg.n_channels + 1)  # 至少129 (对齐原始LaBraM)
+        max_time_windows = max(16, cfg.n_patches)      # 至少16 (原始), 扩展至n_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_electrodes, D))
+        self.time_embed = nn.Parameter(torch.zeros(1, max_time_windows, D))
+        self.pos_drop = nn.Dropout(p=cfg.transformer_dropout)
+
+        # 根据checkpoint类型选择Block配置
+        if cfg.checkpoint_type == 'labram-base':
+            qkv_bias = False
+            qk_norm = partial(nn.LayerNorm, eps=1e-6) if cfg.use_qk_norm else None
+            init_values = cfg.init_values
+        else:  # vqnsp
+            qkv_bias = True
+            qk_norm = None
+            init_values = 0.0
+
+        # DropPath 线性递增
+        dpr = [x.item() for x in torch.linspace(0, cfg.drop_path_rate, cfg.n_transformer_layers)]
+
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=D, num_heads=cfg.n_heads_transformer,
+                mlp_ratio=cfg.ff_mult, qkv_bias=qkv_bias, qk_norm=qk_norm,
+                drop=cfg.transformer_dropout, attn_drop=0.0,
+                drop_path=dpr[i], init_values=init_values,
+                norm_layer=norm_layer,
             )
-            for _ in range(cfg.n_transformer_layers)
+            for i in range(cfg.n_transformer_layers)
         ])
-        self.final_norm = nn.LayerNorm(cfg.embed_dim)
+        self.norm = norm_layer(D)
 
-        # 加载预训练权重 (如果有)
+        # 初始化
+        self._init_weights()
+
+        # 加载预训练权重
         if cfg.labram_checkpoint:
-            self._load_checkpoint(cfg.labram_checkpoint)
+            self._load_checkpoint(cfg.labram_checkpoint, cfg.checkpoint_type)
 
         # 冻结底层
         self._freeze_bottom(cfg.n_frozen_layers)
 
-    def _load_checkpoint(self, path: str):
-        """加载LaBraM预训练权重 (兼容性映射)"""
+    def _init_weights(self):
+        """LaBraM原始初始化"""
+        def _trunc_normal_(tensor, std=0.02):
+            """截断正态分布初始化 (替代timm.trunc_normal_)"""
+            nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-2*std, b=2*std)
+
+        if self.pos_embed is not None:
+            _trunc_normal_(self.pos_embed, std=0.02)
+        if self.time_embed is not None:
+            _trunc_normal_(self.time_embed, std=0.02)
+        self.apply(self.__init_module_weights)
+        self._fix_init_weight()
+
+    @staticmethod
+    def __init_module_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def _fix_init_weight(self):
+        """按深度rescale残差路径权重 (LaBraM原始策略)"""
+        for layer_id, layer in enumerate(self.blocks):
+            if hasattr(layer.attn, 'proj') and hasattr(layer.attn.proj, 'weight'):
+                layer.attn.proj.weight.data.div_(math.sqrt(2.0 * (layer_id + 1)))
+            if hasattr(layer.mlp, 'fc2') and hasattr(layer.mlp.fc2, 'weight'):
+                layer.mlp.fc2.weight.data.div_(math.sqrt(2.0 * (layer_id + 1)))
+
+    def _load_checkpoint(self, path: str, ckpt_type: str = 'labram-base'):
+        """加载LaBraM预训练权重, 处理前缀映射"""
         try:
-            state = torch.load(path, map_location='cpu')
+            state = torch.load(path, map_location='cpu', weights_only=False)
             if 'model' in state:
                 state = state['model']
             elif 'state_dict' in state:
                 state = state['state_dict']
 
-            # 尝试加载 (忽略不匹配的键)
-            missing, unexpected = self.load_state_dict(state, strict=False)
+            # 确定前缀
+            prefix = 'student.' if ckpt_type == 'labram-base' else 'encoder.'
+
+            # 映射: 去掉前缀, 过滤不需要的键 (cls_token, mask_token, lm_head等)
+            skip_keys = {'cls_token', 'mask_token', 'lm_head', 'logit_scale',
+                         'projection_head', 'head'}
+            mapped = {}
+            for k, v in state.items():
+                if not k.startswith(prefix):
+                    continue
+                new_key = k[len(prefix):]
+                # 跳过不需要的权重
+                base = new_key.split('.')[0]
+                if base in skip_keys:
+                    continue
+                mapped[new_key] = v
+
+            missing, unexpected = self.load_state_dict(mapped, strict=False)
+            n_loaded = len(mapped) - len(unexpected)
             logger.info(
-                f"LaBraM checkpoint loaded: {path}\n"
-                f"  missing={len(missing)}, unexpected={len(unexpected)}"
+                f"LaBraM checkpoint loaded ({ckpt_type}): {path}\n"
+                f"  loaded={n_loaded}, missing={len(missing)}, unexpected={len(unexpected)}"
             )
+            if missing:
+                logger.debug(f"  Missing keys: {missing[:10]}...")
         except Exception as e:
             logger.warning(f"无法加载LaBraM checkpoint: {e}, 使用随机初始化")
 
     def _freeze_bottom(self, n_freeze: int):
-        """冻结底部 n_freeze 层"""
-        for i, layer in enumerate(self.layers):
+        """冻结底部 n_freeze 层 + patch_embed + pos/time embed"""
+        # 冻结嵌入层
+        for p in self.patch_embed.parameters():
+            p.requires_grad = False
+        self.pos_embed.requires_grad = False
+        self.time_embed.requires_grad = False
+
+        # 冻结底层blocks
+        for i, layer in enumerate(self.blocks):
             if i < n_freeze:
                 for p in layer.parameters():
                     p.requires_grad = False
+
         n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.parameters())
         logger.info(
-            f"LaBraM: {len(self.layers)} layers, "
-            f"frozen={n_freeze}, trainable params={n_trainable}/{n_total}"
+            f"LaBraM: {len(self.blocks)} layers, "
+            f"frozen={n_freeze}+embed, trainable params={n_trainable:,}/{n_total:,}"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """[B, N, D] → [B, N, D]"""
-        for layer in self.layers:
-            x = layer(x)
-        return self.final_norm(x)
-
-
-# =============================================================================
-# 3. TimeFilter Core
-# =============================================================================
-
-# ---- 3a. Multi-Head Projection Distance + k-NN ----
-
-class MultiHeadDistanceKNN(nn.Module):
-    """
-    多头投影距离计算 → k-NN 图构建
-
-    对每个头: 将节点投影到低维空间, 计算欧氏距离, 保留 top-α 近邻。
-    最终: H 个头的邻接矩阵取并集/平均。
-    """
-
-    def __init__(self, dim: int, n_heads: int = 4, alpha: float = 0.15):
-        super().__init__()
-        self.n_heads = n_heads
-        self.alpha = alpha
-        head_dim = dim // n_heads
-        self.projections = nn.ModuleList([
-            nn.Linear(dim, head_dim, bias=False) for _ in range(n_heads)
-        ])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, input_chans=None) -> torch.Tensor:
         """
         Args:
-            x: [B, N, D]
+            x: [B, N_channels, N_patches, patch_size]  e.g. [B, 22, 20, 200]
+            input_chans: 可选, 电极通道索引 (用于子集电极)
         Returns:
-            adj: [B, N, N]  soft adjacency (0~1, higher=closer)
+            [B, N_channels * N_patches, embed_dim]
         """
-        B, N, _ = x.shape
-        k = max(1, int(N * self.alpha))  # 保留的近邻数
-        adjs = []
+        batch_size, n_ch, n_patches, patch_size = x.shape
 
-        for proj in self.projections:
-            z = proj(x)                                      # [B, N, d_h]
-            # 成对欧氏距离: dist[i,j] = ||z_i - z_j||^2
-            dist = torch.cdist(z, z, p=2)                   # [B, N, N]
-            # k-NN: 每行保留最近的k个, 其余置为inf
-            _, topk_idx = dist.topk(k, dim=-1, largest=False)  # [B, N, k]
-            mask = torch.zeros_like(dist)
-            mask.scatter_(-1, topk_idx, 1.0)
-            # 对称化
-            mask = torch.maximum(mask, mask.transpose(-1, -2))
-            # 距离转相似度 (高斯核)
-            sim = torch.exp(-dist ** 2 / (2 * dist.mean() ** 2 + 1e-8))
-            adjs.append(sim * mask)
+        # TemporalConv
+        x = self.patch_embed(x)                              # [B, n_ch*n_patches, D]
 
-        # 多头平均
-        adj = torch.stack(adjs, dim=0).mean(dim=0)          # [B, N, N]
-        return adj
+        # 位置编码
+        pos_embed_used = self.pos_embed[:, input_chans] if input_chans is not None else self.pos_embed
+        if self.pos_embed is not None:
+            # 空间位置 (使用前n_ch个电极的编码, 不含CLS位)
+            pos_e = pos_embed_used[:, 1:n_ch+1, :]           # [1, n_ch, D]
+            pos_e = pos_e.unsqueeze(2).expand(batch_size, -1, n_patches, -1)
+            pos_e = pos_e.flatten(1, 2)                       # [B, n_ch*n_patches, D]
+            x = x + pos_e
+
+        if self.time_embed is not None:
+            time_e = self.time_embed[:, :n_patches, :]        # [1, n_patches, D]
+            time_e = time_e.unsqueeze(1).expand(batch_size, n_ch, -1, -1)
+            time_e = time_e.flatten(1, 2)                     # [B, n_ch*n_patches, D]
+            x = x + time_e
+
+        x = self.pos_drop(x)
+
+        # Transformer blocks
+        for blk in self.blocks:
+            x = blk(x)
+
+        return self.norm(x)
 
 
-# ---- 3b. Domain-Specific Filters ----
+# =============================================================================
+# 3. TimeFilter Core (恢复原始MoE机制 + 改进Temporal过滤)
+# =============================================================================
 
-class TemporalFilter(nn.Module):
+# ---- 3a. mask_topk: k-NN 稀疏化 ----
+
+def mask_topk(x: torch.Tensor, alpha: float = 0.5, largest: bool = False) -> torch.Tensor:
+    """保留每行最大的 alpha 比例的值, 其余置零。 x: [B, H, L, L]"""
+    k = max(1, int(alpha * x.shape[-1]))
+    _, topk_indices = torch.topk(x, k, dim=-1, largest=largest)
+    mask = torch.ones_like(x, dtype=torch.float32)
+    mask.scatter_(-1, topk_indices, 0)
+    return mask
+
+
+# ---- 3b. 区域掩码生成 (S/T/ST) + 领域先验增强 ----
+
+def build_region_masks(
+    L: int, n_vars: int, device: torch.device,
+    n_channels: int = 22, n_patches: int = 20,
+    tcp_pairs: List[Tuple[str, str]] = None,
+    spatial_dist_thresh: float = 0.55,
+    temporal_k: int = 3,
+) -> torch.Tensor:
     """
-    Filter_Temporal: 保留同一导联内相邻补丁的边 (时序连续性)
+    构建3区域掩码 [L, 3, L], 融合原始TimeFilter的S/T/ST + EEG领域先验
 
-    对于节点 (ch_i, patch_j), 仅保留连向 (ch_i, patch_{j±1}) 的边。
+    区域定义 (对节点k而言):
+      S (Spatial):  同一时间片、不同导联的节点 (增强: 仅保留空间距离<阈值的导联对)
+      T (Temporal): 同一导联、不同时间片的节点 (增强: 仅保留距离<=temporal_k, 带衰减)
+      ST (Other):   其余所有节点
     """
+    N = L // n_vars
 
-    def __init__(self, n_channels: int = 22, n_patches: int = 20):
-        super().__init__()
-        N = n_channels * n_patches
-        # 预计算时序邻接模板
-        mask = torch.zeros(N, N)
-        for ch in range(n_channels):
-            for p in range(n_patches):
-                node = ch * n_patches + p
-                if p > 0:
-                    mask[node, ch * n_patches + (p - 1)] = 1.0
-                if p < n_patches - 1:
-                    mask[node, ch * n_patches + (p + 1)] = 1.0
-        self.register_buffer('mask', mask)  # [N, N]
-
-    def forward(self, adj: torch.Tensor) -> torch.Tensor:
-        """[B, N, N] → [B, N, N]  (仅保留时序边)"""
-        return adj * self.mask.unsqueeze(0)
-
-
-class SpatialFilter(nn.Module):
-    """
-    Filter_Spatial: 保留同一时间点解剖邻近导联的边
-
-    基于10-20系统球面距离 < threshold,
-    仅保留 (ch_i, patch_t) ↔ (ch_j, patch_t) 的边。
-    """
-
-    def __init__(
-        self,
-        n_channels: int = 22,
-        n_patches: int = 20,
-        tcp_pairs: List[Tuple[str, str]] = None,
-        dist_thresh: float = 0.55,
-    ):
-        super().__init__()
-        pairs = tcp_pairs or list(TCP_PAIRS)
-        N = n_channels * n_patches
-
-        # 计算双极导联中点位置
+    # 计算空间邻近矩阵
+    pairs = tcp_pairs or list(TCP_PAIRS)
+    ch_adj = np.ones((n_channels, n_channels), dtype=np.float32)
+    if spatial_dist_thresh > 0:
         ch_pos = []
-        for a, b in pairs:
+        for a, b in pairs[:n_channels]:
             pa = np.array(_ELECTRODE_3D.get(a, (0, 0, 0)))
             pb = np.array(_ELECTRODE_3D.get(b, (0, 0, 0)))
             ch_pos.append((pa + pb) / 2.0)
-        ch_pos = np.array(ch_pos)  # [22, 3]
+        ch_pos = np.array(ch_pos)
+        from scipy.spatial.distance import cdist as scipy_cdist
+        ch_dist = scipy_cdist(ch_pos, ch_pos)
+        ch_adj = (ch_dist < spatial_dist_thresh).astype(np.float32)
+        np.fill_diagonal(ch_adj, 0.0)
 
-        # 通道间距离矩阵
-        from scipy.spatial.distance import cdist
-        ch_dist = cdist(ch_pos, ch_pos)  # [22, 22]
-        ch_adj = (ch_dist < dist_thresh).astype(np.float32)
-        np.fill_diagonal(ch_adj, 0.0)  # 不含自环
+    masks = []
+    for k_idx in range(L):
+        ch_k = k_idx // N
+        patch_k = k_idx % N
 
-        # 扩展到 [N, N]: 只有同一时间点才有空间边
-        mask = np.zeros((N, N), dtype=np.float32)
-        for t in range(n_patches):
-            for ci in range(n_channels):
-                for cj in range(n_channels):
-                    if ch_adj[ci, cj] > 0:
-                        ni = ci * n_patches + t
-                        nj = cj * n_patches + t
-                        mask[ni, nj] = 1.0
-        self.register_buffer('mask', torch.from_numpy(mask))
+        S = torch.zeros(L, dtype=torch.float32, device=device)
+        for ci in range(n_vars):
+            if ci != ch_k and ch_adj[min(ci, n_channels-1), min(ch_k, n_channels-1)] > 0:
+                S[ci * N + patch_k] = 1.0
 
-    def forward(self, adj: torch.Tensor) -> torch.Tensor:
-        """[B, N, N] → [B, N, N]  (仅保留空间边)"""
-        return adj * self.mask.unsqueeze(0)
+        T = torch.zeros(L, dtype=torch.float32, device=device)
+        for pi in range(N):
+            if pi != patch_k:
+                dist = abs(pi - patch_k)
+                if dist <= temporal_k:
+                    T[ch_k * N + pi] = math.exp(-dist / max(temporal_k, 1))
 
+        ST = torch.ones(L, dtype=torch.float32, device=device)
+        ST[k_idx] = 0.0
+        ST = ST - S - T
+        ST = ST.clamp(min=0.0)
 
-class PathologicalFilter(nn.Module):
+        masks.append(torch.stack([S, T, ST], dim=0))
+
+    return torch.stack(masks, dim=0)  # [L, 3, L]
+# ---- 3c. MoE 门控路由 (原始TimeFilter机制 + 辅助损失) ----
+
+class MoERouter(nn.Module):
     """
-    Filter_Pathological: 学习病理模式(HFO/高频振荡)相关边
+    原始TimeFilter的 mask_moe 机制
 
-    设计:
-    - 对每个节点学习一个"病理敏感度"分数
-    - 两个高敏感度节点之间的边被保留
-    - 可接受可选的 gamma 频段能量先验
-    - 实质是可学习的注意力掩码
-
-    若有gamma能量先验 (预提取80-250Hz小波包分解):
-        score = MLP(node_feat ⊕ gamma_energy)
-    否则:
-        score = MLP(node_feat)
+    - 对每个节点输出3个专家(S/T/ST)的门控权重
+    - 含噪门控 + Top-p截断
+    - 返回辅助损失 (cv_squared负载均衡 + cross_entropy多样性)
     """
 
-    def __init__(self, dim: int, n_nodes: int = 440, use_gamma_prior: bool = False):
+    def __init__(self, n_vars: int, top_p: float = 0.5,
+                 num_experts: int = 3, in_dim: int = 96):
         super().__init__()
-        self.use_gamma_prior = use_gamma_prior
-        in_dim = dim + (1 if use_gamma_prior else 0)
-
-        self.score_net = nn.Sequential(
-            nn.Linear(in_dim, dim // 2),
-            nn.GELU(),
-            nn.Linear(dim // 2, 1),
-            nn.Sigmoid(),
-        )
-        # 可学习的阈值
-        self.threshold = nn.Parameter(torch.tensor(0.5))
-
-    def forward(
-        self,
-        adj: torch.Tensor,
-        node_feat: torch.Tensor,
-        gamma_energy: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            adj: [B, N, N]
-            node_feat: [B, N, D]
-            gamma_energy: [B, N, 1] optional
-        Returns:
-            [B, N, N]
-        """
-        if self.use_gamma_prior and gamma_energy is not None:
-            inp = torch.cat([node_feat, gamma_energy], dim=-1)  # [B, N, D+1]
-        else:
-            inp = node_feat
-
-        scores = self.score_net(inp).squeeze(-1)  # [B, N]
-        # 两节点的病理分数乘积 → 边权重
-        edge_weight = scores.unsqueeze(-1) * scores.unsqueeze(-2)  # [B, N, N]
-        # 软阈值门控
-        gate = torch.sigmoid((edge_weight - self.threshold) * 10.0)
-        return adj * gate
-
-
-# ---- 3c. Noisy Gated Router (Top-p) ----
-
-class NoisyGatedRouter(nn.Module):
-    """
-    含噪门控路由: 动态分配每个节点通过哪些过滤器
-
-    - 对每个节点计算 logits → softmax → 过滤器权重
-    - Top-p 选择: 累积概率达到 p 后截断 (允许不同节点使用不同数量的过滤器)
-    - 训练时加噪 (探索); 推理时不加噪
-    """
-
-    def __init__(self, dim: int, n_filters: int = 3, top_p: float = 0.85,
-                 noisy: bool = True):
-        super().__init__()
-        self.n_filters = n_filters
+        self.num_experts = num_experts
+        self.n_vars = n_vars
+        self.in_dim = in_dim
         self.top_p = top_p
-        self.noisy = noisy
 
-        self.gate = nn.Linear(dim, n_filters)
-        # 噪声参数
-        self.w_noise = nn.Linear(dim, n_filters) if noisy else None
+        self.gate = nn.Linear(self.in_dim, num_experts, bias=False)
+        self.noise = nn.Linear(self.in_dim, num_experts, bias=False)
+        self.softplus = nn.Softplus()
+        self.softmax = nn.Softmax(2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def cv_squared(x: torch.Tensor) -> torch.Tensor:
+        """变异系数的平方 — 衡量负载均衡"""
+        eps = 1e-10
+        if x.shape[0] == 1:
+            return torch.tensor([0], device=x.device, dtype=x.dtype)
+        return x.float().var() / (x.float().mean() ** 2 + eps)
+
+    @staticmethod
+    def cross_entropy_loss(x: torch.Tensor) -> torch.Tensor:
+        """交叉熵 — 鼓励路由多样化"""
+        eps = 1e-10
+        if x.shape[0] == 1:
+            return torch.tensor([0], device=x.device, dtype=x.dtype)
+        return -torch.mul(x, torch.log(x + eps)).sum(dim=1).mean()
+
+    def noisy_top_p_gating(self, x: torch.Tensor, is_training: bool,
+                           noise_epsilon: float = 1e-2):
+        """含噪Top-p门控"""
+        clean_logits = self.gate(x)
+        if is_training:
+            raw_noise = self.noise(x)
+            noise_stddev = self.softplus(raw_noise) + noise_epsilon
+            noisy_logits = clean_logits + torch.randn_like(clean_logits) * noise_stddev
+            logits = noisy_logits
+        else:
+            logits = clean_logits
+
+        logits = self.softmax(logits)
+        loss_dynamic = self.cross_entropy_loss(logits)
+
+        sorted_probs, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        mask = cumulative_probs > self.top_p
+
+        threshold_indices = mask.long().argmax(dim=-1)
+        threshold_mask = F.one_hot(threshold_indices, num_classes=sorted_indices.size(-1)).bool()
+        mask = mask & ~threshold_mask
+
+        top_p_mask = torch.zeros_like(mask, dtype=torch.float32)
+        zero_indices = (mask == 0).nonzero(as_tuple=True)
+        top_p_mask[zero_indices[0], zero_indices[1],
+                   sorted_indices[zero_indices[0], zero_indices[1], zero_indices[2]]] = 1
+
+        sorted_probs = torch.where(mask, torch.zeros_like(sorted_probs), sorted_probs)
+        loss_importance = self.cv_squared(sorted_probs.sum(0))
+        lambda_2 = 0.1
+        loss = loss_importance + lambda_2 * loss_dynamic
+
+        return top_p_mask, loss
+
+    def forward(self, x: torch.Tensor, masks: torch.Tensor,
+                is_training: bool = False):
         """
         Args:
-            x: [B, N, D]  节点特征
+            x: [B, H, L, L]  邻接矩阵
+            masks: [L, 3, L]  区域掩码
         Returns:
-            weights: [B, N, F]  每个节点分配给F个过滤器的权重 (经Top-p截断)
+            mask: [B, H, L, L]  路由后掩码
+            loss: 辅助损失 (scalar)
         """
-        logits = self.gate(x)  # [B, N, F]
+        B, H, L, _ = x.shape
+        device = x.device
 
-        # 训练时加噪
-        if self.training and self.noisy and self.w_noise is not None:
-            noise_std = F.softplus(self.w_noise(x))  # [B, N, F]
-            noise = torch.randn_like(logits) * noise_std
-            logits = logits + noise
+        mask_base = torch.eye(L, device=device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        if self.top_p == 0.0:
+            return mask_base, torch.tensor(0.0, device=device)
 
-        probs = F.softmax(logits, dim=-1)  # [B, N, F]
+        x_flat = x.reshape(B * H, L, L)
+        gates, loss = self.noisy_top_p_gating(x_flat, is_training)
+        gates = gates.reshape(B, H, L, -1).float()  # [B, H, L, 3]
 
-        # Top-p 截断
-        sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
-        cumsum = sorted_probs.cumsum(dim=-1)
-        # 创建掩码: 累积概率超过 top_p 的位置置零 (保留第一个超过阈值的)
-        mask = cumsum - sorted_probs < self.top_p   # [B, N, F]
-        sorted_probs = sorted_probs * mask.float()
+        # 门控权重 × 区域掩码  →  最终掩码
+        final_mask = torch.einsum('bhli,lid->bhld', gates, masks) + mask_base
 
-        # 恢复原始顺序
-        weights = torch.zeros_like(probs)
-        weights.scatter_(-1, sorted_idx, sorted_probs)
-
-        # 重新归一化
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
-        return weights
+        return final_mask, loss
 
 
-# ---- 3d. TimeFilter Block ----
+# ---- 3d. Graph Learner (原始TimeFilter内积距离) ----
 
-class TimeFilterBlock(nn.Module):
-    """
-    TimeFilter 核心: 多头距离 → k-NN → 三过滤器 → 门控路由 → 加权邻接
+class GraphLearner(nn.Module):
+    """原始TimeFilter的图学习器: 两个独立线性投影 → 内积 + GELU → k-NN稀疏化 → MoE路由"""
 
-    输出: 经过过滤的图邻接矩阵
-    """
+    def __init__(self, dim: int, n_vars: int, top_p: float = 0.5, in_dim: int = 96):
+        super().__init__()
+        self.proj_1 = nn.Linear(dim, dim)
+        self.proj_2 = nn.Linear(dim, dim)
+        self.mask_moe = MoERouter(n_vars, top_p=top_p, in_dim=in_dim)
+
+    def forward(self, x: torch.Tensor, masks: torch.Tensor,
+                alpha: float = 0.5, is_training: bool = False):
+        """x: [B, H, L, D] → adj: [B, H, L, L], loss"""
+        adj = F.gelu(torch.einsum('bhid,bhjd->bhij', self.proj_1(x), self.proj_2(x)))
+        adj = adj * mask_topk(adj, alpha)
+        mask, loss = self.mask_moe(adj, masks, is_training)
+        adj = adj * mask
+        return adj, loss
+
+
+# ---- 3e. GCN (原始TimeFilter图卷积) ----
+
+class TimeFilterGCN(nn.Module):
+    """原始TimeFilter的多头图卷积"""
+
+    def __init__(self, dim: int, n_heads: int):
+        super().__init__()
+        self.proj = nn.Linear(dim, dim)
+        self.n_heads = n_heads
+
+    def forward(self, adj: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """adj: [B, H, L, L], x: [B, L, D] → [B, L, D]"""
+        B, L, D = x.shape
+        x = self.proj(x).view(B, L, self.n_heads, -1)  # [B, L, H, D_]
+        adj = F.normalize(adj, p=1, dim=-1)
+        x = torch.einsum("bhij,bjhd->bihd", adj, x).contiguous()
+        return x.view(B, L, -1)
+
+
+# ---- 3f. GraphFilter (图学习 + 图卷积) ----
+
+class GraphFilter(nn.Module):
+    """图学习器 + 图卷积 组合模块"""
+
+    def __init__(self, dim: int, n_vars: int, n_heads: int = 4,
+                 top_p: float = 0.5, dropout: float = 0.0, in_dim: int = 96):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.dropout = nn.Dropout(dropout)
+        self.graph_learner = GraphLearner(
+            self.dim // self.n_heads, n_vars, top_p, in_dim=in_dim,
+        )
+        self.graph_conv = TimeFilterGCN(self.dim, self.n_heads)
+
+    def forward(self, x: torch.Tensor, masks: torch.Tensor,
+                alpha: float = 0.5, is_training: bool = False):
+        """x: [B, L, D] → [B, L, D], loss"""
+        B, L, D = x.shape
+        x_h = x.reshape(B, L, self.n_heads, -1).permute(0, 2, 1, 3)  # [B, H, L, D//H]
+        adj, loss = self.graph_learner(x_h, masks, alpha, is_training)
+        adj = torch.softmax(adj, dim=-1)
+        adj = self.dropout(adj)
+        out = self.graph_conv(adj, x)
+        return out, loss
+
+
+# ---- 3g. GraphBlock (图过滤 + FFN + 残差) ----
+
+class GraphBlock(nn.Module):
+    """完整的TimeFilter GraphBlock: GraphFilter + LayerNorm + FFN + 残差"""
+
+    def __init__(self, dim: int, n_vars: int, d_ff: int = None,
+                 n_heads: int = 4, top_p: float = 0.5,
+                 dropout: float = 0.0, in_dim: int = 96):
+        super().__init__()
+        self.gnn = GraphFilter(dim, n_vars, n_heads, top_p=top_p,
+                               dropout=dropout, in_dim=in_dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, d_ff or dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff or dim * 4, dim),
+        )
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor, masks: torch.Tensor,
+                alpha: float = 0.5, is_training: bool = False):
+        """x: [B, L, D] → [B, L, D], loss"""
+        out, loss = self.gnn(self.norm1(x), masks, alpha, is_training)
+        x = x + out
+        x = x + self.ffn(self.norm2(x))
+        return x, loss
+
+
+# ---- 3h. TimeFilterBackbone ----
+
+class TimeFilterBackbone(nn.Module):
+    """TimeFilter backbone: 多层 GraphBlock 堆叠, 返回MoE辅助损失"""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.cfg = cfg
+        D = cfg.embed_dim
+        n_vars = cfg.n_channels
+        L = cfg.n_nodes
 
-        # 多头距离 + k-NN
-        self.distance_knn = MultiHeadDistanceKNN(
-            dim=cfg.embed_dim, n_heads=cfg.tf_n_heads, alpha=cfg.tf_alpha,
-        )
+        self.blocks = nn.ModuleList([
+            GraphBlock(
+                dim=D, n_vars=n_vars, d_ff=D * 2,
+                n_heads=cfg.tf_n_heads, top_p=cfg.top_p,
+                dropout=cfg.gat_dropout, in_dim=L,
+            )
+            for _ in range(cfg.n_timefilter_blocks)
+        ])
+        self.n_blocks = cfg.n_timefilter_blocks
+        self._masks: Optional[torch.Tensor] = None
+        self._cfg = cfg
 
-        # 三个过滤器
-        self.filter_temporal = TemporalFilter(cfg.n_channels, cfg.n_patches)
-        self.filter_spatial = SpatialFilter(
-            cfg.n_channels, cfg.n_patches, cfg.tcp_pairs, cfg.spatial_dist_thresh,
-        )
-        self.filter_pathological = PathologicalFilter(
-            cfg.embed_dim, cfg.n_nodes, use_gamma_prior=False,
-        )
-        self.filters = [self.filter_temporal, self.filter_spatial, self.filter_pathological]
+    def _get_masks(self, L: int, device: torch.device) -> torch.Tensor:
+        if self._masks is None or self._masks.device != device:
+            self._masks = build_region_masks(
+                L=L, n_vars=self._cfg.n_channels, device=device,
+                n_channels=self._cfg.n_channels, n_patches=self._cfg.n_patches,
+                tcp_pairs=self._cfg.tcp_pairs,
+                spatial_dist_thresh=self._cfg.spatial_dist_thresh,
+                temporal_k=self._cfg.temporal_k,
+            )
+        return self._masks
 
-        # 门控路由
-        self.router = NoisyGatedRouter(
-            cfg.embed_dim, cfg.tf_n_filters, cfg.top_p, cfg.noisy_gating,
-        )
+    def forward(self, x: torch.Tensor, is_training: bool = False):
+        """x: [B, L, D] → [B, L, D], moe_loss"""
+        L = x.shape[1]
+        masks = self._get_masks(L, x.device)
+        moe_loss = 0.0
+        for block in self.blocks:
+            x, loss = block(x, masks, self._cfg.tf_alpha, is_training)
+            moe_loss = moe_loss + loss
+        moe_loss = moe_loss / max(self.n_blocks, 1)
+        return x, moe_loss
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        gamma_energy: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: [B, N, D]  节点特征
-            gamma_energy: [B, N, 1]  可选gamma能量先验
-        Returns:
-            filtered_adj: [B, N, N]  过滤后的邻接矩阵
-        """
-        # 1. 构建k-NN图
-        adj = self.distance_knn(x)  # [B, N, N]
 
-        # 2. 三个过滤器分别过滤
-        adj_temporal = self.filter_temporal(adj)
-        adj_spatial = self.filter_spatial(adj)
-        adj_pathological = self.filter_pathological(adj, x, gamma_energy)
-        filtered_adjs = torch.stack(
-            [adj_temporal, adj_spatial, adj_pathological], dim=-1
-        )  # [B, N, N, F]
 
-        # 3. 门控路由 → 加权融合
-        weights = self.router(x)  # [B, N, F]
-        # 对称化权重: 边(i,j)的过滤器权重 = mean(w_i, w_j)
-        w_i = weights.unsqueeze(2)  # [B, N, 1, F]
-        w_j = weights.unsqueeze(1)  # [B, 1, N, F]
-        edge_weights = (w_i + w_j) / 2.0  # [B, N, N, F]
 
-        # 加权求和
-        filtered_adj = (filtered_adjs * edge_weights).sum(dim=-1)  # [B, N, N]
-        return filtered_adj
+
 
 
 # =============================================================================
@@ -1010,27 +1280,16 @@ class LaBraM_TimeFilter_SOZ(nn.Module):
         self.cfg = cfg or ModelConfig()
         cfg = self.cfg
 
-        # ---- 1. Patch Embedding ----
-        self.patch_embed = PatchEmbedding(cfg)
-
-        # ---- 2. LaBraM Backbone ----
+        # ---- 1. LaBraM Backbone (含TemporalConv嵌入层) ----
         self.backbone = LaBraMBackbone(cfg)
 
-        # ---- 3. TimeFilter ----
-        self.timefilter = TimeFilterBlock(cfg)
+        # ---- 2. TimeFilter (GraphBlock堆叠 + MoE路由) ----
+        self.timefilter = TimeFilterBackbone(cfg)
 
-        # ---- 4. GAT ----
-        self.gat = GATBlock(
-            dim=cfg.embed_dim,
-            n_layers=cfg.gat_layers,
-            n_heads=cfg.gat_heads,
-            dropout=cfg.gat_dropout,
-        )
-
-        # ---- 5. SOZ Localization Head ----
+        # ---- 3. SOZ Localization Head ----
         self.soz_head = SOZLocalizationHead(cfg)
 
-        # ---- 6. Domain Discriminator (optional) ----
+        # ---- 4. Domain Discriminator (optional) ----
         self.domain_disc = None
         if cfg.use_domain_adversarial:
             self.domain_disc = DomainDiscriminator(
@@ -1070,19 +1329,13 @@ class LaBraM_TimeFilter_SOZ(nn.Module):
         """
         B = x.size(0)
 
-        # (1) Patch Embedding
-        h = self.patch_embed(x)                      # [B, 440, D]
+        # (1) LaBraM Backbone (含TemporalConv + 位置编码 + Transformer)
+        h = self.backbone(x)                          # [B, 440, D]
 
-        # (2) LaBraM Backbone
-        h = self.backbone(h)                          # [B, 440, D]
+        # (2) TimeFilter (GraphBlock堆叠, 原始MoE路由)
+        h, moe_loss = self.timefilter(h, is_training=self.training)  # [B, 440, D], scalar
 
-        # (3) TimeFilter → 过滤后邻接矩阵
-        filtered_adj = self.timefilter(h, gamma_energy)  # [B, 440, 440]
-
-        # (4) GAT 图卷积
-        h = self.gat(h, filtered_adj)                 # [B, 440, D]
-
-        # (5) SOZ Localization Head
+        # (3) SOZ Localization Head
         soz_logits, aux = self.soz_head(h)            # [B, n_output]
         soz_probs = torch.sigmoid(soz_logits)
 
@@ -1091,13 +1344,13 @@ class LaBraM_TimeFilter_SOZ(nn.Module):
             'soz_logits': soz_logits,                  # [B, n_output]
             'bipolar_logits': aux['bipolar_logits'],    # [B, 22] 始终可用
             'temporal_attn': aux['temporal_attn_weights'],
-            'filtered_adj': filtered_adj,
+            'moe_loss': moe_loss,                      # MoE辅助损失
             # 向后兼容旧键名
             'monopolar_probs': soz_probs,
             'monopolar_logits': soz_logits,
         }
 
-        # (6) Domain Discriminator
+        # (4) Domain Discriminator
         if self.domain_disc is not None:
             global_feat = h.mean(dim=1)               # [B, D]
             domain_logits = self.domain_disc(global_feat)  # [B, 1]
@@ -1177,14 +1430,16 @@ class LaBraM_TimeFilter_SOZ(nn.Module):
 
 def build_model(
     checkpoint: str = '',
-    n_frozen: int = 12,
-    embed_dim: int = 128,
+    checkpoint_type: str = 'labram-base',
+    n_frozen: int = 10,
+    embed_dim: int = 200,
     use_domain_adversarial: bool = True,
     **kwargs,
 ) -> LaBraM_TimeFilter_SOZ:
     """快速构建模型"""
     cfg = ModelConfig(
         labram_checkpoint=checkpoint,
+        checkpoint_type=checkpoint_type,
         n_frozen_layers=n_frozen,
         embed_dim=embed_dim,
         use_domain_adversarial=use_domain_adversarial,
@@ -1213,12 +1468,14 @@ if __name__ == '__main__':
             n_frozen_layers=2,
             n_output=n_out,
             output_mode=mode,
+            patch_len=200,
+            n_timefilter_blocks=1,
         )
         model = LaBraM_TimeFilter_SOZ(cfg)
         print(model.summary())
 
         B = 4
-        X = torch.randn(B, 22, 20, 100)
+        X = torch.randn(B, 22, 20, 200)  # patch_len=200 对齐LaBraM
         domain = torch.tensor([[0], [0], [1], [1]], dtype=torch.float32)
 
         # Forward (shape check)
@@ -1227,10 +1484,11 @@ if __name__ == '__main__':
             out = model(X, domain_labels=domain)
         for k, v in out.items():
             if isinstance(v, torch.Tensor):
-                print(f"  {k}: {v.shape}")
+                print(f"  {k}: {v.shape}" if v.dim() > 0 else f"  {k}: {v.item():.4f}")
 
         assert out['soz_probs'].shape == (B, n_out), \
             f"Expected soz_probs shape ({B}, {n_out}), got {out['soz_probs'].shape}"
+        print(f"  MoE aux loss: {out['moe_loss']:.6f}")
 
         # Loss + Backward
         print(f"\nLoss + Backward...")
@@ -1244,9 +1502,10 @@ if __name__ == '__main__':
             out['soz_logits'], y_soz,
             out.get('domain_logits'), domain,
         )
-        print(f"  Total loss: {total_loss.item():.4f}")
+        # 加上MoE辅助损失
+        total_loss = total_loss + cfg.moe_loss_weight * out['moe_loss']
+        print(f"  Total loss (incl. MoE): {total_loss.item():.4f}")
         total_loss.backward()
         print(f"  Backward OK")
 
     print(f"\n[OK] All tests passed (bipolar + monopolar modes)!")
-
