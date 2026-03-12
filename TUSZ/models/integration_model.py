@@ -312,6 +312,8 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         seizure_onset_sec: torch.Tensor,
         window_start_sec: torch.Tensor,
         valid_patch_counts: Optional[torch.Tensor] = None,
+        brain_networks: Optional[torch.Tensor] = None,
+        rel_time: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args
@@ -320,6 +322,8 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         seizure_onset_sec : [B]         absolute onset time (s)
         window_start_sec  : [B]         absolute window start (s)
         valid_patch_counts: [B] (opt)   override patching counts
+        brain_networks    : [B, P, 22, 22, 4] (opt) precomputed brain networks
+        rel_time          : [B, P] (opt) precomputed rel time
 
         Returns
         -------
@@ -330,11 +334,12 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         B = x.size(0)
 
         # ── Step 1: Seizure-aligned patching ──
-        patches, vp_counts, rel_time = self.patching(
+        patches, vp_counts_patched, rel_time_patched = self.patching(
             x, seizure_onset_sec, window_start_sec,
-        )  # patches [B, P, 22, 100], vp_counts [B], rel_time [B, P]
-        if valid_patch_counts is not None:
-            vp_counts = valid_patch_counts
+        )  # patches [B, P, 22, 100]
+        
+        vp_counts = valid_patch_counts if valid_patch_counts is not None else vp_counts_patched
+        rel_time = rel_time if rel_time is not None else rel_time_patched
         P = patches.size(1)
 
         # ── Branch A: Temporal (LaBraM Backbone + TimeFilter) ──
@@ -348,9 +353,12 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         temporal_feat = h                                     # [B, N, D]
 
         # ── Branch B: Brain network + DirectedBrainTimeFilter ──
-        with torch.no_grad():
-            net_result = self.net_extractor(patches)          # dict
-        brain_nets = net_result['all']                        # [B, P, 22, 22, 4]
+        if brain_networks is None:
+            with torch.no_grad():
+                net_result = self.net_extractor(patches)          # dict
+            brain_nets = net_result['all']                        # [B, P, 22, 22, 4]
+        else:
+            brain_nets = brain_networks
 
         # 有向图过滤
         brain_nets_filtered, moe_loss_b = self.brain_timefilter(

@@ -138,43 +138,91 @@ class SOZBrainNetworkDataset(torch.utils.data.Dataset):
     needed by SeizureAlignedAdaptivePatching.
     """
 
-    def __init__(self, manifest_ds: ManifestSOZDataset):
+    def __init__(self, manifest_ds: ManifestSOZDataset, precomputed_dir: str = None):
         self.ds = manifest_ds
+        self.precomputed_dir = Path(precomputed_dir) if precomputed_dir else None
 
     def __len__(self):
         return len(self.ds)
 
+    def _get_cache_path(self, idx: int) -> Optional[Path]:
+        if not self.precomputed_dir:
+            return None
+        row = self.ds.df.iloc[idx]
+        edf_rel = Path(str(row.get('edf_path', '')))
+        start_sec = float(row.get('window_start_sec', 0.0))
+        
+        # Keep directory structure: precomputed_dir / dir_of_edf / filename_start_sec.npz
+        # Using .with_suffix('') to remove the .edf extension before appending
+        rel_path = edf_rel.parent / f"{edf_rel.stem}_w{start_sec:.1f}.npz"
+        
+        cache_file = self.precomputed_dir / rel_path
+        # Ensure the subdirectories exist
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        return cache_file
+
     def __getitem__(self, idx):
         sample = self.ds[idx]
-        x = sample['data']                         # [22, 20, 100]
-        label = sample['label']                    # [22] or [19]
+        # x = sample['data']                         # [22, 20, 100]
+        # label = sample['label']                    # [22] or [19]
+
+        x, label, mask, meta, y_bipolar, y_monopolar = sample
 
         # flatten to [22, 2000] for patching module
         C, P, L = x.shape
         x_flat = x.reshape(C, P * L)
 
         # extract onset / start from manifest row
-        row = self.ds.manifest.iloc[idx]
+        row = self.ds.df.iloc[idx]
         onset_sec = float(row.get('onset_sec', 5.0))
         start_sec = float(row.get('window_start_sec', 0.0))
-
-        return {
+        
+        ret = {
+            'idx': idx,
             'x': x_flat,
             'label': label,
+            'bipolar_label': y_bipolar,
+            'monopolar_label': y_monopolar,
             'onset_sec': onset_sec,
             'start_sec': start_sec,
             'source': row.get('source', 'unknown'),
+            'patient_id': row.get('patient_id', 'unknown'),
+            'edf_path': row.get('edf_path', ''),
         }
+        
+        cache_path = self._get_cache_path(idx)
+        if cache_path and cache_path.exists():
+            try:
+                data = np.load(str(cache_path))
+                ret['brain_nets'] = torch.from_numpy(data['brain_nets'])
+                ret['valid_patch_counts'] = torch.tensor(data['valid_patch_counts'])
+                ret['rel_time'] = torch.from_numpy(data['rel_time'])
+            except Exception as e:
+                pass # Fallback to online computation if loading fails
+                
+        return ret
 
 
 def collate_fn(batch):
-    return {
+    ret = {
+        'idx': [b['idx'] for b in batch],
         'x': torch.stack([b['x'] for b in batch]),
         'label': torch.stack([b['label'] for b in batch]),
+        'bipolar_label': torch.stack([b['bipolar_label'] for b in batch]),
+        'monopolar_label': torch.stack([b['monopolar_label'] for b in batch]),
         'onset_sec': torch.tensor([b['onset_sec'] for b in batch]),
         'start_sec': torch.tensor([b['start_sec'] for b in batch]),
         'source': [b['source'] for b in batch],
+        'patient_id': [b['patient_id'] for b in batch],
+        'edf_path': [b['edf_path'] for b in batch],
     }
+    
+    if all('brain_nets' in b for b in batch):
+        ret['brain_nets'] = torch.stack([b['brain_nets'] for b in batch])
+        ret['valid_patch_counts'] = torch.stack([b['valid_patch_counts'] for b in batch])
+        ret['rel_time'] = torch.stack([b['rel_time'] for b in batch])
+        
+    return ret
 
 
 # =====================================================================
@@ -193,9 +241,25 @@ def train_one_epoch(
         label = batch['label'].to(device)
         onset = batch['onset_sec'].to(device)
         start = batch['start_sec'].to(device)
+        
+        brain_nets = batch.get('brain_nets', None)
+        vp_counts = batch.get('valid_patch_counts', None)
+        rel_time = batch.get('rel_time', None)
+        
+        if brain_nets is not None:
+            brain_nets = brain_nets.to(device)
+        if vp_counts is not None:
+            vp_counts = vp_counts.to(device)
+        if rel_time is not None:
+            rel_time = rel_time.to(device)
 
         with torch.cuda.amp.autocast(enabled=scaler is not None):
-            outputs = model(x, onset, start)
+            outputs = model(
+                x, onset, start,
+                valid_patch_counts=vp_counts,
+                brain_networks=brain_nets,
+                rel_time=rel_time,
+            )
 
             # build aux targets
             vm = model.module._build_valid_mask(
@@ -270,7 +334,24 @@ def evaluate(model, loader, device):
         label = batch['label'].to(device)
         onset = batch['onset_sec'].to(device)
         start = batch['start_sec'].to(device)
-        out = model(x, onset, start)
+        
+        brain_nets = batch.get('brain_nets', None)
+        vp_counts = batch.get('valid_patch_counts', None)
+        rel_time = batch.get('rel_time', None)
+        
+        if brain_nets is not None:
+            brain_nets = brain_nets.to(device)
+        if vp_counts is not None:
+            vp_counts = vp_counts.to(device)
+        if rel_time is not None:
+            rel_time = rel_time.to(device)
+
+        out = model(
+            x, onset, start,
+            valid_patch_counts=vp_counts,
+            brain_networks=brain_nets,
+            rel_time=rel_time,
+        )
         all_probs.append(out['soz_probs'].cpu().numpy())
         all_targets.append(label.cpu().numpy())
     probs = np.concatenate(all_probs, axis=0)
@@ -345,7 +426,7 @@ def parse_args():
 
     # data
     p.add_argument('--manifest', required=True, help='combined_manifest.csv')
-    p.add_argument('--data-root', default='', help='preprocessed data root')
+    p.add_argument('--private-data-root', default='', help='preprocessed data root')
     p.add_argument('--tusz-data-root', default='', help='TUSZ EDF root')
     p.add_argument('--source', default='all', choices=['tusz', 'private', 'all'])
 
@@ -372,6 +453,7 @@ def parse_args():
 
     # output
     p.add_argument('--output-dir', default='output/train_bn')
+    p.add_argument('--precomputed-dir', default=None, help='Directory with precomputed brain networks')
     p.add_argument('--resume', default='', help='checkpoint to resume from')
     p.add_argument('--save-every', type=int, default=10)
 
@@ -406,13 +488,13 @@ def main():
     log.info("=== Step 1: Loading data ===")
     manifest_ds = ManifestSOZDataset(
         manifest_path=args.manifest,
-        data_root=args.data_root,
+        private_data_root=args.private_data_root,
         tusz_data_root=args.tusz_data_root,
-        source=args.source,
+        source_filter=args.source,
     )
     log.info(f"  Manifest loaded: {len(manifest_ds)} samples")
 
-    dataset = SOZBrainNetworkDataset(manifest_ds)
+    dataset = SOZBrainNetworkDataset(manifest_ds, precomputed_dir=args.precomputed_dir)
 
     # split (simple random; for LOPO use external loop)
     n = len(dataset)

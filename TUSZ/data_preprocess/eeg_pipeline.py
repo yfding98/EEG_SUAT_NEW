@@ -246,18 +246,30 @@ class EEGPipeline:
     # 文件读取与预处理 (每个文件只执行一次, 结果缓存)
     # -----------------------------------------------------------------
 
-    def load_edf(self, edf_path: str) -> Tuple[np.ndarray, float]:
+    def load_edf(self, edf_path: str, onset: Optional[float] = None) -> Tuple[np.ndarray, float]:
         """
-        读取EDF → 提取21电极 → MNE滤波 → MNE重采样
+        读取EDF → 截取有效段 (若提供onset) → 提取21电极 → MNE滤波 → MNE重采样
 
         Returns:
             (data_21, fs)  data_21: (21, n_samples) 单位Volts
         """
-        if edf_path in self._cache:
-            return self._cache[edf_path]
+        # If cache exists and we aren't cropping explicitly (or it's close enough), use it
+        # Note: if cropping is used, caching the whole file no longer makes sense per-file unless we cache per-event.
+        cache_key = f"{edf_path}_{onset:.1f}" if onset is not None else edf_path
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         # 1. 读取
         raw = self._read_raw(edf_path)
+
+        # 1.5 如果提供了onset，提前Crop以节省内存
+        if onset is not None:
+            pre = self.cfg.pre_onset_sec + 2.0  # extra margin for edge effects
+            post = self.cfg.post_onset_sec + 2.0
+            tmin = max(0.0, onset - pre)
+            tmax = min(raw.times[-1], onset + post)
+            if tmax > tmin:
+                raw.crop(tmin=tmin, tmax=tmax)
 
         # 2. 筛选目标通道
         raw = self._pick_channels(raw)
@@ -299,7 +311,8 @@ class EEGPipeline:
             if target in norm_to_row:
                 data_21[i] = raw_data[norm_to_row[target]]
 
-        self._cache[edf_path] = (data_21, fs)
+        # Store in cache with the specific key
+        self._cache[cache_key] = (data_21, fs)
         return data_21, fs
 
     def _read_raw(self, path: str) -> mne.io.BaseRaw:
@@ -360,10 +373,30 @@ class EEGPipeline:
 
         # 提取 (边界处零填充)
         window = np.zeros((data.shape[0], win_len), dtype=np.float64)
-        src_s = max(0, onset_samp - pre)
-        src_e = min(n_total, onset_samp + post)
-        dst_s = src_s - (onset_samp - pre)
-        dst_e = dst_s + (src_e - src_s)
+        
+        # If we cropped during load_edf, onset_samp is relative to the cropped start
+        # The crop started at `max(0, onset - (pre_onset_sec + 2.0))`
+        # To be safe, we just take the center segment since we know the window limits
+        # We will assume data was cropped if it's smaller than the full edf would normally be.
+        # It's better to calculate relative to crop
+        
+        # A simpler way when data is already cropped with a 2-second margin:
+        # Expected cropped length: (pre + 2.0 + post + 2.0) * fs
+        # Target start index within this cropped data: 2.0 * fs
+        if data.shape[1] < (pre + post + 10) * fs: # It was cropped
+            cropped_tmin_sec = max(0.0, onset - (self.cfg.pre_onset_sec + 2.0))
+            onset_samp_rel = int((onset - cropped_tmin_sec) * fs)
+            src_s = max(0, onset_samp_rel - pre)
+            src_e = min(n_total, onset_samp_rel + post)
+            dst_s = pre - (onset_samp_rel - src_s)
+            dst_e = dst_s + (src_e - src_s)
+        else: # Full file (e.g. if onset was not provided to load_edf)
+            src_s = max(0, onset_samp - pre)
+            src_e = min(n_total, onset_samp + post)
+            dst_s = max(0, pre - onset_samp) if onset_samp < pre else 0 
+            # Equivalently: dst_s = pre - (onset_samp - src_s)
+            dst_e = dst_s + (src_e - src_s)
+            
         window[:, dst_s:dst_e] = data[:, src_s:src_e]
 
         return window
@@ -561,7 +594,7 @@ class EEGPipeline:
         """
         # (a) 读取 + 滤波 + 重采样 (缓存)
         try:
-            data_21, fs = self.load_edf(event.edf_path)
+            data_21, fs = self.load_edf(event.edf_path, onset=event.onset)
         except Exception as e:
             logger.error(f"读取失败 {event.edf_path}: {e}")
             return None
@@ -640,10 +673,11 @@ class EEGPipeline:
         prev_file = None
 
         for event in iterator:
-            if event.edf_path != prev_file:
+            cache_key = f"{event.edf_path}_{event.onset:.1f}"
+            if cache_key != prev_file:
                 if prev_file is not None and prev_file in self._cache:
                     del self._cache[prev_file]
-                prev_file = event.edf_path
+                prev_file = cache_key
 
             result = self.process_event(event)
             if result is not None:
@@ -734,10 +768,11 @@ class EEGPipeline:
             n_total += 1
 
             # 缓存管理
-            if event.edf_path != prev_file:
+            cache_key = f"{event.edf_path}_{event.onset:.1f}"
+            if cache_key != prev_file:
                 if prev_file is not None and prev_file in self._cache:
                     del self._cache[prev_file]
-                prev_file = event.edf_path
+                prev_file = cache_key
 
             result = self.process_event(event)
             if result is None:

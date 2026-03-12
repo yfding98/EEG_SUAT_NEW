@@ -209,7 +209,7 @@ class MultiScaleBrainNetworkExtractor(nn.Module):
         XtX_r = Xr.transpose(-2, -1) @ Xr
         XtX_r += self.gc_ridge * torch.eye(p, device=dev)
         Xty_r = Xr.transpose(-2, -1) @ yr.unsqueeze(-1)
-        beta_r = torch.linalg.solve(XtX_r, Xty_r)
+        beta_r = torch.linalg.lstsq(XtX_r, Xty_r).solution
         res_r = yr - (Xr @ beta_r).squeeze(-1)
         var_r = res_r.var(-1).reshape(N, C)                  # [N,C]
 
@@ -224,7 +224,7 @@ class MultiScaleBrainNetworkExtractor(nn.Module):
             yi = targets[:, i].unsqueeze(1).expand(-1, C, -1).reshape(N * C, T)
             XtX_u = Xu.transpose(-2, -1) @ Xu + reg_u
             Xty_u = Xu.transpose(-2, -1) @ yi.unsqueeze(-1)
-            beta_u = torch.linalg.solve(XtX_u, Xty_u)
+            beta_u = torch.linalg.lstsq(XtX_u, Xty_u).solution
             res_u = yi - (Xu @ beta_u).squeeze(-1)
             var_u = res_u.var(-1).reshape(N, C).clamp(min=1e-10)
             gc[:, i, :] = torch.log(var_r[:, i: i + 1] / var_u).clamp(min=0)

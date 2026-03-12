@@ -80,7 +80,7 @@ def _build_bipolar_to_monopolar_matrix() -> np.ndarray:
         return M_norm  # (19, 22)
     else:
         # Fallback: 手动构建
-        from models.labram_timefilter_soz import TCP_PAIRS, STANDARD_19
+        from labram_timefilter_soz import TCP_PAIRS, STANDARD_19
         STD_IDX = {ch: i for i, ch in enumerate(STANDARD_19)}
         M = np.zeros((19, 22), dtype=np.float32)
         for j, (a, b) in enumerate(TCP_PAIRS):
@@ -190,7 +190,7 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         df = pd.read_csv(path)
         n0 = len(df)
 
-        if source_filter != 'both':
+        if source_filter not in ('both', 'all'):
             df = df[df['source'] == source_filter]
 
         if split_filter:
@@ -259,9 +259,9 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         """
         Returns:
             X:     [22, n_patches, patch_len] float32 — TCP双极patch数据
-            y_soz: [n_output] float32 — SOZ标签 (22 bipolar or 19 monopolar)
+            y:     [22] float32 - bipolar, [19] float32 - monopolar (tuple)
             mask:  [22] float32 — 通道有效性掩码
-            meta:  dict — 元数据
+            meta:  dict — 元数据 (contains both labels too)
         """
         row = self.df.iloc[idx]
 
@@ -270,13 +270,19 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
             [int(row.get(col, 0)) for col in TCP_COL_NAMES],
             dtype=np.float32,
         )  # (22,)
+        
+        # 双极 → 单极映射: (19, 22) @ (22,) → (19,)
+        if self._b2m_matrix is not None:
+            monopolar_label = (self._b2m_matrix @ bipolar_label > 0).astype(np.float32)
+        else:
+            # Fallback for safety
+            self._b2m_matrix = _build_bipolar_to_monopolar_matrix()
+            monopolar_label = (self._b2m_matrix @ bipolar_label > 0).astype(np.float32)
 
         if self.label_mode == 'bipolar':
             y_soz = bipolar_label
         else:
-            # 双极 → 单极映射: (19, 22) @ (22,) → (19,)
-            y_mono = self._b2m_matrix @ bipolar_label
-            y_soz = (y_mono > 0).astype(np.float32)
+            y_soz = monopolar_label
 
         # ── 元数据 ────────────────────────────────────────────────────────
         meta = {
@@ -290,6 +296,8 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
             'onset_channels': str(row.get('onset_channels', '')),
             'has_soz':        int(bipolar_label.sum() > 0),
             'row_idx':        idx,
+            'bipolar_label':  bipolar_label,
+            'monopolar_label': monopolar_label,
         }
 
         # ── EEG 数据 ──────────────────────────────────────────────────────
@@ -298,9 +306,11 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         # 转为 torch tensor
         X = torch.from_numpy(X).float()
         y_soz = torch.from_numpy(y_soz).float()
+        y_bipolar = torch.from_numpy(bipolar_label).float()
+        y_monopolar = torch.from_numpy(monopolar_label).float()
         mask = torch.from_numpy(mask).float()
 
-        return X, y_soz, mask, meta
+        return X, y_soz, mask, meta, y_bipolar, y_monopolar
 
     def _load_eeg(self, row: pd.Series, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """加载 EDF → 21单极 → 双极转换 → patches"""
@@ -377,12 +387,14 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
 
     @staticmethod
     def collate_fn(batch):
-        Xs, ys, masks, metas = zip(*batch)
+        Xs, ys, masks, metas, y_bipolars, y_monopolars = zip(*batch)
         return (
             torch.stack(Xs),
             torch.stack(ys),
             torch.stack(masks),
             list(metas),
+            torch.stack(y_bipolars),
+            torch.stack(y_monopolars),
         )
 
 
