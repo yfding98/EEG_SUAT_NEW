@@ -198,7 +198,17 @@ class TemporalConv(nn.Module):
             [B, N*A, D]  where D = T_out * out_chans
         """
         B, N, A, T = x.shape
-        x = x.reshape(B, N * A, T)          # [B, N*A, T]
+
+        # LaBraM's pre-trained weights strictly expect 200 samples (1s at 200Hz).
+        # Shorter patches will output smaller D after convolution and break transformer blocks.
+        # We zero-pad the patch to 200 to preserve pre-trained feature indices.
+        if T < 200:
+            x = torch.nn.functional.pad(x, (0, 200 - T))
+        elif T > 200:
+            x = x[:, :, :, :200]
+        T = 200
+
+        x = x.reshape(B, N * A, T)            # [B, N*A, T]
         x = x.unsqueeze(1)                    # [B, 1, N*A, T]
         x = self.gelu1(self.norm1(self.conv1(x)))
         x = self.gelu2(self.norm2(self.conv2(x)))

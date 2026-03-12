@@ -413,14 +413,17 @@ class DynamicNetworkEvolutionModel(nn.Module):
         tr_in = gru_out.permute(0, 2, 1)                    # [B, 256, P]
         tr_logits = self.transition_head(tr_in).squeeze(1)   # [B, P]
         # mask: only score patches inside window
-        tr_logits = tr_logits.masked_fill(~in_window, -1e9)
+        # use a safe minimum value for fp16
+        min_val = torch.finfo(tr_logits.dtype).min
+        tr_logits = tr_logits.masked_fill(~in_window, min_val)
         transition_probs = torch.sigmoid(tr_logits)
         transition_probs = transition_probs * valid_mask.float()
 
         # ── (d) Pattern classification ──
         # Use hidden state at the onset boundary (patch index closest to t=0)
         onset_dist = seizure_relative_time.abs()
-        onset_dist = onset_dist.masked_fill(~valid_mask, 1e9)
+        max_val = torch.finfo(onset_dist.dtype).max / 2  # safe maximum for any dtype
+        onset_dist = onset_dist.masked_fill(~valid_mask, max_val)
         onset_idx = onset_dist.argmin(dim=1)                 # [B]
         onset_h = gru_out[
             torch.arange(B, device=dev), onset_idx
