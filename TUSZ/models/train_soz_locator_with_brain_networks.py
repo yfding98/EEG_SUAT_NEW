@@ -442,6 +442,10 @@ def parse_args():
     p.add_argument('--use-contrastive', action='store_true')
     p.add_argument('--pretrain-epochs', type=int, default=50)
 
+    # Sequence length configurations
+    p.add_argument('--pre-onset-sec', type=float, default=5.0, help='Seconds before onset to extract')
+    p.add_argument('--post-onset-sec', type=float, default=5.0, help='Seconds after onset to extract')
+
     # training
     p.add_argument('--finetune-epochs', type=int, default=100)
     p.add_argument('--batch-size', type=int, default=16)
@@ -486,11 +490,32 @@ def main():
 
     # ── 1. Data loading ──
     log.info("=== Step 1: Loading data ===")
+    
+    # Calculate patch configurations
+    patch_len = int(args.patch_duration * args.fs)
+    n_pre_patches = int(np.ceil(args.pre_onset_sec / args.patch_duration))
+    n_post_patches = int(np.ceil(args.post_onset_sec / args.patch_duration))
+    n_patches = n_pre_patches + n_post_patches
+    
+    try:
+        from data_preprocess.eeg_pipeline import PipelineConfig
+    except ImportError:
+        from .data_preprocess.eeg_pipeline import PipelineConfig
+        
+    pipeline_cfg = PipelineConfig(
+        target_fs=args.fs,
+        pre_onset_sec=args.pre_onset_sec,
+        post_onset_sec=args.post_onset_sec,
+        n_patches=n_patches,
+        patch_len=patch_len
+    )
+    
     manifest_ds = ManifestSOZDataset(
         manifest_path=args.manifest,
         private_data_root=args.private_data_root,
         tusz_data_root=args.tusz_data_root,
         source_filter=args.source,
+        pipeline_cfg=pipeline_cfg,
     )
     log.info(f"  Manifest loaded: {len(manifest_ds)} samples")
 
@@ -532,10 +557,11 @@ def main():
 
     # ── 2. ModelInit ──
     log.info("=== Step 2: Initializing model ===")
-    patch_len = int(args.patch_duration * args.fs)
     cfg = IntegrationConfig(
         embed_dim=args.embed_dim,
         patch_len=patch_len,
+        n_pre_patches=n_pre_patches,
+        n_post_patches=n_post_patches,
         fs=args.fs,
         labram_checkpoint=args.labram_ckpt,
         output_mode=args.output_mode,

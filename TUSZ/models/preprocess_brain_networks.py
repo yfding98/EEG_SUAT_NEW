@@ -52,6 +52,10 @@ def parse_args():
     p.add_argument('--patch-duration', type=float, default=0.5)
     p.add_argument('--fs', type=float, default=200.0)
     
+    # Sequence length configurations
+    p.add_argument('--pre-onset-sec', type=float, default=5.0, help='Seconds before onset')
+    p.add_argument('--post-onset-sec', type=float, default=5.0, help='Seconds after onset')
+    
     return p.parse_args()
 
 def main():
@@ -62,11 +66,31 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     log.info(f"Loading manifest from {args.manifest}")
+    
+    patch_len = int(args.patch_duration * args.fs)
+    n_pre_patches = int(np.ceil(args.pre_onset_sec / args.patch_duration))
+    n_post_patches = int(np.ceil(args.post_onset_sec / args.patch_duration))
+    n_patches = n_pre_patches + n_post_patches
+    
+    try:
+        from data_preprocess.eeg_pipeline import PipelineConfig
+    except ImportError:
+        from .data_preprocess.eeg_pipeline import PipelineConfig
+
+    pipeline_cfg = PipelineConfig(
+        target_fs=args.fs,
+        pre_onset_sec=args.pre_onset_sec,
+        post_onset_sec=args.post_onset_sec,
+        n_patches=n_patches,
+        patch_len=patch_len
+    )
+
     manifest_ds = ManifestSOZDataset(
         manifest_path=args.manifest,
         private_data_root=args.private_data_root,
         tusz_data_root=args.tusz_data_root,
         source_filter=args.source,
+        pipeline_cfg=pipeline_cfg,
     )
     # Instantiate without precomputed_dir since we are generating them
     dataset = SOZBrainNetworkDataset(manifest_ds)
@@ -79,7 +103,12 @@ def main():
     )
     
     log.info("Initializing models...")
-    cfg = IntegrationConfig(patch_len=int(args.patch_duration * args.fs), fs=args.fs)
+    cfg = IntegrationConfig(
+        patch_len=patch_len, 
+        n_pre_patches=n_pre_patches,
+        n_post_patches=n_post_patches,
+        fs=args.fs
+    )
     patching = SeizureAlignedAdaptivePatching(
         n_channels=cfg.n_channels, patch_len=cfg.patch_len,
         n_pre_patches=cfg.n_pre_patches,

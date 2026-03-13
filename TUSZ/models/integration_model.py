@@ -62,8 +62,8 @@ class IntegrationConfig:
     # patching
     n_channels: int = 22
     patch_len: int = 200               # 对齐LaBraM patch_size
-    n_pre_patches: int = 8
-    n_post_patches: int = 12
+    n_pre_patches: int = 6
+    n_post_patches: int = 10
     fs: float = 200.0
 
     # LaBraM backbone

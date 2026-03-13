@@ -488,6 +488,20 @@ class LaBraMBackbone(nn.Module):
                     continue
                 mapped[new_key] = v
 
+            # Interpolate time_embed if shapes mismatch
+            if 'time_embed' in mapped:
+                ckpt_time_embed = mapped['time_embed']
+                my_time_embed = self.time_embed
+                if ckpt_time_embed.shape != my_time_embed.shape:
+                    logger.info(f"Interpolating time_embed from {ckpt_time_embed.shape} to {my_time_embed.shape}")
+                    import torch.nn.functional as F
+                    mapped['time_embed'] = F.interpolate(
+                        ckpt_time_embed.permute(0, 2, 1),
+                        size=my_time_embed.shape[1],
+                        mode='linear',
+                        align_corners=False
+                    ).permute(0, 2, 1)
+                    
             missing, unexpected = self.load_state_dict(mapped, strict=False)
             n_loaded = len(mapped) - len(unexpected)
             logger.info(
