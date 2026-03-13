@@ -45,7 +45,7 @@ FEATURE_DIRECTED = [True, True, True, False]  # 前三个有向, wPLI无向
 class DirectedTimeFilterConfig:
     """有向脑网络TimeFilter配置"""
     n_channels: int = 22
-    n_patches: int = 20
+    n_patches: int = 10
     n_features: int = 4
     n_heads: int = 4
     alpha: float = 0.15

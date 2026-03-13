@@ -123,8 +123,8 @@ class PipelineConfig:
     # total = 10s → 2000 samples @ 200Hz
 
     # ---- 补丁 ----
-    n_patches: int = 20
-    patch_len: int = 100   # samples (0.5s @ 200Hz)
+    n_patches: int = 10
+    patch_len: int = 200   # samples (1.0s @ 200Hz)
 
     # ---- 坏段检测 ----
     bad_amp_uv: float = 500.0   # μV 阈值

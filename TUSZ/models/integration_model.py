@@ -184,7 +184,7 @@ class SOZHead(nn.Module):
     """Channel-level pooling + bipolar→monopolar mapping → logits."""
 
     def __init__(self, embed_dim: int, n_channels: int = 22,
-                 n_patches: int = 20, output_mode: str = 'monopolar'):
+                 n_patches: int = 10, output_mode: str = 'monopolar'):
         super().__init__()
         self.n_channels = n_channels
         self.n_patches = n_patches

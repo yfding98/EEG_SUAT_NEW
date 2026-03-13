@@ -110,10 +110,10 @@ class ModelConfig:
     """LaBraM-TimeFilter-SOZ 模型配置"""
 
     # ---- 输入 ----
-    n_channels: int = 22          # TCP导联数
-    n_patches: int = 20           # 每导联补丁数
+    n_channels: int = 22          # 脑电通道数 (仅支持22或19)
+    n_patches: int = 10           # 每导联补丁数
     patch_len: int = 200          # LaBraM原始patch长度 (200采样点 @200Hz = 1s)
-    n_nodes: int = 440            # n_channels * n_patches
+    n_nodes: int = 220            # n_channels * n_patches
 
     # ---- LaBraM Backbone (对齐 labram-base checkpoint) ----
     embed_dim: int = 200          # 对齐 LaBraM-base
@@ -198,16 +198,6 @@ class TemporalConv(nn.Module):
             [B, N*A, D]  where D = T_out * out_chans
         """
         B, N, A, T = x.shape
-
-        # LaBraM's pre-trained weights strictly expect 200 samples (1s at 200Hz).
-        # Shorter patches will output smaller D after convolution and break transformer blocks.
-        # We zero-pad the patch to 200 to preserve pre-trained feature indices.
-        if T < 200:
-            x = torch.nn.functional.pad(x, (0, 200 - T))
-        elif T > 200:
-            x = x[:, :, :, :200]
-        T = 200
-
         x = x.reshape(B, N * A, T)            # [B, N*A, T]
         x = x.unsqueeze(1)                    # [B, 1, N*A, T]
         x = self.gelu1(self.norm1(self.conv1(x)))
@@ -533,7 +523,7 @@ class LaBraMBackbone(nn.Module):
     def forward(self, x: torch.Tensor, input_chans=None) -> torch.Tensor:
         """
         Args:
-            x: [B, N_channels, N_patches, patch_size]  e.g. [B, 22, 20, 200]
+            x: [B, N_channels, N_patches, patch_size]  e.g. [B, 22, 10, 200]
             input_chans: 可选, 电极通道索引 (用于子集电极)
         Returns:
             [B, N_channels * N_patches, embed_dim]
@@ -586,7 +576,7 @@ def mask_topk(x: torch.Tensor, alpha: float = 0.5, largest: bool = False) -> tor
 
 def build_region_masks(
     L: int, n_vars: int, device: torch.device,
-    n_channels: int = 22, n_patches: int = 20,
+    n_channels: int = 22, n_patches: int = 10,
     tcp_pairs: List[Tuple[str, str]] = None,
     spatial_dist_thresh: float = 0.55,
     temporal_k: int = 3,

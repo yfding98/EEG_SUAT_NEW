@@ -117,7 +117,7 @@ class ExplainerConfig:
     # 时间参数
     fs: float = 200.0                         # 采样率
     patch_len: int = 100                      # 补丁长度 (采样点)
-    n_patches: int = 20                       # 补丁数
+    n_patches: int = 10                       # 补丁数
     n_channels: int = 22                      # TCP通道数
     onset_window_pre: float = 0.5             # onset前0.5s
     onset_window_post: float = 1.0            # onset后1.0s
@@ -1291,7 +1291,7 @@ def _self_test():
     y_true = np.zeros(19)
     y_true[[2, 5, 10]] = 1.0
 
-    ex_cfg = ExplainerConfig(ig_steps=5, n_patches=20, n_channels=22)
+    ex_cfg = ExplainerConfig(ig_steps=5, n_patches=10, n_channels=22)
     explainer = SOZExplainer(model, device='cpu', cfg=ex_cfg)
 
     # 1. 图可视化
