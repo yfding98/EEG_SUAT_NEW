@@ -253,7 +253,7 @@ def train_one_epoch(
         if rel_time is not None:
             rel_time = rel_time.to(device)
 
-        with torch.cuda.amp.autocast(enabled=scaler is not None):
+        with torch.amp.autocast('cuda', enabled=scaler is not None):
             outputs = model(
                 x, onset, start,
                 valid_patch_counts=vp_counts,
@@ -373,7 +373,7 @@ def run_contrastive_pretraining(
 ):
     log.info("=== Contrastive pretraining ===")
     net_ext = MultiScaleBrainNetworkExtractor(
-        n_channels=22, patch_len=100, fs=args.fs,
+        n_channels=22, patch_len=int(args.patch_duration * args.fs), fs=args.fs,
     ).to(device)
     optimizer = torch.optim.AdamW(model_pretrain.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -432,9 +432,9 @@ def parse_args():
 
     # model
     p.add_argument('--labram-ckpt', default='', help='LaBraM pretrained weights')
-    p.add_argument('--patch-duration', type=float, default=0.5)
+    p.add_argument('--patch-duration', type=float, default=1.0)
     p.add_argument('--fs', type=float, default=200.0)
-    p.add_argument('--embed-dim', type=int, default=128)
+    p.add_argument('--embed-dim', type=int, default=200)
     p.add_argument('--output-mode', default='monopolar', choices=['monopolar', 'bipolar'])
 
     # brain networks
@@ -585,7 +585,7 @@ def main():
     # ── 4. Fine-tuning ──
     log.info("=== Step 4: Fine-tuning ===")
     writer = SummaryWriter(str(output_dir / 'tb')) if (_HAS_TB and is_main(rank)) else None
-    scaler = torch.cuda.amp.GradScaler() if args.amp else None
+    scaler = torch.amp.GradScaler('cuda') if args.amp else None
 
     # DDP
     if world > 1:

@@ -384,6 +384,14 @@ class LaBraMBackbone(nn.Module):
         # Patch embedding
         self.patch_embed = TemporalConv(in_chans=1, out_chans=cfg.out_chans)
 
+        # TemporalConv output dim depends on patch_len; project to embed_dim if needed
+        _conv1_out = (cfg.patch_len + 2 * 7 - 15) // 8 + 1  # conv1 stride=8
+        _temporal_out_dim = _conv1_out * cfg.out_chans
+        if _temporal_out_dim != D:
+            self.embed_proj = nn.Linear(_temporal_out_dim, D)
+        else:
+            self.embed_proj = nn.Identity()
+
         # 位置编码 (空间 + 时间)
         max_electrodes = max(129, cfg.n_channels + 1)  # 至少129 (对齐原始LaBraM)
         max_time_windows = max(16, cfg.n_patches)      # 至少16 (原始), 扩展至n_patches
@@ -488,20 +496,58 @@ class LaBraMBackbone(nn.Module):
                     continue
                 mapped[new_key] = v
 
+            # Interpolate pos_embed if shapes mismatch
+            if 'pos_embed' in mapped:
+                ckpt_pos = mapped['pos_embed']
+                my_pos = self.pos_embed
+                if ckpt_pos.shape != my_pos.shape:
+                    logger.info(f"Interpolating pos_embed from {ckpt_pos.shape} to {my_pos.shape}")
+                    # [1, N_elec, D] → interpolate along both axes if needed
+                    if ckpt_pos.shape[2] != my_pos.shape[2]:
+                        ckpt_pos = F.interpolate(
+                            ckpt_pos.permute(0, 2, 1),
+                            size=my_pos.shape[1],
+                            mode='linear', align_corners=False,
+                        ).permute(0, 2, 1)
+                        # now ckpt_pos: [1, my_N, ckpt_D] → project D
+                        ckpt_pos = F.interpolate(
+                            ckpt_pos,  # [1, my_N, ckpt_D]
+                            size=my_pos.shape[2],
+                            mode='linear', align_corners=False,
+                        )
+                    elif ckpt_pos.shape[1] != my_pos.shape[1]:
+                        ckpt_pos = F.interpolate(
+                            ckpt_pos.permute(0, 2, 1),
+                            size=my_pos.shape[1],
+                            mode='linear', align_corners=False,
+                        ).permute(0, 2, 1)
+                    mapped['pos_embed'] = ckpt_pos
+
             # Interpolate time_embed if shapes mismatch
             if 'time_embed' in mapped:
                 ckpt_time_embed = mapped['time_embed']
                 my_time_embed = self.time_embed
                 if ckpt_time_embed.shape != my_time_embed.shape:
                     logger.info(f"Interpolating time_embed from {ckpt_time_embed.shape} to {my_time_embed.shape}")
-                    import torch.nn.functional as F
-                    mapped['time_embed'] = F.interpolate(
-                        ckpt_time_embed.permute(0, 2, 1),
-                        size=my_time_embed.shape[1],
-                        mode='linear',
-                        align_corners=False
-                    ).permute(0, 2, 1)
-                    
+                    if ckpt_time_embed.shape[2] != my_time_embed.shape[2]:
+                        ckpt_time_embed = F.interpolate(
+                            ckpt_time_embed.permute(0, 2, 1),
+                            size=my_time_embed.shape[1],
+                            mode='linear', align_corners=False,
+                        ).permute(0, 2, 1)
+                        ckpt_time_embed = F.interpolate(
+                            ckpt_time_embed,
+                            size=my_time_embed.shape[2],
+                            mode='linear', align_corners=False,
+                        )
+                    else:
+                        ckpt_time_embed = F.interpolate(
+                            ckpt_time_embed.permute(0, 2, 1),
+                            size=my_time_embed.shape[1],
+                            mode='linear', align_corners=False,
+                        ).permute(0, 2, 1)
+                    mapped['time_embed'] = ckpt_time_embed
+
             missing, unexpected = self.load_state_dict(mapped, strict=False)
             n_loaded = len(mapped) - len(unexpected)
             logger.info(
@@ -544,8 +590,9 @@ class LaBraMBackbone(nn.Module):
         """
         batch_size, n_ch, n_patches, patch_size = x.shape
 
-        # TemporalConv
-        x = self.patch_embed(x)                              # [B, n_ch*n_patches, D]
+        # TemporalConv → project to embed_dim
+        x = self.patch_embed(x)                              # [B, n_ch*n_patches, T_out*C]
+        x = self.embed_proj(x)                               # [B, n_ch*n_patches, D]
 
         # 位置编码
         pos_embed_used = self.pos_embed[:, input_chans] if input_chans is not None else self.pos_embed

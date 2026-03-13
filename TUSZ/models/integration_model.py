@@ -62,8 +62,8 @@ class IntegrationConfig:
     # patching
     n_channels: int = 22
     patch_len: int = 200               # 对齐LaBraM patch_size
-    n_pre_patches: int = 6
-    n_post_patches: int = 10
+    n_pre_patches: int = 5
+    n_post_patches: int = 5
     fs: float = 200.0
 
     # LaBraM backbone
@@ -336,7 +336,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         # ── Step 1: Seizure-aligned patching ──
         patches, vp_counts_patched, rel_time_patched = self.patching(
             x, seizure_onset_sec, window_start_sec,
-        )  # patches [B, P, 22, 100]
+        )  # patches [B, P, 22, patch_len]
         
         vp_counts = valid_patch_counts if valid_patch_counts is not None else vp_counts_patched
         rel_time = rel_time if rel_time is not None else rel_time_patched
