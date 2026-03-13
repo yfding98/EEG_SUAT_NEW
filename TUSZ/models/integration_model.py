@@ -354,8 +354,8 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
 
         # ── Branch B: Brain network + DirectedBrainTimeFilter ──
         if brain_networks is None:
-            with torch.no_grad():
-                net_result = self.net_extractor(patches)          # dict
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+                net_result = self.net_extractor(patches.float())  # dict
             brain_nets = net_result['all']                        # [B, P, 22, 22, 4]
         else:
             brain_nets = brain_networks
