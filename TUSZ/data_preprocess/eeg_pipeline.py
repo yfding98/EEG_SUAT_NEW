@@ -324,9 +324,32 @@ class EEGPipeline:
                 return mne.io.read_raw_edf(
                     path, preload=True, verbose=False, encoding=enc
                 )
-            except Exception:
+            except Exception as e:
+                # 检查是否是 annotations 时间异常导致的错误
+                try:
+                    raw_temp = mne.io.read_raw_edf(
+                        path, preload=False, verbose=False, encoding=enc
+                    )
+                    if raw_temp.annotations and len(raw_temp.annotations) > 0:
+                        invalid_count = 0
+                        for i, (onset, dur, desc) in enumerate(zip(
+                            raw_temp.annotations.onset,
+                            raw_temp.annotations.duration,
+                            raw_temp.annotations.description
+                        )):
+                            if onset > raw_temp.times[-1] or onset < 0:
+                                if invalid_count == 0:
+                                    print(f"File: {path}")
+                                    print(f"Data duration: {raw_temp.times[-1]:.2f} seconds")
+                                    print(f"Number of annotations: {len(raw_temp.annotations)}")
+                                print(f"  ⚠️  Annotation {i}: onset={onset:.2f}s, duration={dur:.2f}s, desc={desc}")
+                                invalid_count += 1
+                        if invalid_count > 0:
+                            print(f"Total invalid annotations: {invalid_count}")
+                except Exception:
+                    pass
                 continue
-        raise RuntimeError(f"无法读取: {path}")
+        raise RuntimeError(f"无法读取：{path}")
 
     def _pick_channels(self, raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
         """只保留与ELECTRODES_21匹配的通道, 减少后续计算量"""
