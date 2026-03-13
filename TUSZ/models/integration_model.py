@@ -296,7 +296,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
 
         # ── Loss functions ──
         self.focal_loss = FocalLoss(gamma=c.focal_gamma, alpha=c.focal_alpha)
-        self.transition_bce = nn.BCELoss(reduction='mean')
+        self.transition_bce = nn.BCEWithLogitsLoss(reduction='mean')
         self.pattern_ce = nn.CrossEntropyLoss(reduction='mean')
 
         # cache
@@ -368,6 +368,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         evo_out = self.net_evolution(brain_nets_filtered, vp_counts, rel_time)
         network_feat = evo_out['network_features']            # [B, 256]
         transition_probs = evo_out['transition_probs']        # [B, P]
+        transition_logits = evo_out['transition_logits']      # [B, P]
         pattern_logits = evo_out['pattern_logits']            # [B, 3]
         branch_weights = evo_out['branch_weights']            # [B, P, 4]
 
@@ -387,6 +388,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             'soz_logits': soz_logits,
             'bipolar_logits': bipolar_logits,
             'transition_probs': transition_probs,
+            'transition_logits': transition_logits,
             'pattern_logits': pattern_logits,
             'gate_weights': gate_w,
             'brain_networks': brain_nets.detach(),
@@ -429,7 +431,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
 
         # auxiliary 1: transition detection
         if transition_targets is not None:
-            tp = outputs['transition_probs']
+            tp = outputs['transition_logits']
             losses['transition'] = self.transition_bce(tp, transition_targets)
             total = total + c.w_transition * losses['transition']
 

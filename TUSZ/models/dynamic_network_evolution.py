@@ -441,6 +441,7 @@ class DynamicNetworkEvolutionModel(nn.Module):
         out = {
             'network_features': network_features,
             'transition_probs': transition_probs,
+            'transition_logits': tr_logits,
             'pattern_logits':   pattern_logits,
             'evolution_hidden': gru_out,
             'branch_weights':   branch_wts,
