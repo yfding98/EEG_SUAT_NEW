@@ -190,12 +190,14 @@ class MultiScaleBrainNetworkExtractor(nn.Module):
     @torch.no_grad()
     def compute_gc(self, x: torch.Tensor) -> torch.Tensor:
         """x:[N,C,L] -> gc:[N,C,C], gc[i,j]=GC(j->i) >= 0."""
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
         N, C, L = x.shape
         p = self.gc_order
         T = L - p
         dev = x.device
         if T <= 2 * p:
-            return torch.zeros(N, C, C, device=dev)
+            return torch.zeros(N, C, C, device=dev, dtype=orig_dtype)
 
         # lagged matrix: [N,C,T,p]
         lags = torch.stack(
@@ -230,7 +232,7 @@ class MultiScaleBrainNetworkExtractor(nn.Module):
             gc[:, i, :] = torch.log(var_r[:, i: i + 1] / var_u).clamp(min=0)
             gc[:, i, i] = 0.0
 
-        return _safe(gc)
+        return _safe(gc).to(orig_dtype)
 
     # -----------------------------------------------------------------
     # Transfer Entropy  (binned, batched)
