@@ -262,17 +262,6 @@ def train_one_epoch(
             )
 
             # build aux targets
-            vm = model.module._build_valid_mask(
-                outputs['valid_patch_counts'],
-                outputs['transition_probs'].size(1),
-            ) if hasattr(model, 'module') else \
-                type(model)._build_valid_mask(
-                    None,
-                    outputs['valid_patch_counts'],
-                    outputs['transition_probs'].size(1),
-                )
-
-            # use model's internal method
             base = model.module if hasattr(model, 'module') else model
             vm = DynamicNetworkEvolutionModel._build_valid_mask(
                 outputs['valid_patch_counts'],
