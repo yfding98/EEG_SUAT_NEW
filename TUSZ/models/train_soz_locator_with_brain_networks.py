@@ -141,8 +141,36 @@ def compute_pos_weight(loader, device='cpu') -> torch.Tensor:
     neg_sum = total - pos_sum
     pw = (neg_sum / pos_sum.clamp(min=1.0)).float()
     pw = pw.clamp(max=50.0)
+    global_pos_rate = pos_sum.sum() / (total * pos_sum.shape[0])
+    per_ch_rate = pos_sum / total
     log.info(f"pos_weight per channel: min={pw.min():.1f}, max={pw.max():.1f}, "
-             f"mean={pw.mean():.1f}, pos_rate={pos_sum.sum()/(total*pos_sum.shape[0]):.4f}")
+             f"mean={pw.mean():.1f}, pos_rate={global_pos_rate:.4f}")
+    log.info(f"  per-channel pos_rate: {[f'{r:.2f}' for r in per_ch_rate.tolist()]}")
+
+    if global_pos_rate > 0.40:
+        log.warning(
+            f"  *** LABEL ANOMALY: global pos_rate={global_pos_rate:.3f} (>{40}%) ***\n"
+            f"  This means {global_pos_rate*100:.1f}% of all channel-labels are positive.\n"
+            f"  Typical SOZ labeling should have ~10-20% positive rate.\n"
+            f"  Likely cause: onset_channels in manifest are the UNION across all\n"
+            f"  seizure events per file, inflating labels. Check generate_manifest.py\n"
+            f"  and ensure per-event onset channels are used, not file-level union."
+        )
+
+    # count samples with extreme positive counts
+    n_ch = pos_sum.shape[0]
+    all_pos_count = 0
+    high_pos_count = 0
+    for batch in loader:
+        y = batch['label']
+        ch_pos = y.sum(dim=1)  # per-sample positive channel count
+        all_pos_count += (ch_pos == n_ch).sum().item()
+        high_pos_count += (ch_pos > n_ch * 0.5).sum().item()
+    if all_pos_count > 0:
+        log.warning(f"  {all_pos_count}/{total} samples have ALL {n_ch} channels = 1")
+    if high_pos_count > total * 0.3:
+        log.warning(f"  {high_pos_count}/{total} samples have >50% channels positive")
+
     return pw.to(device)
 
 
@@ -289,10 +317,19 @@ def train_one_epoch(
                 outputs['seizure_relative_time'], vm,
             )
 
+            # Compute sample_weight for soft suppression of generalized seizures (pos_ratio > 0.5)
+            pos_ratio = label.sum(dim=1) / max(label.shape[1], 1)
+            sample_weight = torch.where(
+                pos_ratio > 0.5, 
+                torch.tensor(0.05, device=device, dtype=torch.float32), 
+                torch.tensor(1.0, device=device, dtype=torch.float32)
+            )
+
             loss, losses = base.compute_loss(
                 outputs, label,
                 transition_targets=aux['transition_targets'].to(device),
                 pattern_targets=aux['pattern_targets'].to(device),
+                sample_weight=sample_weight,
             )
 
         # NaN check

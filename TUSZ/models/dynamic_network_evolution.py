@@ -180,7 +180,12 @@ class MultiBranchSnapshotEncoder(nn.Module):
             embed_dim=out_dim, num_heads=n_attn_heads,
             dropout=dropout, batch_first=True,
         )
-        self.attn_gate = nn.Linear(out_dim, 1)  # per-branch importance score
+        self.attn_norm = nn.LayerNorm(out_dim)
+        self.attn_gate = nn.Sequential(
+            nn.Linear(out_dim, out_dim // 2),
+            nn.GELU(),
+            nn.Linear(out_dim // 2, 1),
+        )
         self.norm = nn.LayerNorm(out_dim)
 
     def forward(
@@ -212,7 +217,7 @@ class MultiBranchSnapshotEncoder(nn.Module):
         attn_out = attn_out + tokens                 # residual
 
         # branch importance weights
-        gate_logits = self.attn_gate(attn_out).squeeze(-1)  # [N, 4]
+        gate_logits = self.attn_gate(self.attn_norm(attn_out)).squeeze(-1)  # [N, 4]
         branch_wts = torch.softmax(gate_logits, dim=-1)     # [N, 4]
 
         # weighted fusion

@@ -145,7 +145,7 @@ class FocalLoss(nn.Module):
         else:
             self.pos_weight = None
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
         bce = F.binary_cross_entropy_with_logits(
             logits, targets, reduction='none',
             pos_weight=self.pos_weight,
@@ -154,6 +154,10 @@ class FocalLoss(nn.Module):
         # alpha_t: alpha for positive, (1-alpha) for negative
         alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
         focal = alpha_t * (1.0 - pt) ** self.gamma * bce
+        
+        if sample_weight is not None:
+            focal = focal * sample_weight.unsqueeze(1)
+            
         return focal.mean()
 
 
@@ -170,9 +174,11 @@ class GatedFusion(nn.Module):
         self.network_norm = nn.LayerNorm(network_dim)
         self.gate = nn.Sequential(
             nn.Linear(temporal_dim + network_dim, temporal_dim),
+            nn.LayerNorm(temporal_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(temporal_dim, temporal_dim),
+            nn.Dropout(0.2),
             nn.Sigmoid(),
         )
         self.net_proj = nn.Linear(network_dim, temporal_dim)
@@ -207,15 +213,24 @@ class SOZHead(nn.Module):
     """Channel-level pooling + bipolar→monopolar mapping → logits."""
 
     def __init__(self, embed_dim: int, n_channels: int = 22,
-                 n_patches: int = 10, output_mode: str = 'monopolar'):
+                 n_patches: int = 10, output_mode: str = 'monopolar',
+                 dropout: float = 0.3):
         super().__init__()
         self.n_channels = n_channels
         self.n_patches = n_patches
         self.output_mode = output_mode
+        hidden = embed_dim
+        self.pool_norm = nn.LayerNorm(embed_dim * 2)
         self.channel_fc = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Linear(embed_dim * 2, hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
-            nn.Linear(embed_dim, 1),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.LayerNorm(hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 1),
         )
         if output_mode == 'monopolar':
             self.b2m = BipolarToMonopolarMapper()
@@ -232,6 +247,7 @@ class SOZHead(nn.Module):
         max_p = x_4d.max(dim=2).values                        # [B, 22, D]
         mean_p = x_4d.mean(dim=2)                             # [B, 22, D]
         cat = torch.cat([max_p, mean_p], dim=-1)               # [B, 22, 2D]
+        cat = self.pool_norm(cat)                               # normalize before MLP
         bipolar_logits = self.channel_fc(cat).squeeze(-1)      # [B, 22]
 
         if self.output_mode == 'monopolar':
@@ -442,6 +458,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         soz_targets: torch.Tensor,
         transition_targets: Optional[torch.Tensor] = None,
         pattern_targets: Optional[torch.Tensor] = None,
+        sample_weight: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Args
@@ -456,7 +473,9 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         losses = {}
 
         # primary: SOZ focal loss
-        losses['soz'] = self.focal_loss(outputs['soz_logits'], soz_targets)
+        losses['soz'] = self.focal_loss(
+            outputs['soz_logits'], soz_targets, sample_weight=sample_weight
+        )
         total = losses['soz']
 
         # auxiliary 1: transition detection

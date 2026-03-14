@@ -23,6 +23,7 @@ merge_manifests.py
   sz_end          : 发作结束时间（秒）
   sz_duration     : 本次发作时长（秒）
   n_seizure_events: 该文件的发作事件总数
+  seizure_type    : 发作类型 (fnsz/gnsz/cpsz/absz/tnsz/mysz/seiz 等)
   hemisphere      : L/R/B/M/U
 
   ─ SOZ 标注 ─
@@ -86,34 +87,30 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
 
     rows = []
     for _, r in df.iterrows():
-        # TUSZ 的 sz_starts/sz_ends 为分号分隔的多个时间点（一个文件多次发作）
-        # 每次发作单独拆成一行，方便训练时按发作片段索引
         starts = [s.strip() for s in str(r['sz_starts']).split(';') if s.strip()]
         ends   = [e.strip() for e in str(r['sz_ends']).split(';') if e.strip()]
 
-        # onset_channels 字段是逗号分隔的双极导联名（全大写）
-        onset_ch_str = str(r['onset_channels']) if pd.notna(r['onset_channels']) else ''
-        bipolar_01 = bipolar_str_to_01(onset_ch_str)
+        # onset_channels: pipe-separated per-event format from generate_manifest
+        onset_ch_raw = str(r['onset_channels']) if pd.notna(r['onset_channels']) else ''
+        per_event_onset = [g.strip() for g in onset_ch_raw.split('|') if g.strip()]
 
-        # 规范化 soz_bipolar（去除空格，逗号分隔）
-        soz_bipolar_norm = ','.join(
-            c.strip() for c in onset_ch_str.split(',') if c.strip()
-        )
+        # backward compatibility: if no pipe separator, treat as single group
+        if not per_event_onset and onset_ch_raw.strip():
+            per_event_onset = [onset_ch_raw.strip()]
 
-        # onset_channels: 拆分双极导联为独立电极，去重，分号分隔
-        # 例: "T4-T6,T6-O2" → "T4;T6;O2"
-        electrodes = []
-        for bp_ch in onset_ch_str.split(','):
-            bp_ch = bp_ch.strip().upper()
-            if bp_ch and '-' in bp_ch:
-                for elec in bp_ch.split('-'):
-                    e = elec.strip()
-                    if e and e not in electrodes:
-                        electrodes.append(e)
-            elif bp_ch:
-                if bp_ch not in electrodes:
-                    electrodes.append(bp_ch)
-        onset_channels_unipolar = ';'.join(electrodes)
+        # seizure_types: pipe-separated per-event format (e.g. "fnsz|gnsz|fnsz")
+        # backward compat: old format was comma-separated union (e.g. "fnsz,gnsz")
+        sz_types_raw = str(r.get('seizure_types', '')) if pd.notna(r.get('seizure_types', '')) else ''
+        if '|' in sz_types_raw:
+            per_event_types = [t.strip() for t in sz_types_raw.split('|')]
+        elif ',' in sz_types_raw:
+            # old format: comma-separated union, apply to all events
+            union_type = sz_types_raw.strip()
+            per_event_types = [union_type]
+        elif sz_types_raw.strip():
+            per_event_types = [sz_types_raw.strip()]
+        else:
+            per_event_types = []
 
         n_events = int(r['n_seizure_events'])
         n_pairs = min(len(starts), len(ends))
@@ -122,6 +119,41 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
             sz_start = float(starts[i]) if i < len(starts) else float('nan')
             sz_end   = float(ends[i])   if i < len(ends)   else float('nan')
             sz_dur   = (sz_end - sz_start) if (not pd.isna(sz_start) and not pd.isna(sz_end)) else float('nan')
+
+            # per-event onset channels
+            if i < len(per_event_onset):
+                event_onset_str = per_event_onset[i]
+            elif per_event_onset:
+                event_onset_str = per_event_onset[-1]
+            else:
+                event_onset_str = ''
+
+            # per-event seizure type
+            if i < len(per_event_types):
+                event_sz_type = per_event_types[i]
+            elif per_event_types:
+                event_sz_type = per_event_types[-1]
+            else:
+                event_sz_type = 'seiz'
+
+            bipolar_01 = bipolar_str_to_01(event_onset_str)
+
+            soz_bipolar_norm = ','.join(
+                c.strip() for c in event_onset_str.split(',') if c.strip()
+            )
+
+            electrodes = []
+            for bp_ch in event_onset_str.split(','):
+                bp_ch = bp_ch.strip().upper()
+                if bp_ch and '-' in bp_ch:
+                    for elec in bp_ch.split('-'):
+                        e = elec.strip()
+                        if e and e not in electrodes:
+                            electrodes.append(e)
+                elif bp_ch:
+                    if bp_ch not in electrodes:
+                        electrodes.append(bp_ch)
+            onset_channels_unipolar = ';'.join(electrodes)
 
             row = {
                 'source':           'tusz',
@@ -133,6 +165,7 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
                 'sz_end':           sz_end,
                 'sz_duration':      sz_dur,
                 'n_seizure_events': n_events,
+                'seizure_type':     event_sz_type,
                 'hemisphere':       r.get('hemisphere', 'U'),
                 'onset_channels':   onset_channels_unipolar,
                 'soz_bipolar':      soz_bipolar_norm,
@@ -215,6 +248,7 @@ def process_private(private_path: str) -> pd.DataFrame:
             'sz_end':           sz_end,
             'sz_duration':      sz_dur,
             'n_seizure_events': nsz,
+            'seizure_type':     'fnsz',
             'hemisphere':       hemisphere,
             'onset_channels':   onset_channels,
             'soz_bipolar':      soz_bipolar_norm,
@@ -245,7 +279,7 @@ def main():
     meta_cols = [
         'source', 'patient_id', 'edf_path', 'split', 'duration',
         'sz_start', 'sz_end', 'sz_duration', 'n_seizure_events',
-        'hemisphere', 'onset_channels', 'soz_bipolar',
+        'seizure_type', 'hemisphere', 'onset_channels', 'soz_bipolar',
     ]
     final_cols = meta_cols + TCP_COL_NAMES
     df_combined = df_combined[final_cols]
@@ -275,10 +309,48 @@ def main():
         pos = (sub[TCP_COL_NAMES].sum(axis=1) > 0).sum()
         print(f'  {src}: {pos}/{len(sub)} ({pos/len(sub)*100:.1f}%)')
     print()
+    print('发作类型分布:')
+
+    n_ch = len(TCP_COL_NAMES)
+    sz_type_counts = df_combined['seizure_type'].value_counts()
+    for sz_type, cnt in sz_type_counts.items():
+        sub = df_combined[df_combined['seizure_type'] == sz_type]
+        sub_pos = sub[TCP_COL_NAMES].sum(axis=1)
+        print(f'  {sz_type:8s}: {cnt:4d} events, '
+              f'avg_pos_ch={sub_pos.mean():.1f}/{n_ch}, '
+              f'>50%: {(sub_pos > n_ch * 0.5).sum()}, '
+              f'全通道=1: {(sub_pos == n_ch).sum()}')
+    print()
     print('22个TCP导联的SOZ频次:')
     for ch, col in zip(TCP_BIPOLAR, TCP_COL_NAMES):
         cnt = int(df_combined[col].sum())
         print(f'  {ch:10s}: {cnt:4d}')
+    print()
+
+    # per-event label quality stats
+    ch_pos_per_row = df_combined[TCP_COL_NAMES].sum(axis=1)
+    n_total = len(df_combined)
+    global_pos_rate = df_combined[TCP_COL_NAMES].values.sum() / (n_total * n_ch)
+    print(f'Label质量统计:')
+    print(f'  全局正样本率 (channel-level): {global_pos_rate:.4f} ({global_pos_rate*100:.1f}%)')
+    print(f'  每行平均阳性通道数: {ch_pos_per_row.mean():.2f} / {n_ch}')
+    print(f'  全通道=1 的行: {(ch_pos_per_row == n_ch).sum()} / {n_total}')
+    print(f'  >50%通道=1 的行: {(ch_pos_per_row > n_ch * 0.5).sum()} / {n_total}')
+    print(f'  0通道=1 的行: {(ch_pos_per_row == 0).sum()} / {n_total}')
+    print()
+
+    # per-source label stats
+    for src in df_combined['source'].unique():
+        sub = df_combined[df_combined['source'] == src]
+        sub_pos = sub[TCP_COL_NAMES].values.sum()
+        sub_total = len(sub) * n_ch
+        sub_rate = sub_pos / sub_total if sub_total > 0 else 0
+        sub_per_row = sub[TCP_COL_NAMES].sum(axis=1)
+        print(f'  [{src}] pos_rate={sub_rate:.4f}, '
+              f'avg_pos_ch={sub_per_row.mean():.2f}/{n_ch}, '
+              f'全通道=1: {(sub_per_row == n_ch).sum()}, '
+              f'>50%: {(sub_per_row > n_ch * 0.5).sum()}')
+
     print('=' * 60)
 
 

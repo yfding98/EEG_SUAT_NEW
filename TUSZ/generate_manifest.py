@@ -74,16 +74,27 @@ class ManifestEntry:
     # 使用独立列存储每个通道的标签
     
     def to_dict(self, channel_list: List[str] = None) -> Dict:
-        """转换为字典，包含通道级标签列"""
+        """转换为字典，包含通道级标签列。
+        
+        onset_channels 可能是 pipe-separated per-event 格式:
+          "T4-T6,T6-O2|FP1-F7"   (2个event)
+        文件级 0/1 列使用所有 event 的并集。
+        """
         d = asdict(self)
         
         if channel_list is None:
-            channel_list = BIPOLAR_CHANNELS  # 默认使用22通道TCP导联（与eeg_pipeline.py对齐）
-        
-        # 添加通道级SOZ标签列
-        onset_set = set(ch.upper() for ch in self.onset_channels.split(',') if ch.strip())
+            channel_list = BIPOLAR_CHANNELS
+
+        # flatten pipe-separated per-event groups to get file-level union
+        onset_set = set()
+        for event_group in self.onset_channels.split('|'):
+            for ch in event_group.split(','):
+                ch = ch.strip().upper()
+                if ch:
+                    onset_set.add(ch)
+
         for ch in channel_list:
-            col_name = ch.replace('-', '_')  # CSV列名不能有减号
+            col_name = ch.replace('-', '_')
             d[col_name] = 1 if ch.upper() in onset_set else 0
         
         return d
@@ -217,27 +228,32 @@ def process_edf_file(file_info: Dict, data_root: str) -> Optional[ManifestEntry]
                 n_seizure_events = len(events)
                 
                 if events:
-                    # 收集所有事件的信息
                     all_types = set()
+                    per_event_types = []
                     all_starts = []
                     all_ends = []
-                    all_onset_channels = set()
+                    per_event_onset_channels = []
                     all_onset_regions = set()
                     hemispheres = set()
                     
                     for event in events:
                         all_types.add(event.seizure_type)
+                        per_event_types.append(event.seizure_type or 'seiz')
                         all_starts.append(f"{event.start_time:.4f}")
                         all_ends.append(f"{event.stop_time:.4f}")
-                        all_onset_channels.update(event.onset_channels)
+                        per_event_onset_channels.append(
+                            ','.join(sorted(event.onset_channels))
+                        )
                         all_onset_regions.update(event.onset_regions)
                         hemispheres.add(event.hemisphere)
                         total_seizure_duration += event.duration
                     
-                    seizure_types = ','.join(sorted(all_types))
+                    # pipe-separated per-event seizure types
+                    seizure_types = '|'.join(per_event_types)
                     sz_starts = ';'.join(all_starts)
                     sz_ends = ';'.join(all_ends)
-                    onset_channels = ','.join(sorted(all_onset_channels))
+                    # pipe-separated per-event onset channels
+                    onset_channels = '|'.join(per_event_onset_channels)
                     onset_regions = ','.join(sorted(all_onset_regions))
                     
                     # 确定整体半球

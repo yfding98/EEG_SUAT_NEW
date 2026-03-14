@@ -1102,9 +1102,14 @@ class SOZLocalizationHead(nn.Module):
         # 融合两种池化
         self.fusion = nn.Sequential(
             nn.Linear(D * 2, cfg.head_hidden),
-            nn.GELU(),
+            nn.LayerNorm(cfg.head_hidden),
+            nn.ReLU(),
             nn.Dropout(cfg.head_dropout),
-            nn.Linear(cfg.head_hidden, 1),
+            nn.Linear(cfg.head_hidden, cfg.head_hidden // 2),
+            nn.LayerNorm(cfg.head_hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(cfg.head_dropout),
+            nn.Linear(cfg.head_hidden // 2, 1),
         )
 
         # 仅在 monopolar 模式下使用 BipolarToMonopolar 映射
@@ -1230,7 +1235,7 @@ class FocalLoss(nn.Module):
         self.alpha = alpha
         self.reduction = reduction
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor, sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             inputs:  [B, C]  logits
@@ -1238,8 +1243,13 @@ class FocalLoss(nn.Module):
         """
         bce = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         pt = torch.exp(-bce)
-        focal_weight = self.alpha * (1 - pt) ** self.gamma
+        # alpha_t: alpha for positive, (1-alpha) for negative
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        focal_weight = alpha_t * (1 - pt) ** self.gamma
         loss = focal_weight * bce
+
+        if sample_weight is not None:
+            loss = loss * sample_weight.unsqueeze(1)
 
         if self.reduction == 'mean':
             return loss.mean()
@@ -1277,12 +1287,13 @@ class SOZDetectionLoss(nn.Module):
         soz_targets: torch.Tensor,
         domain_logits: Optional[torch.Tensor] = None,
         domain_targets: Optional[torch.Tensor] = None,
+        sample_weight: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Returns:
             total_loss, {'focal': ..., 'domain': ..., 'total': ...}
         """
-        loss_focal = self.focal(soz_logits, soz_targets)
+        loss_focal = self.focal(soz_logits, soz_targets, sample_weight=sample_weight)
         losses = {'focal': loss_focal}
 
         total = loss_focal

@@ -188,6 +188,7 @@ class FeatureAwareMoERouter(nn.Module):
         self.top_p = top_p
 
         self.feature_embed = nn.Embedding(n_features, in_dim)
+        self.gate_norm = nn.LayerNorm(in_dim)
         self.gate = nn.Linear(in_dim, num_experts, bias=False)
         self.noise = nn.Linear(in_dim, num_experts, bias=False)
         self.softplus = nn.Softplus()
@@ -217,12 +218,11 @@ class FeatureAwareMoERouter(nn.Module):
             x = x.unsqueeze(-1) * feat_emb.unsqueeze(0)  # [B, L, D]
             x = x.sum(-1)  # [B, L]
 
-        clean_logits = self.gate(feat_emb.unsqueeze(0).expand(x.shape[0], -1, -1))  # [B, L, E]
+        gate_in = self.gate_norm(feat_emb.unsqueeze(0).expand(x.shape[0], -1, -1))
+        clean_logits = self.gate(gate_in)  # [B, L, E]
 
         if is_training:
-            noise_std = self.softplus(
-                self.noise(feat_emb.unsqueeze(0).expand(x.shape[0], -1, -1))
-            ) + 1e-2
+            noise_std = self.softplus(self.noise(gate_in)) + 1e-2
             logits = clean_logits + torch.randn_like(clean_logits) * noise_std
         else:
             logits = clean_logits
@@ -284,8 +284,12 @@ class DirectedBrainGraphBlock(nn.Module):
 
         # 特征融合
         self.norm = nn.LayerNorm(n_channels)
+        self.gate_norm = nn.LayerNorm(hidden * 4)
         self.feat_gate = nn.Sequential(
-            nn.Linear(hidden * 4, 4),
+            nn.Linear(hidden * 4, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 4),
             nn.Softmax(dim=-1),
         )
         self.proj_out = nn.Linear(hidden, n_channels)
@@ -339,7 +343,7 @@ class DirectedBrainGraphBlock(nn.Module):
         # 特征门控融合
         stacked = torch.stack(branch_outs, dim=-1)        # [B, C, hidden, 4]
         concat = torch.cat(branch_outs, dim=-1)           # [B, C, hidden*4]
-        gates = self.feat_gate(concat)                     # [B, C, 4]
+        gates = self.feat_gate(self.gate_norm(concat))     # [B, C, 4]
         fused = (stacked * gates.unsqueeze(2)).sum(dim=-1)  # [B, C, hidden]
         fused = self.proj_out(fused)                        # [B, C, C]
 
