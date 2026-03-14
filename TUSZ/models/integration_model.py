@@ -114,7 +114,7 @@ class IntegrationConfig:
     w_contrast: float = 0.1
     w_moe: float = 0.01               # MoE辅助损失权重
     focal_gamma: float = 2.0
-    focal_alpha: float = 0.25
+    focal_alpha: float = 0.75
 
     # training strategy
     use_checkpoint: bool = False
@@ -125,17 +125,35 @@ class IntegrationConfig:
 # =====================================================================
 
 class FocalLoss(nn.Module):
-    """FL(p_t) = -alpha_t (1-p_t)^gamma log(p_t)"""
+    """
+    Multi-label Binary Focal Loss with proper alpha balancing.
 
-    def __init__(self, gamma: float = 2.0, alpha: float = 0.25):
+    For each element:
+        FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    where alpha_t = alpha for positives, (1-alpha) for negatives.
+
+    Also supports dynamic pos_weight computed from label statistics.
+    """
+
+    def __init__(self, gamma: float = 2.0, alpha: float = 0.75,
+                 pos_weight: Optional[torch.Tensor] = None):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
+        if pos_weight is not None:
+            self.register_buffer('pos_weight', pos_weight)
+        else:
+            self.pos_weight = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none',
+            pos_weight=self.pos_weight,
+        )
         pt = torch.exp(-bce)
-        focal = self.alpha * (1 - pt) ** self.gamma * bce
+        # alpha_t: alpha for positive, (1-alpha) for negative
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        focal = alpha_t * (1.0 - pt) ** self.gamma * bce
         return focal.mean()
 
 
@@ -148,6 +166,8 @@ class GatedFusion(nn.Module):
 
     def __init__(self, temporal_dim: int, network_dim: int, dropout: float = 0.1):
         super().__init__()
+        self.temporal_norm = nn.LayerNorm(temporal_dim)
+        self.network_norm = nn.LayerNorm(network_dim)
         self.gate = nn.Sequential(
             nn.Linear(temporal_dim + network_dim, temporal_dim),
             nn.ReLU(),
@@ -156,7 +176,7 @@ class GatedFusion(nn.Module):
             nn.Sigmoid(),
         )
         self.net_proj = nn.Linear(network_dim, temporal_dim)
-        self.norm = nn.LayerNorm(temporal_dim)
+        self.out_norm = nn.LayerNorm(temporal_dim)
 
     def forward(
         self, temporal: torch.Tensor, network: torch.Tensor,
@@ -166,6 +186,9 @@ class GatedFusion(nn.Module):
         network  : [B, D_n]   (broadcast to N nodes)
         Returns  : fused [B, N, D_t],  gate_weights [B, N]
         """
+        temporal = self.temporal_norm(temporal)
+        network = self.network_norm(network)
+
         N = temporal.size(1)
         net_exp = network.unsqueeze(1).expand(-1, N, -1)     # [B, N, D_n]
         cat = torch.cat([temporal, net_exp], dim=-1)          # [B, N, D_t+D_n]
@@ -173,7 +196,7 @@ class GatedFusion(nn.Module):
         net_proj = self.net_proj(net_exp)                     # [B, N, D_t]
         fused = g * temporal + (1 - g) * net_proj
         gate_scalar = g.mean(dim=-1)                          # [B, N]
-        return self.norm(fused), gate_scalar
+        return self.out_norm(fused), gate_scalar
 
 
 # =====================================================================
@@ -298,6 +321,13 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         self.focal_loss = FocalLoss(gamma=c.focal_gamma, alpha=c.focal_alpha)
         self.transition_bce = nn.BCEWithLogitsLoss(reduction='mean')
         self.pattern_ce = nn.CrossEntropyLoss(reduction='mean')
+
+    def set_pos_weight(self, pos_weight: torch.Tensor):
+        """Set pos_weight for focal loss from dataset label statistics."""
+        self.focal_loss = FocalLoss(
+            gamma=self.cfg.focal_gamma, alpha=self.cfg.focal_alpha,
+            pos_weight=pos_weight,
+        )
 
         # cache
         self._last: Optional[Dict] = None

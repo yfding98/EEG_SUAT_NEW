@@ -128,6 +128,24 @@ def compute_auc(probs: np.ndarray, targets: np.ndarray) -> float:
         return 0.0
 
 
+def compute_pos_weight(loader, device='cpu') -> torch.Tensor:
+    """Compute pos_weight = n_neg / n_pos per channel from the full dataset."""
+    pos_sum = None
+    total = 0
+    for batch in loader:
+        y = batch['label']
+        if pos_sum is None:
+            pos_sum = torch.zeros(y.shape[1], dtype=torch.float64)
+        pos_sum += y.sum(dim=0).double()
+        total += y.shape[0]
+    neg_sum = total - pos_sum
+    pw = (neg_sum / pos_sum.clamp(min=1.0)).float()
+    pw = pw.clamp(max=50.0)
+    log.info(f"pos_weight per channel: min={pw.min():.1f}, max={pw.max():.1f}, "
+             f"mean={pw.mean():.1f}, pos_rate={pos_sum.sum()/(total*pos_sum.shape[0]):.4f}")
+    return pw.to(device)
+
+
 # =====================================================================
 # Dataset wrapper (adds onset / window metadata for patching)
 # =====================================================================
@@ -287,18 +305,38 @@ def train_one_epoch(
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(base.parameters(), 5.0)
+            nn.utils.clip_grad_norm_(base.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            nn.utils.clip_grad_norm_(base.parameters(), 5.0)
+            nn.utils.clip_grad_norm_(base.parameters(), 1.0)
             optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
         all_probs.append(outputs['soz_probs'].detach().cpu().numpy())
         all_targets.append(label.cpu().numpy())
+
+        # logits monitoring (every 50 steps)
+        if step % 50 == 0:
+            with torch.no_grad():
+                soz_l = outputs['soz_logits'].detach()
+                soz_p = outputs['soz_probs'].detach()
+                gate_w = outputs.get('gate_weights')
+                log.info(
+                    f"  [E{epoch} S{step}] "
+                    f"logits(min={soz_l.min():.3f}, max={soz_l.max():.3f}, "
+                    f"mean={soz_l.mean():.3f}, std={soz_l.std():.3f}) "
+                    f"probs(min={soz_p.min():.3f}, max={soz_p.max():.3f}, "
+                    f"mean={soz_p.mean():.3f}) "
+                    f"loss={loss.item():.4f}"
+                )
+                if gate_w is not None:
+                    log.info(
+                        f"           gate(min={gate_w.min():.3f}, "
+                        f"max={gate_w.max():.3f}, mean={gate_w.mean():.3f})"
+                    )
 
     avg_loss = total_loss / max(n_batches, 1)
     probs = np.concatenate(all_probs, axis=0)
@@ -310,6 +348,11 @@ def train_one_epoch(
         writer.add_scalar('train/loss', avg_loss, epoch)
         writer.add_scalar('train/top3', top3, epoch)
         writer.add_scalar('train/auc', auc, epoch)
+        with torch.no_grad():
+            for name, param in base.named_parameters():
+                if param.grad is not None and param.requires_grad:
+                    writer.add_scalar(f'grad_norm/{name}',
+                                      param.grad.norm().item(), epoch)
 
     return avg_loss, top3, auc
 
@@ -317,7 +360,7 @@ def train_one_epoch(
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
-    all_probs, all_targets = [], []
+    all_probs, all_targets, all_logits = [], [], []
     for batch in loader:
         x = batch['x'].to(device)
         label = batch['label'].to(device)
@@ -343,12 +386,24 @@ def evaluate(model, loader, device):
         )
         all_probs.append(out['soz_probs'].cpu().numpy())
         all_targets.append(label.cpu().numpy())
+        all_logits.append(out['soz_logits'].cpu().numpy())
+
     probs = np.concatenate(all_probs, axis=0)
     targets = np.concatenate(all_targets, axis=0)
+    logits = np.concatenate(all_logits, axis=0)
     top1 = compute_top_k(probs, targets, k=1)
     top3 = compute_top_k(probs, targets, k=3)
     top5 = compute_top_k(probs, targets, k=5)
     auc = compute_auc(probs, targets) if roc_auc_score else 0.0
+
+    log.info(
+        f"  [eval] logits(min={logits.min():.3f}, max={logits.max():.3f}, "
+        f"mean={logits.mean():.3f}, std={logits.std():.3f}) "
+        f"probs(min={probs.min():.3f}, max={probs.max():.3f}, "
+        f"mean={probs.mean():.3f}) "
+        f"label_pos_rate={targets.mean():.4f}"
+    )
+
     return {'top1': top1, 'top3': top3, 'top5': top5, 'auc': auc,
             'probs': probs, 'targets': targets}
 
@@ -557,6 +612,12 @@ def main():
     )
     model = TimeFilter_LaBraM_BrainNetwork_Integration(cfg).to(device)
     log.info(model.summary())
+
+    # ── 2b. Compute class balance and set pos_weight ──
+    log.info("  Computing pos_weight from training labels...")
+    pw = compute_pos_weight(train_loader, device=device)
+    model.set_pos_weight(pw)
+    log.info(f"  pos_weight set (shape={pw.shape})")
 
     # ── 3. Contrastive pretraining (optional) ──
     pretrain_encoder_path = None
