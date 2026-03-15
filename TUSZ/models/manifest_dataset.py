@@ -68,6 +68,61 @@ TCP_BIPOLAR_NAMES = [
     'A1-T3',  'T3-C3', 'C3-CZ', 'CZ-C4', 'C4-T4', 'T4-A2',
 ]
 TCP_COL_NAMES = [ch.replace('-', '_') for ch in TCP_BIPOLAR_NAMES]
+REGION_NAMES = ['FP', 'F', 'C', 'T', 'P', 'O']
+REGION_TO_INDEX = {name: idx for idx, name in enumerate(REGION_NAMES)}
+HEMISPHERE_NAMES = ['L', 'R', 'B']
+HEMISPHERE_TO_INDEX = {name: idx for idx, name in enumerate(HEMISPHERE_NAMES)}
+HEMISPHERE_IGNORE_INDEX = -100
+
+
+def _channel_to_regions(channel_name: str) -> List[str]:
+    """Map a channel/electrode name to one or more coarse brain regions."""
+    name = str(channel_name).strip().upper()
+    if not name:
+        return []
+    if '-' in name:
+        regions: List[str] = []
+        for part in name.split('-'):
+            regions.extend(_channel_to_regions(part))
+        return list(dict.fromkeys(regions))
+
+    if name.startswith('FP'):
+        return ['FP']
+    if name.startswith('F'):
+        return ['F']
+    if name.startswith('C') or name == 'CZ':
+        return ['C']
+    if name.startswith('T'):
+        return ['T']
+    if name.startswith('P'):
+        return ['P']
+    if name.startswith('O'):
+        return ['O']
+    return []
+
+
+def _build_region_target(onset_channels: str, bipolar_label: np.ndarray) -> np.ndarray:
+    """Build a coarse multi-label region target from onset channels or active bipolar pairs."""
+    region_target = np.zeros(len(REGION_NAMES), dtype=np.float32)
+    onset_parts = [part.strip() for part in str(onset_channels).split(';') if part.strip()]
+
+    if onset_parts:
+        for part in onset_parts:
+            for region in _channel_to_regions(part):
+                region_target[REGION_TO_INDEX[region]] = 1.0
+
+    if region_target.sum() == 0:
+        for is_active, pair in zip(bipolar_label.tolist(), TCP_BIPOLAR_NAMES):
+            if is_active <= 0:
+                continue
+            for region in _channel_to_regions(pair):
+                region_target[REGION_TO_INDEX[region]] = 1.0
+
+    return region_target
+
+
+def _map_hemisphere_label(raw_value: str) -> int:
+    return HEMISPHERE_TO_INDEX.get(str(raw_value).strip().upper(), HEMISPHERE_IGNORE_INDEX)
 
 
 def _build_bipolar_to_monopolar_matrix() -> np.ndarray:
@@ -261,7 +316,7 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
             X:     [22, n_patches, patch_len] float32 — TCP双极patch数据
             y:     [22] float32 - bipolar, [19] float32 - monopolar (tuple)
             mask:  [22] float32 — 通道有效性掩码
-            meta:  dict — 元数据 (contains both labels too)
+            meta:  dict — 元数据 (contains SOZ/region/hemisphere labels too)
         """
         row = self.df.iloc[idx]
 
@@ -284,6 +339,12 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         else:
             y_soz = monopolar_label
 
+        region_label = _build_region_target(
+            str(row.get('onset_channels', '')),
+            bipolar_label,
+        )
+        hemisphere_label = _map_hemisphere_label(str(row.get('hemisphere', '')))
+
         # ── 元数据 ────────────────────────────────────────────────────────
         meta = {
             'source':         str(row.get('source', '')),
@@ -298,6 +359,8 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
             'row_idx':        idx,
             'bipolar_label':  bipolar_label,
             'monopolar_label': monopolar_label,
+            'region_label':   region_label,
+            'hemisphere_label': hemisphere_label,
         }
 
         # ── EEG 数据 ──────────────────────────────────────────────────────
@@ -308,9 +371,11 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         y_soz = torch.from_numpy(y_soz).float()
         y_bipolar = torch.from_numpy(bipolar_label).float()
         y_monopolar = torch.from_numpy(monopolar_label).float()
+        y_region = torch.from_numpy(region_label).float()
+        y_hemisphere = torch.tensor(hemisphere_label, dtype=torch.long)
         mask = torch.from_numpy(mask).float()
 
-        return X, y_soz, mask, meta, y_bipolar, y_monopolar
+        return X, y_soz, mask, meta, y_bipolar, y_monopolar, y_region, y_hemisphere
 
     def _load_eeg(self, row: pd.Series, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """加载 EDF → 21单极 → 双极转换 → patches"""
@@ -387,7 +452,7 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
 
     @staticmethod
     def collate_fn(batch):
-        Xs, ys, masks, metas, y_bipolars, y_monopolars = zip(*batch)
+        Xs, ys, masks, metas, y_bipolars, y_monopolars, y_regions, y_hemispheres = zip(*batch)
         return (
             torch.stack(Xs),
             torch.stack(ys),
@@ -395,6 +460,8 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
             list(metas),
             torch.stack(y_bipolars),
             torch.stack(y_monopolars),
+            torch.stack(y_regions),
+            torch.stack(y_hemispheres),
         )
 
 

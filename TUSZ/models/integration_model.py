@@ -105,14 +105,21 @@ class IntegrationConfig:
     fusion_dropout: float = 0.1
 
     # output
+    task_mode: str = 'soz'            # 'soz' or 'stage_pretrain'
     output_mode: str = 'monopolar'     # 'monopolar' (19) or 'bipolar' (22)
     n_monopolar: int = 19
+    n_regions: int = 6
+    n_hemisphere_classes: int = 3
+    n_stage_classes: int = 2
+    stage_ignore_index: int = -100
 
     # loss weights
     w_transition: float = 0.3
     w_pattern: float = 0.2
     w_contrast: float = 0.1
     w_moe: float = 0.01               # MoE辅助损失权重
+    w_region: float = 0.5
+    w_hemisphere: float = 0.5
     focal_gamma: float = 2.0
     focal_alpha: float = 0.75
 
@@ -257,6 +264,74 @@ class SOZHead(nn.Module):
         return logits, bipolar_logits
 
 
+class GlobalPoolHead(nn.Module):
+    """Global mean/max pooling over fused tokens for auxiliary classification."""
+
+    def __init__(self, embed_dim: int, out_dim: int, dropout: float = 0.3):
+        super().__init__()
+        hidden = embed_dim
+        self.pool_norm = nn.LayerNorm(embed_dim * 2)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.LayerNorm(hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        max_pool = x.max(dim=1).values
+        mean_pool = x.mean(dim=1)
+        pooled = torch.cat([max_pool, mean_pool], dim=-1)
+        pooled = self.pool_norm(pooled)
+        return self.mlp(pooled)
+
+
+class PatchStageHead(nn.Module):
+    """Predict a binary stage label for each patch."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        n_channels: int = 22,
+        n_classes: int = 2,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.n_channels = n_channels
+        hidden = embed_dim
+        self.pool_norm = nn.LayerNorm(embed_dim * 2)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.LayerNorm(hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, N, D], where N = n_channels * n_patches
+        returns: [B, n_patches, n_classes]
+        """
+        B, N, D = x.shape
+        P = N // self.n_channels
+        x_4d = x.view(B, self.n_channels, P, D).permute(0, 2, 1, 3)
+        max_pool = x_4d.max(dim=2).values
+        mean_pool = x_4d.mean(dim=2)
+        pooled = torch.cat([max_pool, mean_pool], dim=-1)
+        pooled = self.pool_norm(pooled)
+        return self.mlp(pooled)
+
+
 # =====================================================================
 # Main Integration Model
 # =====================================================================
@@ -332,11 +407,34 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             embed_dim=c.embed_dim, n_channels=c.n_channels,
             n_patches=max_patches, output_mode=c.output_mode,
         )
+        self.region_head = GlobalPoolHead(
+            embed_dim=c.embed_dim,
+            out_dim=c.n_regions,
+        )
+        self.hemisphere_head = GlobalPoolHead(
+            embed_dim=c.embed_dim,
+            out_dim=c.n_hemisphere_classes,
+        )
+        self.stage_head = PatchStageHead(
+            embed_dim=c.embed_dim,
+            n_channels=c.n_channels,
+            n_classes=c.n_stage_classes,
+        )
 
         # ── Loss functions ──
         self.focal_loss = FocalLoss(gamma=c.focal_gamma, alpha=c.focal_alpha)
+        self.region_bce = nn.BCEWithLogitsLoss(reduction='mean')
+        self.hemisphere_ce = nn.CrossEntropyLoss(
+            reduction='mean',
+            ignore_index=-100,
+        )
         self.transition_bce = nn.BCEWithLogitsLoss(reduction='mean')
         self.pattern_ce = nn.CrossEntropyLoss(reduction='mean')
+        self.stage_ce = nn.CrossEntropyLoss(
+            reduction='mean',
+            ignore_index=c.stage_ignore_index,
+        )
+        self._last: Optional[Dict] = None
 
     def set_pos_weight(self, pos_weight: torch.Tensor):
         """Set pos_weight for focal loss from dataset label statistics."""
@@ -345,9 +443,6 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             pos_weight=pos_weight,
         )
 
-        # cache
-        self._last: Optional[Dict] = None
-
     # -----------------------------------------------------------------
     # forward
     # -----------------------------------------------------------------
@@ -355,8 +450,8 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        seizure_onset_sec: torch.Tensor,
-        window_start_sec: torch.Tensor,
+        seizure_onset_sec: Optional[torch.Tensor] = None,
+        window_start_sec: Optional[torch.Tensor] = None,
         valid_patch_counts: Optional[torch.Tensor] = None,
         brain_networks: Optional[torch.Tensor] = None,
         rel_time: Optional[torch.Tensor] = None,
@@ -373,13 +468,62 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
 
         Returns
         -------
-        dict with soz_probs, transition_probs, pattern_logits,
-        gate_weights, brain_networks, branch_weights, bipolar_logits
+        dict with SOZ, region, hemisphere, and sequence auxiliary outputs
         """
         c = self.cfg
         B = x.size(0)
 
+        if c.task_mode == 'stage_pretrain':
+            if x.dim() == 4:
+                patches = x.permute(0, 2, 1, 3)
+            elif x.dim() == 3:
+                expected = c.patch_len * (c.n_pre_patches + c.n_post_patches)
+                if x.size(-1) != expected:
+                    raise ValueError(
+                        f"Stage pretrain expects {expected} samples per window, got {x.size(-1)}"
+                    )
+                patches = x.view(B, c.n_channels, -1, c.patch_len).permute(0, 2, 1, 3)
+            else:
+                raise ValueError(f"Unsupported stage-pretrain input shape: {tuple(x.shape)}")
+
+            P = patches.size(1)
+            vp_counts = torch.full(
+                (B,),
+                fill_value=P,
+                dtype=torch.long,
+                device=patches.device,
+            )
+            if rel_time is None:
+                rel_time = torch.arange(
+                    P, device=patches.device, dtype=torch.float32,
+                ) * (c.patch_len / c.fs)
+                rel_time = rel_time.unsqueeze(0).expand(B, -1)
+
+            patches_a = patches.permute(0, 2, 1, 3)
+            if c.use_checkpoint and self.training:
+                h = checkpoint(self.backbone, patches_a, use_reentrant=False)
+            else:
+                h = self.backbone(patches_a)
+            h, moe_loss_a = self.timefilter(h, is_training=self.training)
+
+            stage_logits = self.stage_head(h)
+            outputs = {
+                'stage_logits': stage_logits,
+                'stage_probs': torch.softmax(stage_logits, dim=-1),
+                'valid_patch_counts': vp_counts,
+                'seizure_relative_time': rel_time,
+                'moe_loss': moe_loss_a,
+            }
+            self._last = {
+                k: (v.detach() if isinstance(v, torch.Tensor) else v)
+                for k, v in outputs.items()
+            }
+            return outputs
+
         # ── Step 1: Seizure-aligned patching ──
+        if seizure_onset_sec is None or window_start_sec is None:
+            raise ValueError("SOZ mode requires seizure_onset_sec and window_start_sec")
+
         patches, vp_counts_patched, rel_time_patched = self.patching(
             x, seizure_onset_sec, window_start_sec,
         )  # patches [B, P, 22, patch_len]
@@ -425,6 +569,8 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         # ── Step 4: SOZ localization ──
         soz_logits, bipolar_logits = self.soz_head(fused)     # [B, 19], [B, 22]
         soz_probs = torch.sigmoid(soz_logits)
+        region_logits = self.region_head(fused)               # [B, 6]
+        hemisphere_logits = self.hemisphere_head(fused)       # [B, 3]
 
         # MoE辅助损失合并
         moe_loss = moe_loss_a + moe_loss_b
@@ -433,6 +579,10 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             'soz_probs': soz_probs,
             'soz_logits': soz_logits,
             'bipolar_logits': bipolar_logits,
+            'region_logits': region_logits,
+            'region_probs': torch.sigmoid(region_logits),
+            'hemisphere_logits': hemisphere_logits,
+            'hemisphere_probs': torch.softmax(hemisphere_logits, dim=-1),
             'transition_probs': transition_probs,
             'transition_logits': transition_logits,
             'pattern_logits': pattern_logits,
@@ -456,6 +606,8 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         self,
         outputs: Dict[str, torch.Tensor],
         soz_targets: torch.Tensor,
+        region_targets: Optional[torch.Tensor] = None,
+        hemisphere_targets: Optional[torch.Tensor] = None,
         transition_targets: Optional[torch.Tensor] = None,
         pattern_targets: Optional[torch.Tensor] = None,
         sample_weight: Optional[torch.Tensor] = None,
@@ -464,6 +616,8 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         Args
         ----
         soz_targets        : [B, 19] or [B, 22]
+        region_targets     : [B, 6]  (optional, multi-label)
+        hemisphere_targets : [B]     (optional, 0=L,1=R,2=B,-100=ignore)
         transition_targets : [B, P]  (optional)
         pattern_targets    : [B]     (optional)
 
@@ -477,6 +631,24 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             outputs['soz_logits'], soz_targets, sample_weight=sample_weight
         )
         total = losses['soz']
+
+        if region_targets is not None:
+            losses['region'] = self.region_bce(
+                outputs['region_logits'],
+                region_targets,
+            )
+            total = total + c.w_region * losses['region']
+
+        if hemisphere_targets is not None:
+            valid_hemisphere = hemisphere_targets != -100
+            if valid_hemisphere.any():
+                losses['hemisphere'] = self.hemisphere_ce(
+                    outputs['hemisphere_logits'],
+                    hemisphere_targets,
+                )
+                total = total + c.w_hemisphere * losses['hemisphere']
+            else:
+                losses['hemisphere'] = outputs['hemisphere_logits'].new_zeros(())
 
         # auxiliary 1: transition detection
         if transition_targets is not None:
@@ -495,6 +667,32 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         if 'moe_loss' in outputs:
             losses['moe'] = outputs['moe_loss']
             total = total + c.w_moe * outputs['moe_loss']
+
+        losses['total'] = total
+        return total, losses
+
+    def compute_stage_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        stage_targets: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute patch-level seizure/non-seizure loss."""
+        losses: Dict[str, torch.Tensor] = {}
+        flat_targets = stage_targets.reshape(-1)
+        valid_mask = flat_targets != self.cfg.stage_ignore_index
+        if not valid_mask.any():
+            zero = outputs['stage_logits'].new_zeros(())
+            losses['stage'] = zero
+            losses['total'] = zero
+            return zero, losses
+
+        flat_logits = outputs['stage_logits'].reshape(-1, outputs['stage_logits'].size(-1))
+        losses['stage'] = self.stage_ce(flat_logits, flat_targets)
+        total = losses['stage']
+
+        if 'moe_loss' in outputs:
+            losses['moe'] = outputs['moe_loss']
+            total = total + self.cfg.w_moe * outputs['moe_loss']
 
         losses['total'] = total
         return total, losses
@@ -559,9 +757,42 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
     @classmethod
     def load_checkpoint(cls, path: str, map_location='cpu'):
         ckpt = torch.load(path, map_location=map_location)
-        model = cls(ckpt['config'])
+        cfg = ckpt['config']
+        if isinstance(cfg, dict):
+            cfg = IntegrationConfig(**cfg)
+        model = cls(cfg)
         model.load_state_dict(ckpt['model_state'])
         return model, ckpt
+
+    def load_a_branch_weights(self, path: str, map_location='cpu') -> Dict[str, List[str]]:
+        """Load only backbone + timefilter weights from a checkpoint."""
+        ckpt = torch.load(path, map_location=map_location)
+        state = ckpt.get('model_state', ckpt.get('state_dict', ckpt))
+        branch_state = {}
+        for key, value in state.items():
+            clean_key = key[7:] if key.startswith('module.') else key
+            if clean_key.startswith('backbone.') or clean_key.startswith('timefilter.'):
+                branch_state[clean_key] = value
+        own_state = self.state_dict()
+        loaded_keys: List[str] = []
+        unexpected_keys: List[str] = []
+        for key, value in branch_state.items():
+            if key not in own_state or own_state[key].shape != value.shape:
+                unexpected_keys.append(key)
+                continue
+            own_state[key].copy_(value)
+            loaded_keys.append(key)
+
+        missing_keys = [
+            key for key in own_state.keys()
+            if (key.startswith('backbone.') or key.startswith('timefilter.'))
+            and key not in branch_state
+        ]
+        return {
+            'loaded_keys': sorted(loaded_keys),
+            'missing_keys': sorted(missing_keys),
+            'unexpected_keys': sorted(unexpected_keys),
+        }
 
     # -----------------------------------------------------------------
     # Interpretability
@@ -601,6 +832,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return (
             f"TimeFilter_LaBraM_BrainNetwork_Integration\n"
+            f"  Task mode:        {self.cfg.task_mode}\n"
             f"  Total params:     {n_total:,}\n"
             f"  Trainable params: {n_train:,}\n"
             f"  Output mode:      {self.cfg.output_mode}\n"
@@ -645,12 +877,16 @@ def _test():
     n_out = 19 if cfg.output_mode == 'monopolar' else 22
     assert out['soz_probs'].shape == (B, n_out), \
         f"soz_probs: expected [B,{n_out}], got {list(out['soz_probs'].shape)}"
+    assert out['region_logits'].shape == (B, cfg.n_regions)
+    assert out['hemisphere_logits'].shape == (B, cfg.n_hemisphere_classes)
     assert out['transition_probs'].shape == (B, max_patches)
     assert out['pattern_logits'].shape == (B, 3)
     assert out['brain_networks'].shape == (B, max_patches, C, C, 4)
     assert out['gate_weights'].shape[0] == B
 
     print(f"soz_probs         : {list(out['soz_probs'].shape)}")
+    print(f"region_logits     : {list(out['region_logits'].shape)}")
+    print(f"hemisphere_logits : {list(out['hemisphere_logits'].shape)}")
     print(f"transition_probs  : {list(out['transition_probs'].shape)}")
     print(f"pattern_logits    : {list(out['pattern_logits'].shape)}")
     print(f"gate_weights      : {list(out['gate_weights'].shape)}")
@@ -659,6 +895,10 @@ def _test():
     # loss
     soz_target = torch.zeros(B, n_out)
     soz_target[:, 3] = 1.0   # simulate one SOZ channel
+    region_target = torch.zeros(B, cfg.n_regions)
+    region_target[:, 0] = 1.0
+    region_target[:, 3] = 1.0
+    hemisphere_target = torch.tensor([0, 2], dtype=torch.long)
     vm = model.patching._valid_mask
     if vm is None:
         vm = torch.ones(B, max_patches, dtype=torch.bool)
@@ -667,6 +907,8 @@ def _test():
     )
     total, losses = model.compute_loss(
         out, soz_target,
+        region_targets=region_target,
+        hemisphere_targets=hemisphere_target,
         transition_targets=aux_targets['transition_targets'],
         pattern_targets=aux_targets['pattern_targets'],
     )

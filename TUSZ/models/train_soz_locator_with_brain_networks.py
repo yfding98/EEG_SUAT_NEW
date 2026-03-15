@@ -50,6 +50,12 @@ try:
     from models.brain_network_extractor import MultiScaleBrainNetworkExtractor
     from models.dynamic_network_evolution import DynamicNetworkEvolutionModel
     from models.manifest_dataset import ManifestSOZDataset
+    from tasks.stage_detection import (
+        EEGStagePretrainDataset,
+        inspect_stage_annotation_support,
+        stage_collate_fn,
+        summarize_stage_dataset,
+    )
 except ImportError:
     from .integration_model import (
         TimeFilter_LaBraM_BrainNetwork_Integration, IntegrationConfig,
@@ -60,6 +66,12 @@ except ImportError:
     from .brain_network_extractor import MultiScaleBrainNetworkExtractor
     from .dynamic_network_evolution import DynamicNetworkEvolutionModel
     from .manifest_dataset import ManifestSOZDataset
+    from ..tasks.stage_detection import (
+        EEGStagePretrainDataset,
+        inspect_stage_annotation_support,
+        stage_collate_fn,
+        summarize_stage_dataset,
+    )
 
 try:
     from sklearn.metrics import roc_auc_score
@@ -126,6 +138,48 @@ def compute_auc(probs: np.ndarray, targets: np.ndarray) -> float:
         return roc_auc_score(targets[:, valid], probs[:, valid], average='macro')
     except Exception:
         return 0.0
+
+
+def compute_multilabel_accuracy(
+    probs: np.ndarray,
+    targets: np.ndarray,
+    threshold: float = 0.5,
+) -> float:
+    if len(probs) == 0:
+        return 0.0
+    preds = probs >= threshold
+    truth = targets >= 0.5
+    return float((preds == truth).mean())
+
+
+def compute_multiclass_accuracy(
+    logits: np.ndarray,
+    targets: np.ndarray,
+    ignore_index: int = -100,
+) -> float:
+    if len(logits) == 0:
+        return 0.0
+    mask = targets != ignore_index
+    if mask.sum() == 0:
+        return 0.0
+    preds = logits.argmax(axis=1)
+    return float((preds[mask] == targets[mask]).mean())
+
+
+def compute_patch_accuracy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -100,
+) -> Tuple[float, int]:
+    if logits.numel() == 0:
+        return 0.0, 0
+    preds = logits.argmax(dim=-1)
+    mask = targets != ignore_index
+    valid = int(mask.sum().item())
+    if valid == 0:
+        return 0.0, 0
+    correct = (preds[mask] == targets[mask]).float().mean().item()
+    return float(correct), valid
 
 
 def compute_pos_weight(loader, device='cpu') -> torch.Tensor:
@@ -212,7 +266,7 @@ class SOZBrainNetworkDataset(torch.utils.data.Dataset):
         # x = sample['data']                         # [22, 20, 100]
         # label = sample['label']                    # [22] or [19]
 
-        x, label, mask, meta, y_bipolar, y_monopolar = sample
+        x, label, mask, meta, y_bipolar, y_monopolar, y_region, y_hemisphere = sample
 
         # flatten to [22, 2000] for patching module
         C, P, L = x.shape
@@ -229,6 +283,8 @@ class SOZBrainNetworkDataset(torch.utils.data.Dataset):
             'label': label,
             'bipolar_label': y_bipolar,
             'monopolar_label': y_monopolar,
+            'region_label': y_region,
+            'hemisphere_label': y_hemisphere,
             'onset_sec': onset_sec,
             'start_sec': start_sec,
             'source': row.get('source', 'unknown'),
@@ -256,6 +312,8 @@ def collate_fn(batch):
         'label': torch.stack([b['label'] for b in batch]),
         'bipolar_label': torch.stack([b['bipolar_label'] for b in batch]),
         'monopolar_label': torch.stack([b['monopolar_label'] for b in batch]),
+        'region_label': torch.stack([b['region_label'] for b in batch]),
+        'hemisphere_label': torch.stack([b['hemisphere_label'] for b in batch]),
         'onset_sec': torch.tensor([b['onset_sec'] for b in batch]),
         'start_sec': torch.tensor([b['start_sec'] for b in batch]),
         'source': [b['source'] for b in batch],
@@ -279,12 +337,18 @@ def train_one_epoch(
     model, loader, optimizer, scaler, device, epoch, cfg, writer=None,
 ):
     model.train()
+    base = model.module if hasattr(model, 'module') else model
     total_loss, n_batches = 0.0, 0
     all_probs, all_targets = [], []
+    all_region_probs, all_region_targets = [], []
+    all_hemi_logits, all_hemi_targets = [], []
+    loss_sums: Dict[str, float] = {}
 
     for step, batch in enumerate(loader):
         x = batch['x'].to(device)
         label = batch['label'].to(device)
+        region_label = batch['region_label'].to(device)
+        hemisphere_label = batch['hemisphere_label'].to(device)
         onset = batch['onset_sec'].to(device)
         start = batch['start_sec'].to(device)
         
@@ -308,7 +372,6 @@ def train_one_epoch(
             )
 
             # build aux targets
-            base = model.module if hasattr(model, 'module') else model
             vm = DynamicNetworkEvolutionModel._build_valid_mask(
                 outputs['valid_patch_counts'],
                 outputs['transition_probs'].size(1),
@@ -327,6 +390,8 @@ def train_one_epoch(
 
             loss, losses = base.compute_loss(
                 outputs, label,
+                region_targets=region_label,
+                hemisphere_targets=hemisphere_label,
                 transition_targets=aux['transition_targets'].to(device),
                 pattern_targets=aux['pattern_targets'].to(device),
                 sample_weight=sample_weight,
@@ -352,8 +417,14 @@ def train_one_epoch(
 
         total_loss += loss.item()
         n_batches += 1
+        for name, value in losses.items():
+            loss_sums[name] = loss_sums.get(name, 0.0) + float(value.detach().item())
         all_probs.append(outputs['soz_probs'].detach().cpu().numpy())
         all_targets.append(label.cpu().numpy())
+        all_region_probs.append(outputs['region_probs'].detach().cpu().numpy())
+        all_region_targets.append(region_label.cpu().numpy())
+        all_hemi_logits.append(outputs['hemisphere_logits'].detach().cpu().numpy())
+        all_hemi_targets.append(hemisphere_label.cpu().numpy())
 
         # logits monitoring (every 50 steps)
         if step % 50 == 0:
@@ -361,6 +432,8 @@ def train_one_epoch(
                 soz_l = outputs['soz_logits'].detach()
                 soz_p = outputs['soz_probs'].detach()
                 gate_w = outputs.get('gate_weights')
+                region_loss = losses.get('region')
+                hemisphere_loss = losses.get('hemisphere')
                 log.info(
                     f"  [E{epoch} S{step}] "
                     f"logits(min={soz_l.min():.3f}, max={soz_l.max():.3f}, "
@@ -369,6 +442,11 @@ def train_one_epoch(
                     f"mean={soz_p.mean():.3f}) "
                     f"loss={loss.item():.4f}"
                 )
+                if region_loss is not None or hemisphere_loss is not None:
+                    log.info(
+                        f"           aux(region={region_loss.detach().item():.4f}, "
+                        f"hemisphere={hemisphere_loss.detach().item():.4f})"
+                    )
                 if gate_w is not None:
                     log.info(
                         f"           gate(min={gate_w.min():.3f}, "
@@ -378,29 +456,57 @@ def train_one_epoch(
     avg_loss = total_loss / max(n_batches, 1)
     probs = np.concatenate(all_probs, axis=0)
     targets = np.concatenate(all_targets, axis=0)
+    region_probs = np.concatenate(all_region_probs, axis=0)
+    region_targets = np.concatenate(all_region_targets, axis=0)
+    hemi_logits = np.concatenate(all_hemi_logits, axis=0)
+    hemi_targets = np.concatenate(all_hemi_targets, axis=0)
     top3 = compute_top_k(probs, targets, k=3)
     auc = compute_auc(probs, targets) if roc_auc_score else 0.0
+    region_acc = compute_multilabel_accuracy(region_probs, region_targets)
+    hemisphere_acc = compute_multiclass_accuracy(hemi_logits, hemi_targets)
+    avg_losses = {
+        f"loss_{name}": value / max(n_batches, 1)
+        for name, value in loss_sums.items()
+    }
 
     if writer:
         writer.add_scalar('train/loss', avg_loss, epoch)
         writer.add_scalar('train/top3', top3, epoch)
         writer.add_scalar('train/auc', auc, epoch)
+        writer.add_scalar('train/region_acc', region_acc, epoch)
+        writer.add_scalar('train/hemisphere_acc', hemisphere_acc, epoch)
+        for name, value in avg_losses.items():
+            writer.add_scalar(f'train/{name}', value, epoch)
         with torch.no_grad():
             for name, param in base.named_parameters():
                 if param.grad is not None and param.requires_grad:
                     writer.add_scalar(f'grad_norm/{name}',
                                       param.grad.norm().item(), epoch)
 
-    return avg_loss, top3, auc
+    return {
+        'loss': avg_loss,
+        'top3': top3,
+        'auc': auc,
+        'region_acc': region_acc,
+        'hemisphere_acc': hemisphere_acc,
+        **avg_losses,
+    }
 
 
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
+    base = model.module if hasattr(model, 'module') else model
     all_probs, all_targets, all_logits = [], [], []
+    all_region_probs, all_region_targets = [], []
+    all_hemi_logits, all_hemi_targets = [], []
+    loss_sums: Dict[str, float] = {}
+    n_batches = 0
     for batch in loader:
         x = batch['x'].to(device)
         label = batch['label'].to(device)
+        region_label = batch['region_label'].to(device)
+        hemisphere_label = batch['hemisphere_label'].to(device)
         onset = batch['onset_sec'].to(device)
         start = batch['start_sec'].to(device)
         
@@ -421,28 +527,383 @@ def evaluate(model, loader, device):
             brain_networks=brain_nets,
             rel_time=rel_time,
         )
+
+        vm = DynamicNetworkEvolutionModel._build_valid_mask(
+            out['valid_patch_counts'],
+            out['transition_probs'].size(1),
+        )
+        aux = DynamicNetworkEvolutionModel.compute_auxiliary_targets(
+            out['seizure_relative_time'], vm,
+        )
+        pos_ratio = label.sum(dim=1) / max(label.shape[1], 1)
+        sample_weight = torch.where(
+            pos_ratio > 0.5,
+            torch.tensor(0.05, device=device, dtype=torch.float32),
+            torch.tensor(1.0, device=device, dtype=torch.float32),
+        )
+        _, losses = base.compute_loss(
+            out,
+            label,
+            region_targets=region_label,
+            hemisphere_targets=hemisphere_label,
+            transition_targets=aux['transition_targets'].to(device),
+            pattern_targets=aux['pattern_targets'].to(device),
+            sample_weight=sample_weight,
+        )
+
         all_probs.append(out['soz_probs'].cpu().numpy())
         all_targets.append(label.cpu().numpy())
         all_logits.append(out['soz_logits'].cpu().numpy())
+        all_region_probs.append(out['region_probs'].cpu().numpy())
+        all_region_targets.append(region_label.cpu().numpy())
+        all_hemi_logits.append(out['hemisphere_logits'].cpu().numpy())
+        all_hemi_targets.append(hemisphere_label.cpu().numpy())
+        for name, value in losses.items():
+            loss_sums[name] = loss_sums.get(name, 0.0) + float(value.detach().item())
+        n_batches += 1
 
     probs = np.concatenate(all_probs, axis=0)
     targets = np.concatenate(all_targets, axis=0)
     logits = np.concatenate(all_logits, axis=0)
+    region_probs = np.concatenate(all_region_probs, axis=0)
+    region_targets = np.concatenate(all_region_targets, axis=0)
+    hemi_logits = np.concatenate(all_hemi_logits, axis=0)
+    hemi_targets = np.concatenate(all_hemi_targets, axis=0)
     top1 = compute_top_k(probs, targets, k=1)
     top3 = compute_top_k(probs, targets, k=3)
     top5 = compute_top_k(probs, targets, k=5)
     auc = compute_auc(probs, targets) if roc_auc_score else 0.0
+    region_acc = compute_multilabel_accuracy(region_probs, region_targets)
+    hemisphere_acc = compute_multiclass_accuracy(hemi_logits, hemi_targets)
+    avg_losses = {
+        f"loss_{name}": value / max(n_batches, 1)
+        for name, value in loss_sums.items()
+    }
 
     log.info(
         f"  [eval] logits(min={logits.min():.3f}, max={logits.max():.3f}, "
         f"mean={logits.mean():.3f}, std={logits.std():.3f}) "
         f"probs(min={probs.min():.3f}, max={probs.max():.3f}, "
         f"mean={probs.mean():.3f}) "
-        f"label_pos_rate={targets.mean():.4f}"
+        f"label_pos_rate={targets.mean():.4f} "
+        f"region_acc={region_acc:.3f} "
+        f"hemi_acc={hemisphere_acc:.3f}"
     )
 
-    return {'top1': top1, 'top3': top3, 'top5': top5, 'auc': auc,
-            'probs': probs, 'targets': targets}
+    return {
+        'top1': top1,
+        'top3': top3,
+        'top5': top5,
+        'auc': auc,
+        'region_acc': region_acc,
+        'hemisphere_acc': hemisphere_acc,
+        'probs': probs,
+        'targets': targets,
+        'region_probs': region_probs,
+        'region_targets': region_targets,
+        'hemisphere_logits': hemi_logits,
+        'hemisphere_targets': hemi_targets,
+        **avg_losses,
+    }
+
+
+def train_stage_one_epoch(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    epoch,
+    writer=None,
+):
+    model.train()
+    base = model.module if hasattr(model, 'module') else model
+    total_loss = 0.0
+    total_correct = 0.0
+    total_valid = 0
+    total_pos = 0
+    n_batches = 0
+    loss_sums: Dict[str, float] = {}
+
+    for batch in loader:
+        x = batch['x'].to(device)
+        stage_labels = batch['stage_labels'].to(device)
+        valid_patches = int((stage_labels != base.cfg.stage_ignore_index).sum().item())
+        if valid_patches == 0:
+            continue
+
+        with torch.amp.autocast('cuda', enabled=scaler is not None):
+            outputs = model(x)
+            loss, losses = base.compute_stage_loss(outputs, stage_labels)
+
+        optimizer.zero_grad()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(base.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(base.parameters(), 1.0)
+            optimizer.step()
+
+        acc, n_valid = compute_patch_accuracy(
+            outputs['stage_logits'].detach(),
+            stage_labels,
+            ignore_index=base.cfg.stage_ignore_index,
+        )
+        total_correct += acc * n_valid
+        total_valid += n_valid
+        total_pos += int((stage_labels == 1).sum().item())
+        total_loss += float(loss.detach().item())
+        n_batches += 1
+        for name, value in losses.items():
+            loss_sums[name] = loss_sums.get(name, 0.0) + float(value.detach().item())
+
+    avg_loss = total_loss / max(n_batches, 1)
+    patch_acc = total_correct / max(total_valid, 1)
+    pos_rate = total_pos / max(total_valid, 1)
+    avg_losses = {
+        f"loss_{name}": value / max(n_batches, 1)
+        for name, value in loss_sums.items()
+    }
+
+    if writer:
+        writer.add_scalar('train/loss', avg_loss, epoch)
+        writer.add_scalar('train/patch_acc', patch_acc, epoch)
+        writer.add_scalar('train/positive_rate', pos_rate, epoch)
+        for name, value in avg_losses.items():
+            writer.add_scalar(f'train/{name}', value, epoch)
+
+    return {
+        'loss': avg_loss,
+        'patch_acc': patch_acc,
+        'positive_rate': pos_rate,
+        **avg_losses,
+    }
+
+
+@torch.no_grad()
+def evaluate_stage(model, loader, device):
+    model.eval()
+    base = model.module if hasattr(model, 'module') else model
+    total_loss = 0.0
+    total_correct = 0.0
+    total_valid = 0
+    total_pos = 0
+    n_batches = 0
+    loss_sums: Dict[str, float] = {}
+
+    for batch in loader:
+        x = batch['x'].to(device)
+        stage_labels = batch['stage_labels'].to(device)
+        valid_patches = int((stage_labels != base.cfg.stage_ignore_index).sum().item())
+        if valid_patches == 0:
+            continue
+
+        outputs = model(x)
+        loss, losses = base.compute_stage_loss(outputs, stage_labels)
+        acc, n_valid = compute_patch_accuracy(
+            outputs['stage_logits'],
+            stage_labels,
+            ignore_index=base.cfg.stage_ignore_index,
+        )
+        total_correct += acc * n_valid
+        total_valid += n_valid
+        total_pos += int((stage_labels == 1).sum().item())
+        total_loss += float(loss.detach().item())
+        n_batches += 1
+        for name, value in losses.items():
+            loss_sums[name] = loss_sums.get(name, 0.0) + float(value.detach().item())
+
+    avg_loss = total_loss / max(n_batches, 1)
+    patch_acc = total_correct / max(total_valid, 1)
+    pos_rate = total_pos / max(total_valid, 1)
+    avg_losses = {
+        f"loss_{name}": value / max(n_batches, 1)
+        for name, value in loss_sums.items()
+    }
+    return {
+        'loss': avg_loss,
+        'patch_acc': patch_acc,
+        'positive_rate': pos_rate,
+        **avg_losses,
+    }
+
+
+def run_stage_pretraining(
+    args,
+    output_dir: Path,
+    device,
+    rank: int,
+    world: int,
+    local_rank: int,
+    patch_len: int,
+    n_pre_patches: int,
+    n_post_patches: int,
+):
+    log.info("=== Stage pretraining (binary seizure vs non-seizure) ===")
+    support = inspect_stage_annotation_support(
+        manifest_path=args.manifest,
+        tusz_data_root=args.tusz_data_root,
+        source_filter='tusz',
+    )
+    log.info(
+        "  Stage support: classes=%s valid_events=%s raw=%s",
+        support.get('supported_classes'),
+        support.get('n_valid_events'),
+        support.get('raw_annotation_counts', {}),
+    )
+
+    try:
+        from data_preprocess.eeg_pipeline import PipelineConfig
+    except ImportError:
+        from ..data_preprocess.eeg_pipeline import PipelineConfig
+
+    pipeline_cfg = PipelineConfig(
+        target_fs=args.fs,
+        pre_onset_sec=args.pre_onset_sec,
+        post_onset_sec=args.post_onset_sec,
+        n_patches=n_pre_patches + n_post_patches,
+        patch_len=patch_len,
+    )
+
+    train_ds = EEGStagePretrainDataset(
+        manifest_path=args.manifest,
+        tusz_data_root=args.tusz_data_root,
+        pipeline_cfg=pipeline_cfg,
+        source_filter='tusz',
+        split_filter=['train'],
+    )
+    val_splits = ['dev']
+    val_ds = EEGStagePretrainDataset(
+        manifest_path=args.manifest,
+        tusz_data_root=args.tusz_data_root,
+        pipeline_cfg=pipeline_cfg,
+        source_filter='tusz',
+        split_filter=val_splits,
+    )
+    if len(val_ds) == 0:
+        val_splits = ['eval']
+        val_ds = EEGStagePretrainDataset(
+            manifest_path=args.manifest,
+            tusz_data_root=args.tusz_data_root,
+            pipeline_cfg=pipeline_cfg,
+            source_filter='tusz',
+            split_filter=val_splits,
+        )
+
+    train_meta = summarize_stage_dataset(train_ds)
+    val_meta = summarize_stage_dataset(val_ds)
+    log.info("  Stage train windows: %s", train_meta)
+    log.info("  Stage val windows: %s", val_meta)
+
+    if len(train_ds) == 0 or len(val_ds) == 0:
+        log.warning("  Stage pretraining skipped because train/val windows are empty.")
+        return None
+
+    if world > 1:
+        train_sampler = DistributedSampler(train_ds, rank=rank, num_replicas=world)
+    else:
+        train_sampler = RandomSampler(train_ds)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        num_workers=args.workers,
+        collate_fn=stage_collate_fn,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        collate_fn=stage_collate_fn,
+        pin_memory=True,
+    )
+
+    cfg = IntegrationConfig(
+        task_mode='stage_pretrain',
+        embed_dim=args.embed_dim,
+        patch_len=patch_len,
+        n_pre_patches=n_pre_patches,
+        n_post_patches=n_post_patches,
+        fs=args.fs,
+        labram_checkpoint=args.labram_ckpt,
+        output_mode=args.output_mode,
+        w_region=args.w_region,
+        w_hemisphere=args.w_hemisphere,
+    )
+    model = TimeFilter_LaBraM_BrainNetwork_Integration(cfg).to(device)
+    if world > 1:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    base_model = model.module if hasattr(model, 'module') else model
+
+    optimizer = torch.optim.AdamW(
+        base_model.get_param_groups(args.stage_lr),
+        weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(args.stage_epochs, 1),
+    )
+    scaler = torch.amp.GradScaler('cuda') if args.amp else None
+    writer = SummaryWriter(str(output_dir / 'tb_stage_pretrain')) if (_HAS_TB and is_main(rank)) else None
+
+    best_patch_acc = -1.0
+    best_path = output_dir / 'best_pretrain_ckpt.pth'
+
+    for epoch in range(args.stage_epochs):
+        if world > 1:
+            train_sampler.set_epoch(epoch)
+
+        train_metrics = train_stage_one_epoch(
+            model, train_loader, optimizer, scaler, device, epoch, writer,
+        )
+        val_metrics = evaluate_stage(model, val_loader, device)
+        scheduler.step()
+
+        if is_main(rank):
+            log.info(
+                "  [stage] epoch %03d/%03d train_loss=%.4f train_acc=%.3f "
+                "val_loss=%.4f val_acc=%.3f val_pos=%.3f",
+                epoch + 1,
+                args.stage_epochs,
+                train_metrics['loss'],
+                train_metrics['patch_acc'],
+                val_metrics['loss'],
+                val_metrics['patch_acc'],
+                val_metrics['positive_rate'],
+            )
+            if writer:
+                writer.add_scalar('val/loss', val_metrics['loss'], epoch)
+                writer.add_scalar('val/patch_acc', val_metrics['patch_acc'], epoch)
+                writer.add_scalar('val/positive_rate', val_metrics['positive_rate'], epoch)
+                for key in ('loss_stage', 'loss_moe', 'loss_total'):
+                    if key in val_metrics:
+                        writer.add_scalar(f'val/{key}', val_metrics[key], epoch)
+                writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
+
+            if val_metrics['patch_acc'] >= best_patch_acc:
+                best_patch_acc = val_metrics['patch_acc']
+                base_model.save_checkpoint(
+                    str(best_path),
+                    extra={
+                        'epoch': epoch,
+                        'best_patch_acc': best_patch_acc,
+                        'stage_metrics': val_metrics,
+                    },
+                )
+
+    if writer:
+        writer.close()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return best_path if best_path.exists() else None
 
 
 # =====================================================================
@@ -522,6 +983,18 @@ def parse_args():
     p.add_argument('--brain-network-features', default='gc,te,aec,wpli')
     p.add_argument('--use-contrastive', action='store_true')
     p.add_argument('--pretrain-epochs', type=int, default=50)
+    p.add_argument('--use-pretrain-stage', action='store_true',
+                   help='Run binary seizure/non-seizure stage pretraining on TUSZ before SOZ finetuning')
+    p.add_argument('--stage-only', action='store_true',
+                   help='Run only stage-1 binary seizure/non-seizure pretraining and exit')
+    p.add_argument('--stage-pretrain-ckpt', default='',
+                   help='Path to a stage-1 checkpoint to load for SOZ-only training')
+    p.add_argument('--freeze-labram', action='store_true',
+                   help='Freeze LaBraM backbone during SOZ finetuning')
+    p.add_argument('--stage-epochs', type=int, default=20,
+                   help='Epochs for binary stage pretraining')
+    p.add_argument('--stage-lr', type=float, default=1e-4,
+                   help='Learning rate for stage pretraining')
 
     # Sequence length configurations
     p.add_argument('--pre-onset-sec', type=float, default=5.0, help='Seconds before onset to extract')
@@ -532,6 +1005,10 @@ def parse_args():
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight-decay', type=float, default=1e-4)
+    p.add_argument('--w-region', type=float, default=0.5,
+                   help='Loss weight for coarse region classifier')
+    p.add_argument('--w-hemisphere', type=float, default=0.5,
+                   help='Loss weight for hemisphere classifier')
     p.add_argument('--amp', action='store_true', help='mixed precision')
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--seed', type=int, default=42)
@@ -577,11 +1054,30 @@ def main():
     n_pre_patches = int(np.ceil(args.pre_onset_sec / args.patch_duration))
     n_post_patches = int(np.ceil(args.post_onset_sec / args.patch_duration))
     n_patches = n_pre_patches + n_post_patches
+
+    if args.stage_only:
+        stage_pretrain_ckpt = run_stage_pretraining(
+            args=args,
+            output_dir=output_dir,
+            device=device,
+            rank=rank,
+            world=world,
+            local_rank=local_rank,
+            patch_len=patch_len,
+            n_pre_patches=n_pre_patches,
+            n_post_patches=n_post_patches,
+        )
+        if is_main(rank):
+            log.info("Stage-1 pretraining finished: %s", stage_pretrain_ckpt)
+        if world > 1:
+            dist.destroy_process_group()
+        log.info("Done.")
+        return 0
     
     try:
         from data_preprocess.eeg_pipeline import PipelineConfig
     except ImportError:
-        from .data_preprocess.eeg_pipeline import PipelineConfig
+        from ..data_preprocess.eeg_pipeline import PipelineConfig
         
     pipeline_cfg = PipelineConfig(
         target_fs=args.fs,
@@ -596,6 +1092,7 @@ def main():
         private_data_root=args.private_data_root,
         tusz_data_root=args.tusz_data_root,
         source_filter=args.source,
+        label_mode=args.output_mode,
         pipeline_cfg=pipeline_cfg,
     )
     log.info(f"  Manifest loaded: {len(manifest_ds)} samples")
@@ -637,8 +1134,29 @@ def main():
     )
 
     # ── 2. ModelInit ──
+    stage_pretrain_ckpt = None
+    if args.stage_pretrain_ckpt:
+        candidate = Path(args.stage_pretrain_ckpt)
+        if not candidate.exists():
+            raise FileNotFoundError(f"Stage pretrain checkpoint not found: {candidate}")
+        stage_pretrain_ckpt = candidate
+        log.info("Using provided stage-1 checkpoint for SOZ training: %s", stage_pretrain_ckpt)
+    elif args.use_pretrain_stage:
+        stage_pretrain_ckpt = run_stage_pretraining(
+            args=args,
+            output_dir=output_dir,
+            device=device,
+            rank=rank,
+            world=world,
+            local_rank=local_rank,
+            patch_len=patch_len,
+            n_pre_patches=n_pre_patches,
+            n_post_patches=n_post_patches,
+        )
+
     log.info("=== Step 2: Initializing model ===")
     cfg = IntegrationConfig(
+        task_mode='soz',
         embed_dim=args.embed_dim,
         patch_len=patch_len,
         n_pre_patches=n_pre_patches,
@@ -646,9 +1164,20 @@ def main():
         fs=args.fs,
         labram_checkpoint=args.labram_ckpt,
         output_mode=args.output_mode,
+        w_region=args.w_region,
+        w_hemisphere=args.w_hemisphere,
     )
     model = TimeFilter_LaBraM_BrainNetwork_Integration(cfg).to(device)
     log.info(model.summary())
+    if stage_pretrain_ckpt is not None:
+        load_info = model.load_a_branch_weights(str(stage_pretrain_ckpt), map_location=device)
+        log.info(
+            "  Loaded stage-pretrained A-branch from %s (loaded=%d, missing=%d, unexpected=%d)",
+            stage_pretrain_ckpt,
+            len(load_info['loaded_keys']),
+            len(load_info['missing_keys']),
+            len(load_info['unexpected_keys']),
+        )
 
     # ── 2b. Compute class balance and set pos_weight ──
     log.info("  Computing pos_weight from training labels...")
@@ -662,7 +1191,7 @@ def main():
         log.info("=== Step 3: Contrastive pretraining ===")
         pt_cfg = PretrainConfig(embed_dim=cfg.embed_dim)
         pretrain_model = BrainNetworkContrastivePretrainer(pt_cfg).to(device)
-        writer_pt = SummaryWriter(str(output_dir / 'tb_pretrain')) if (_HAS_TB and is_main(rank)) else None
+        writer_pt = SummaryWriter(str(output_dir / 'tb_contrastive_pretrain')) if (_HAS_TB and is_main(rank)) else None
         pretrain_encoder_path = run_contrastive_pretraining(
             pretrain_model, train_loader, device, args, writer_pt,
         )
@@ -671,7 +1200,7 @@ def main():
 
     # ── 4. Fine-tuning ──
     log.info("=== Step 4: Fine-tuning ===")
-    writer = SummaryWriter(str(output_dir / 'tb')) if (_HAS_TB and is_main(rank)) else None
+    writer = SummaryWriter(str(output_dir / 'tb_finetune')) if (_HAS_TB and is_main(rank)) else None
     scaler = torch.amp.GradScaler('cuda') if args.amp else None
 
     # DDP
@@ -693,6 +1222,16 @@ def main():
     phase1_end = total_epochs // 5       # 20% frozen backbone
     phase2_end = total_epochs * 3 // 5   # next 40% unfreeze timefilter
 
+    has_stage_init = stage_pretrain_ckpt is not None
+
+    if args.freeze_labram:
+        base_model.freeze_backbone()
+        base_model.unfreeze_timefilter()
+        log.info("  Finetune setup: LaBraM backbone frozen, TimeFilter + downstream heads trainable")
+    elif has_stage_init:
+        base_model.unfreeze_all()
+        log.info("  Finetune setup: loaded stage-pretrained A-branch, all parameters trainable")
+
     optimizer = torch.optim.AdamW(
         base_model.get_param_groups(args.lr), weight_decay=args.weight_decay,
     )
@@ -702,34 +1241,35 @@ def main():
 
     for epoch in range(start_epoch, total_epochs):
         # phase transitions
-        if epoch == 0:
-            base_model.freeze_backbone()
-            log.info("  Phase 1: backbone frozen")
-        elif epoch == phase1_end:
-            base_model.unfreeze_timefilter()
-            optimizer = torch.optim.AdamW(
-                base_model.get_param_groups(args.lr * 0.5), weight_decay=args.weight_decay,
-            )
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                optimizer, T_0=20, T_mult=2,
-            )
-            log.info("  Phase 2: TimeFilter + network unfrozen")
-        elif epoch == phase2_end:
-            base_model.unfreeze_all()
-            optimizer = torch.optim.AdamW(
-                base_model.get_param_groups(args.lr * 0.1), weight_decay=args.weight_decay,
-            )
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                optimizer, T_0=10, T_mult=2,
-            )
-            log.info("  Phase 3: full model unfrozen")
+        if not has_stage_init and not args.freeze_labram:
+            if epoch == 0:
+                base_model.freeze_backbone()
+                log.info("  Phase 1: backbone frozen")
+            elif epoch == phase1_end:
+                base_model.unfreeze_timefilter()
+                optimizer = torch.optim.AdamW(
+                    base_model.get_param_groups(args.lr * 0.5), weight_decay=args.weight_decay,
+                )
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    optimizer, T_0=20, T_mult=2,
+                )
+                log.info("  Phase 2: TimeFilter + network unfrozen")
+            elif epoch == phase2_end:
+                base_model.unfreeze_all()
+                optimizer = torch.optim.AdamW(
+                    base_model.get_param_groups(args.lr * 0.1), weight_decay=args.weight_decay,
+                )
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    optimizer, T_0=10, T_mult=2,
+                )
+                log.info("  Phase 3: full model unfrozen")
 
         if world > 1:
             train_sampler.set_epoch(epoch)
 
         # train
         t0 = time.time()
-        loss, top3, auc = train_one_epoch(
+        train_metrics = train_one_epoch(
             model, train_loader, optimizer, scaler, device, epoch, cfg, writer,
         )
         scheduler.step()
@@ -739,17 +1279,33 @@ def main():
         val_metrics = evaluate(model, val_loader, device)
 
         if is_main(rank):
+            val_summary = {
+                key: value for key, value in val_metrics.items()
+                if not isinstance(value, np.ndarray)
+            }
             log.info(
                 f"Epoch {epoch:3d}/{total_epochs} "
-                f"loss={loss:.4f} "
-                f"train_top3={top3:.3f} "
+                f"loss={train_metrics['loss']:.4f} "
+                f"soz={train_metrics.get('loss_soz', 0.0):.4f} "
+                f"region={train_metrics.get('loss_region', 0.0):.4f} "
+                f"hemi={train_metrics.get('loss_hemisphere', 0.0):.4f} "
+                f"train_top3={train_metrics['top3']:.3f} "
+                f"train_region_acc={train_metrics['region_acc']:.3f} "
+                f"train_hemi_acc={train_metrics['hemisphere_acc']:.3f} "
                 f"val_top3={val_metrics['top3']:.3f} "
                 f"val_auc={val_metrics['auc']:.3f} "
+                f"val_region_acc={val_metrics['region_acc']:.3f} "
+                f"val_hemi_acc={val_metrics['hemisphere_acc']:.3f} "
                 f"({dt:.1f}s)"
             )
             if writer:
                 writer.add_scalar('val/top3', val_metrics['top3'], epoch)
                 writer.add_scalar('val/auc', val_metrics['auc'], epoch)
+                writer.add_scalar('val/region_acc', val_metrics['region_acc'], epoch)
+                writer.add_scalar('val/hemisphere_acc', val_metrics['hemisphere_acc'], epoch)
+                for key in ('loss_total', 'loss_soz', 'loss_region', 'loss_hemisphere'):
+                    if key in val_metrics:
+                        writer.add_scalar(f'val/{key}', val_metrics[key], epoch)
                 writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
 
             # save best
@@ -758,7 +1314,7 @@ def main():
                 base_model.save_checkpoint(
                     str(output_dir / 'best_model.pt'),
                     extra={'epoch': epoch, 'best_top3': best_top3,
-                           'val_metrics': val_metrics},
+                           'val_metrics': val_summary},
                 )
                 log.info(f"  ** New best: top3={best_top3:.4f}")
 
@@ -785,7 +1341,9 @@ def main():
             f"  Top-1: {test_metrics['top1']:.4f}\n"
             f"  Top-3: {test_metrics['top3']:.4f}\n"
             f"  Top-5: {test_metrics['top5']:.4f}\n"
-            f"  AUC:   {test_metrics['auc']:.4f}"
+            f"  AUC:   {test_metrics['auc']:.4f}\n"
+            f"  Region acc: {test_metrics['region_acc']:.4f}\n"
+            f"  Hemisphere acc: {test_metrics['hemisphere_acc']:.4f}"
         )
 
         # save test report (markdown)
@@ -795,6 +1353,10 @@ def main():
             f"- Manifest: `{args.manifest}`\n"
             f"- LaBraM checkpoint: `{args.labram_ckpt}`\n"
             f"- Contrastive pretraining: {args.use_contrastive}\n"
+            f"- Stage pretraining: {args.use_pretrain_stage}\n"
+            f"- Stage only mode: {args.stage_only}\n"
+            f"- Stage init ckpt: `{args.stage_pretrain_ckpt or stage_pretrain_ckpt or ''}`\n"
+            f"- Freeze LaBraM backbone: {args.freeze_labram}\n"
             f"- Finetune epochs: {total_epochs}\n"
             f"- Output mode: {args.output_mode}\n\n"
             f"## Test Metrics\n\n"
@@ -802,7 +1364,9 @@ def main():
             f"| Top-1 | {test_metrics['top1']:.4f} |\n"
             f"| Top-3 | {test_metrics['top3']:.4f} |\n"
             f"| Top-5 | {test_metrics['top5']:.4f} |\n"
-            f"| AUC   | {test_metrics['auc']:.4f} |\n\n"
+            f"| AUC   | {test_metrics['auc']:.4f} |\n"
+            f"| Region acc | {test_metrics['region_acc']:.4f} |\n"
+            f"| Hemisphere acc | {test_metrics['hemisphere_acc']:.4f} |\n\n"
             f"## Best validation Top-3: {best_top3:.4f}\n"
         )
         (output_dir / 'report.md').write_text(report, encoding='utf-8')
@@ -813,6 +1377,10 @@ def main():
             str(output_dir / 'test_predictions.npz'),
             probs=test_metrics['probs'],
             targets=test_metrics['targets'],
+            region_probs=test_metrics['region_probs'],
+            region_targets=test_metrics['region_targets'],
+            hemisphere_logits=test_metrics['hemisphere_logits'],
+            hemisphere_targets=test_metrics['hemisphere_targets'],
         )
 
     if writer:
