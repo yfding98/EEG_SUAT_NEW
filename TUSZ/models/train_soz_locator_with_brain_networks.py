@@ -17,6 +17,7 @@ train_soz_locator_with_brain_networks.py
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import logging
 import os
@@ -31,8 +32,9 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
 
 # ── project path ──
 _PARENT = Path(__file__).resolve().parent.parent
@@ -52,6 +54,9 @@ try:
     from models.manifest_dataset import ManifestSOZDataset
     from tasks.stage_detection import (
         EEGStagePretrainDataset,
+        NON_SEIZURE_LABEL,
+        SEIZURE_LABEL,
+        assign_patch_binary_labels,
         inspect_stage_annotation_support,
         stage_collate_fn,
         summarize_stage_dataset,
@@ -68,6 +73,9 @@ except ImportError:
     from .manifest_dataset import ManifestSOZDataset
     from ..tasks.stage_detection import (
         EEGStagePretrainDataset,
+        NON_SEIZURE_LABEL,
+        SEIZURE_LABEL,
+        assign_patch_binary_labels,
         inspect_stage_annotation_support,
         stage_collate_fn,
         summarize_stage_dataset,
@@ -113,6 +121,353 @@ def setup_ddp():
 
 def is_main(rank: int) -> bool:
     return rank == 0
+
+
+def _summarize_manifest_subset(manifest_ds: ManifestSOZDataset) -> Dict[str, object]:
+    df = manifest_ds.df
+    if len(df) == 0:
+        return {'rows': 0, 'patients': 0, 'sources': {}, 'hemisphere': {}}
+    return {
+        'rows': int(len(df)),
+        'patients': int(df['patient_id'].nunique()),
+        'sources': {str(k): int(v) for k, v in df['source'].value_counts().to_dict().items()},
+        'hemisphere': {str(k): int(v) for k, v in df['hemisphere'].value_counts().to_dict().items()},
+    }
+
+
+def _format_subset_summary(name: str, summary: Dict[str, object]) -> str:
+    return (
+        f"{name}: rows={summary['rows']} patients={summary['patients']} "
+        f"sources={summary['sources']} hemisphere={summary['hemisphere']}"
+    )
+
+
+def _resolve_holdout_patient_counts(
+    n_patients: int,
+    val_ratio: float,
+    test_ratio: float,
+) -> Dict[str, int]:
+    if n_patients < 3:
+        raise ValueError(
+            f"private_target split requires at least 3 private patients, got {n_patients}"
+        )
+    if val_ratio < 0 or test_ratio < 0:
+        raise ValueError("val_split and test_split must be >= 0")
+
+    n_val = int(round(n_patients * val_ratio)) if val_ratio > 0 else 0
+    n_test = int(round(n_patients * test_ratio)) if test_ratio > 0 else 0
+    if val_ratio > 0:
+        n_val = max(1, n_val)
+    if test_ratio > 0:
+        n_test = max(1, n_test)
+
+    max_holdout = max(n_patients - 1, 0)
+    while n_val + n_test > max_holdout:
+        if n_test >= n_val and n_test > 0:
+            n_test -= 1
+        elif n_val > 0:
+            n_val -= 1
+        else:
+            break
+
+    n_train = n_patients - n_val - n_test
+    if n_train <= 0:
+        raise ValueError(
+            f"Invalid private_target split: train={n_train}, val={n_val}, test={n_test}"
+        )
+    return {'train': n_train, 'val': n_val, 'test': n_test}
+
+
+def _allocate_group_targets(
+    total_target: int,
+    group_sizes: Dict[str, int],
+) -> Dict[str, int]:
+    if total_target <= 0 or not group_sizes:
+        return {str(k): 0 for k in group_sizes}
+
+    total = max(sum(group_sizes.values()), 1)
+    allocated = {
+        str(k): min(int(v), int(np.floor(v * total_target / total)))
+        for k, v in group_sizes.items()
+    }
+    remaining = total_target - sum(allocated.values())
+    if remaining <= 0:
+        return allocated
+
+    fractions = sorted(
+        group_sizes.items(),
+        key=lambda kv: (
+            (kv[1] * total_target / total) - allocated[str(kv[0])],
+            kv[1],
+            str(kv[0]),
+        ),
+        reverse=True,
+    )
+    while remaining > 0:
+        progressed = False
+        for key, capacity in fractions:
+            key = str(key)
+            if allocated[key] >= int(capacity):
+                continue
+            allocated[key] += 1
+            remaining -= 1
+            progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            break
+    return allocated
+
+
+def _build_private_patient_infos(private_manifest_ds: ManifestSOZDataset) -> List[Dict[str, object]]:
+    patient_infos: List[Dict[str, object]] = []
+    grouped = private_manifest_ds.df.groupby('patient_id', sort=False)
+    for patient_id, patient_df in grouped:
+        hemi_values = [
+            str(v).strip()
+            for v in patient_df['hemisphere'].tolist()
+            if str(v).strip()
+        ]
+        hemisphere = Counter(hemi_values).most_common(1)[0][0] if hemi_values else 'U'
+        patient_infos.append(
+            {
+                'patient_id': str(patient_id),
+                'n_rows': int(len(patient_df)),
+                'hemisphere': hemisphere,
+            }
+        )
+    return patient_infos
+
+
+def _split_private_patients(
+    patient_infos: List[Dict[str, object]],
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> Dict[str, List[str]]:
+    target_counts = _resolve_holdout_patient_counts(
+        len(patient_infos),
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+    )
+    total_rows = sum(int(info['n_rows']) for info in patient_infos)
+    avg_rows = total_rows / max(len(patient_infos), 1)
+    hemisphere_sizes = Counter(str(info['hemisphere']) for info in patient_infos)
+    target_hemi = {
+        split: _allocate_group_targets(count, hemisphere_sizes)
+        for split, count in target_counts.items()
+    }
+    target_rows = {
+        split: total_rows * count / max(len(patient_infos), 1)
+        for split, count in target_counts.items()
+    }
+
+    rng = np.random.default_rng(seed)
+    ordered_patients: List[Dict[str, object]] = []
+    for info in patient_infos:
+        item = dict(info)
+        item['rand'] = float(rng.random())
+        ordered_patients.append(item)
+    ordered_patients.sort(
+        key=lambda item: (-int(item['n_rows']), float(item['rand']), str(item['patient_id']))
+    )
+
+    split_order = ('val', 'test', 'train')
+    split_rank = {name: idx for idx, name in enumerate(split_order)}
+    split_stats = {
+        name: {
+            'patient_ids': [],
+            'n_rows': 0,
+            'hemisphere': Counter(),
+        }
+        for name in target_counts
+    }
+
+    for item in ordered_patients:
+        choices = [
+            split
+            for split in split_order
+            if len(split_stats[split]['patient_ids']) < target_counts[split]
+        ]
+        if not choices:
+            raise RuntimeError("No available split bucket while assigning private patients")
+
+        best_key = None
+        best_split = None
+        for split in choices:
+            patient_delta = abs(
+                (len(split_stats[split]['patient_ids']) + 1) - target_counts[split]
+            )
+            row_delta = abs(
+                (split_stats[split]['n_rows'] + int(item['n_rows'])) - target_rows[split]
+            ) / max(avg_rows, 1.0)
+            hemisphere = str(item['hemisphere'])
+            hemi_delta = abs(
+                (split_stats[split]['hemisphere'][hemisphere] + 1)
+                - target_hemi[split].get(hemisphere, 0)
+            )
+            score = patient_delta * 6.0 + row_delta * 1.5 + hemi_delta * 2.5
+            candidate_key = (score, split_rank[split])
+            if best_key is None or candidate_key < best_key:
+                best_key = candidate_key
+                best_split = split
+
+        assert best_split is not None
+        split_stats[best_split]['patient_ids'].append(str(item['patient_id']))
+        split_stats[best_split]['n_rows'] += int(item['n_rows'])
+        split_stats[best_split]['hemisphere'][str(item['hemisphere'])] += 1
+
+    return {
+        split: sorted(stats['patient_ids'])
+        for split, stats in split_stats.items()
+    }
+
+
+def build_soz_datasets(
+    args,
+    pipeline_cfg,
+) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, torch.utils.data.Dataset, Dict[str, object]]:
+    split_strategy = args.split_strategy
+    private_available = args.source in ('all', 'private')
+
+    if split_strategy == 'auto':
+        split_strategy = 'private_target' if private_available else 'random'
+
+    if split_strategy == 'private_target' and args.source not in ('all', 'private'):
+        raise ValueError(
+            f"split_strategy='private_target' requires --source all/private, got {args.source}"
+        )
+
+    dataset_kwargs = dict(
+        manifest_path=args.manifest,
+        private_data_root=args.private_data_root,
+        tusz_data_root=args.tusz_data_root,
+        label_mode=args.output_mode,
+        pipeline_cfg=pipeline_cfg,
+    )
+
+    if split_strategy == 'private_target':
+        private_all = ManifestSOZDataset(
+            source_filter='private',
+            **dataset_kwargs,
+        )
+        if len(private_all) == 0:
+            raise ValueError(
+                "split_strategy='private_target' requires private samples, but none were found"
+            )
+
+        patient_infos = _build_private_patient_infos(private_all)
+        patient_split = _split_private_patients(
+            patient_infos,
+            val_ratio=args.val_split,
+            test_ratio=args.test_split,
+            seed=args.seed,
+        )
+
+        train_parts: List[torch.utils.data.Dataset] = []
+        split_meta: Dict[str, object] = {
+            'strategy': 'private_target',
+            'private_patient_split': patient_split,
+            'log_lines': [],
+        }
+
+        if args.source == 'all':
+            tusz_train_manifest = ManifestSOZDataset(
+                source_filter='tusz',
+                **dataset_kwargs,
+            )
+            train_parts.append(
+                SOZBrainNetworkDataset(
+                    tusz_train_manifest,
+                    precomputed_dir=args.precomputed_dir,
+                )
+            )
+            tusz_summary = _summarize_manifest_subset(tusz_train_manifest)
+            split_meta['train_tusz_summary'] = tusz_summary
+            split_meta['log_lines'].append(_format_subset_summary('train/tusz_all', tusz_summary))
+
+        private_train_manifest = ManifestSOZDataset(
+            source_filter='private',
+            patient_ids=patient_split['train'],
+            **dataset_kwargs,
+        )
+        private_val_manifest = ManifestSOZDataset(
+            source_filter='private',
+            patient_ids=patient_split['val'],
+            **dataset_kwargs,
+        )
+        private_test_manifest = ManifestSOZDataset(
+            source_filter='private',
+            patient_ids=patient_split['test'],
+            **dataset_kwargs,
+        )
+
+        split_meta['train_private_summary'] = _summarize_manifest_subset(private_train_manifest)
+        split_meta['val_summary'] = _summarize_manifest_subset(private_val_manifest)
+        split_meta['test_summary'] = _summarize_manifest_subset(private_test_manifest)
+
+        train_parts.append(
+            SOZBrainNetworkDataset(
+                private_train_manifest,
+                precomputed_dir=args.precomputed_dir,
+            )
+        )
+        val_ds = SOZBrainNetworkDataset(
+            private_val_manifest,
+            precomputed_dir=args.precomputed_dir,
+        )
+        test_ds = SOZBrainNetworkDataset(
+            private_test_manifest,
+            precomputed_dir=args.precomputed_dir,
+        )
+
+        split_meta['log_lines'].append(
+            _format_subset_summary('train/private', split_meta['train_private_summary'])
+        )
+        split_meta['log_lines'].append(
+            f"train/private patients={patient_split['train']}"
+        )
+        split_meta['log_lines'].append(
+            _format_subset_summary('val/private', split_meta['val_summary'])
+        )
+        split_meta['log_lines'].append(
+            f"val/private patients={patient_split['val']}"
+        )
+        split_meta['log_lines'].append(
+            _format_subset_summary('test/private', split_meta['test_summary'])
+        )
+        split_meta['log_lines'].append(
+            f"test/private patients={patient_split['test']}"
+        )
+
+        if len(train_parts) == 1:
+            train_ds = train_parts[0]
+        else:
+            train_ds = ConcatDataset(train_parts)
+        return train_ds, val_ds, test_ds, split_meta
+
+    manifest_ds = ManifestSOZDataset(
+        source_filter=args.source,
+        **dataset_kwargs,
+    )
+    dataset = SOZBrainNetworkDataset(manifest_ds, precomputed_dir=args.precomputed_dir)
+    n = len(dataset)
+    n_test = int(n * args.test_split)
+    n_val = int(n * args.val_split)
+    n_train = n - n_val - n_test
+    train_ds, val_ds, test_ds = torch.utils.data.random_split(
+        dataset,
+        [n_train, n_val, n_test],
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+    split_meta = {
+        'strategy': 'random',
+        'log_lines': [
+            _format_subset_summary('all_sources', _summarize_manifest_subset(manifest_ds)),
+            f"random_split train={n_train} val={n_val} test={n_test}",
+        ],
+    }
+    return train_ds, val_ds, test_ds, split_meta
 
 
 # =====================================================================
@@ -180,6 +535,146 @@ def compute_patch_accuracy(
         return 0.0, 0
     correct = (preds[mask] == targets[mask]).float().mean().item()
     return float(correct), valid
+
+
+def count_trainable_parameters(model) -> Tuple[int, int]:
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return int(trainable), int(total)
+
+
+def compute_binary_metrics(
+    probs: np.ndarray,
+    targets: np.ndarray,
+    threshold: float = 0.5,
+) -> Dict[str, float]:
+    probs = np.asarray(probs, dtype=np.float64)
+    targets = np.asarray(targets, dtype=np.int64)
+    if probs.size == 0 or targets.size == 0:
+        return {
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+            'specificity': 0.0,
+            'balanced_acc': 0.0,
+            'auc': 0.0,
+            'tp': 0.0,
+            'fp': 0.0,
+            'tn': 0.0,
+            'fn': 0.0,
+        }
+
+    preds = (probs >= threshold).astype(np.int64)
+    tp = float(np.logical_and(preds == 1, targets == 1).sum())
+    fp = float(np.logical_and(preds == 1, targets == 0).sum())
+    tn = float(np.logical_and(preds == 0, targets == 0).sum())
+    fn = float(np.logical_and(preds == 0, targets == 1).sum())
+
+    precision = tp / max(tp + fp, 1.0)
+    recall = tp / max(tp + fn, 1.0)
+    specificity = tn / max(tn + fp, 1.0)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+    balanced_acc = 0.5 * (recall + specificity)
+
+    auc = 0.0
+    if roc_auc_score is not None and np.unique(targets).size > 1:
+        try:
+            auc = float(roc_auc_score(targets, probs))
+        except ValueError:
+            auc = 0.0
+
+    return {
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1': float(f1),
+        'specificity': float(specificity),
+        'balanced_acc': float(balanced_acc),
+        'auc': float(auc),
+        'tp': tp,
+        'fp': fp,
+        'tn': tn,
+        'fn': fn,
+    }
+
+
+def compute_binary_metrics_from_counts(
+    tp: float,
+    fp: float,
+    tn: float,
+    fn: float,
+) -> Dict[str, float]:
+    precision = tp / max(tp + fp, 1.0)
+    recall = tp / max(tp + fn, 1.0)
+    specificity = tn / max(tn + fp, 1.0)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+    balanced_acc = 0.5 * (recall + specificity)
+    return {
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1': float(f1),
+        'specificity': float(specificity),
+        'balanced_acc': float(balanced_acc),
+    }
+
+
+def estimate_stage_patch_statistics(
+    dataset: EEGStagePretrainDataset,
+    ignore_index: int = -100,
+) -> Dict[str, object]:
+    cfg = dataset.pipeline.cfg
+    pos = 0
+    neg = 0
+    ignored = 0
+
+    for sample in dataset.samples:
+        labels, _ = assign_patch_binary_labels(
+            seizure_start_sec=sample.seizure_start_sec,
+            seizure_end_sec=sample.seizure_end_sec,
+            window_start_sec=float(sample.center_sec - cfg.pre_onset_sec),
+            file_duration_sec=sample.duration_sec,
+            n_patches=cfg.n_patches,
+            patch_len=cfg.patch_len,
+            fs=cfg.target_fs,
+            ignore_index=ignore_index,
+        )
+        pos += int((labels == SEIZURE_LABEL).sum())
+        neg += int((labels == NON_SEIZURE_LABEL).sum())
+        ignored += int((labels == ignore_index).sum())
+
+    total = pos + neg
+    counts = np.array([neg, pos], dtype=np.float64)
+    if total > 0:
+        class_weight = counts.sum() / np.clip(counts, a_min=1.0, a_max=None)
+        class_weight = class_weight / class_weight.mean()
+    else:
+        class_weight = np.ones(2, dtype=np.float64)
+
+    return {
+        'valid_patches': int(total),
+        'positive_patches': int(pos),
+        'negative_patches': int(neg),
+        'ignored_patches': int(ignored),
+        'positive_rate': float(pos / total) if total > 0 else 0.0,
+        'class_weight': torch.tensor(class_weight, dtype=torch.float32),
+    }
+
+
+def stage_metric_value(metrics: Dict[str, float], metric_name: str) -> float:
+    if metric_name == 'loss':
+        return -float(metrics['loss'])
+    if metric_name == 'acc':
+        return float(metrics['patch_acc'])
+    if metric_name == 'auc':
+        return float(metrics['auc'])
+    if metric_name == 'recall':
+        return float(metrics['recall'])
+    return float(metrics['f1'])
+
+
+def stage_metric_display_value(metric_value: float, metric_name: str) -> float:
+    if metric_name == 'loss':
+        return -float(metric_value)
+    return float(metric_value)
 
 
 def compute_pos_weight(loader, device='cpu') -> torch.Tensor:
@@ -615,6 +1110,8 @@ def train_stage_one_epoch(
     device,
     epoch,
     writer=None,
+    show_progress: bool = False,
+    log_every: int = 20,
 ):
     model.train()
     base = model.module if hasattr(model, 'module') else model
@@ -624,8 +1121,23 @@ def train_stage_one_epoch(
     total_pos = 0
     n_batches = 0
     loss_sums: Dict[str, float] = {}
+    all_probs: List[np.ndarray] = []
+    all_targets: List[np.ndarray] = []
+    tp = 0.0
+    fp = 0.0
+    tn = 0.0
+    fn = 0.0
 
-    for batch in loader:
+    iterator = loader
+    if show_progress:
+        iterator = tqdm(
+            loader,
+            desc=f'stage-train {epoch + 1}',
+            leave=False,
+            dynamic_ncols=True,
+        )
+
+    for step, batch in enumerate(iterator, start=1):
         x = batch['x'].to(device)
         stage_labels = batch['stage_labels'].to(device)
         valid_patches = int((stage_labels != base.cfg.stage_ignore_index).sum().item())
@@ -653,17 +1165,60 @@ def train_stage_one_epoch(
             stage_labels,
             ignore_index=base.cfg.stage_ignore_index,
         )
+        valid_mask = stage_labels != base.cfg.stage_ignore_index
+        valid_probs = torch.softmax(outputs['stage_logits'].detach(), dim=-1)[..., 1][valid_mask]
+        valid_targets = stage_labels[valid_mask]
         total_correct += acc * n_valid
         total_valid += n_valid
         total_pos += int((stage_labels == 1).sum().item())
         total_loss += float(loss.detach().item())
         n_batches += 1
+        if valid_probs.numel() > 0:
+            all_probs.append(valid_probs.cpu().numpy())
+            all_targets.append(valid_targets.cpu().numpy())
+            valid_preds = (valid_probs >= 0.5).long()
+            tp += float(((valid_preds == 1) & (valid_targets == 1)).sum().item())
+            fp += float(((valid_preds == 1) & (valid_targets == 0)).sum().item())
+            tn += float(((valid_preds == 0) & (valid_targets == 0)).sum().item())
+            fn += float(((valid_preds == 0) & (valid_targets == 1)).sum().item())
         for name, value in losses.items():
             loss_sums[name] = loss_sums.get(name, 0.0) + float(value.detach().item())
+
+        running_loss = total_loss / max(n_batches, 1)
+        running_acc = total_correct / max(total_valid, 1)
+        running_pos = total_pos / max(total_valid, 1)
+        running_binary = compute_binary_metrics_from_counts(tp, fp, tn, fn)
+        running_f1 = running_binary['f1']
+        running_recall = running_binary['recall']
+        if show_progress:
+            iterator.set_postfix(
+                loss=f'{running_loss:.4f}',
+                acc=f'{running_acc:.3f}',
+                rec=f'{running_recall:.3f}',
+                f1=f'{running_f1:.3f}',
+                pos=f'{running_pos:.3f}',
+            )
+        if log_every > 0 and (step == 1 or step % log_every == 0):
+            log.info(
+                "  [stage train] epoch=%d step=%d/%d loss=%.4f acc=%.3f rec=%.3f f1=%.3f pos=%.3f valid_patches=%d",
+                epoch + 1,
+                step,
+                len(loader),
+                running_loss,
+                running_acc,
+                running_recall,
+                running_f1,
+                running_pos,
+                total_valid,
+            )
 
     avg_loss = total_loss / max(n_batches, 1)
     patch_acc = total_correct / max(total_valid, 1)
     pos_rate = total_pos / max(total_valid, 1)
+    binary_metrics = compute_binary_metrics(
+        np.concatenate(all_probs, axis=0) if all_probs else np.array([], dtype=np.float64),
+        np.concatenate(all_targets, axis=0) if all_targets else np.array([], dtype=np.int64),
+    )
     avg_losses = {
         f"loss_{name}": value / max(n_batches, 1)
         for name, value in loss_sums.items()
@@ -673,6 +1228,11 @@ def train_stage_one_epoch(
         writer.add_scalar('train/loss', avg_loss, epoch)
         writer.add_scalar('train/patch_acc', patch_acc, epoch)
         writer.add_scalar('train/positive_rate', pos_rate, epoch)
+        writer.add_scalar('train/precision', binary_metrics['precision'], epoch)
+        writer.add_scalar('train/recall', binary_metrics['recall'], epoch)
+        writer.add_scalar('train/f1', binary_metrics['f1'], epoch)
+        writer.add_scalar('train/balanced_acc', binary_metrics['balanced_acc'], epoch)
+        writer.add_scalar('train/auc', binary_metrics['auc'], epoch)
         for name, value in avg_losses.items():
             writer.add_scalar(f'train/{name}', value, epoch)
 
@@ -680,12 +1240,19 @@ def train_stage_one_epoch(
         'loss': avg_loss,
         'patch_acc': patch_acc,
         'positive_rate': pos_rate,
+        **binary_metrics,
         **avg_losses,
     }
 
 
 @torch.no_grad()
-def evaluate_stage(model, loader, device):
+def evaluate_stage(
+    model,
+    loader,
+    device,
+    show_progress: bool = False,
+    log_every: int = 20,
+):
     model.eval()
     base = model.module if hasattr(model, 'module') else model
     total_loss = 0.0
@@ -694,8 +1261,23 @@ def evaluate_stage(model, loader, device):
     total_pos = 0
     n_batches = 0
     loss_sums: Dict[str, float] = {}
+    all_probs: List[np.ndarray] = []
+    all_targets: List[np.ndarray] = []
+    tp = 0.0
+    fp = 0.0
+    tn = 0.0
+    fn = 0.0
 
-    for batch in loader:
+    iterator = loader
+    if show_progress:
+        iterator = tqdm(
+            loader,
+            desc='stage-val',
+            leave=False,
+            dynamic_ncols=True,
+        )
+
+    for step, batch in enumerate(iterator, start=1):
         x = batch['x'].to(device)
         stage_labels = batch['stage_labels'].to(device)
         valid_patches = int((stage_labels != base.cfg.stage_ignore_index).sum().item())
@@ -709,17 +1291,56 @@ def evaluate_stage(model, loader, device):
             stage_labels,
             ignore_index=base.cfg.stage_ignore_index,
         )
+        valid_mask = stage_labels != base.cfg.stage_ignore_index
+        valid_probs = torch.softmax(outputs['stage_logits'], dim=-1)[..., 1][valid_mask]
+        valid_targets = stage_labels[valid_mask]
         total_correct += acc * n_valid
         total_valid += n_valid
         total_pos += int((stage_labels == 1).sum().item())
         total_loss += float(loss.detach().item())
         n_batches += 1
+        if valid_probs.numel() > 0:
+            all_probs.append(valid_probs.cpu().numpy())
+            all_targets.append(valid_targets.cpu().numpy())
+            valid_preds = (valid_probs >= 0.5).long()
+            tp += float(((valid_preds == 1) & (valid_targets == 1)).sum().item())
+            fp += float(((valid_preds == 1) & (valid_targets == 0)).sum().item())
+            tn += float(((valid_preds == 0) & (valid_targets == 0)).sum().item())
+            fn += float(((valid_preds == 0) & (valid_targets == 1)).sum().item())
         for name, value in losses.items():
             loss_sums[name] = loss_sums.get(name, 0.0) + float(value.detach().item())
+
+        running_binary = compute_binary_metrics_from_counts(tp, fp, tn, fn)
+        running_f1 = running_binary['f1']
+        running_recall = running_binary['recall']
+        if hasattr(iterator, 'set_postfix'):
+            iterator.set_postfix(
+                loss=f'{total_loss / max(n_batches, 1):.4f}',
+                acc=f'{total_correct / max(total_valid, 1):.3f}',
+                rec=f'{running_recall:.3f}',
+                f1=f'{running_f1:.3f}',
+                pos=f'{total_pos / max(total_valid, 1):.3f}',
+            )
+        if log_every > 0 and (step == 1 or step % log_every == 0):
+            log.info(
+                "  [stage val] step=%d/%d loss=%.4f acc=%.3f rec=%.3f f1=%.3f pos=%.3f valid_patches=%d",
+                step,
+                len(loader),
+                total_loss / max(n_batches, 1),
+                total_correct / max(total_valid, 1),
+                running_recall,
+                running_f1,
+                total_pos / max(total_valid, 1),
+                total_valid,
+            )
 
     avg_loss = total_loss / max(n_batches, 1)
     patch_acc = total_correct / max(total_valid, 1)
     pos_rate = total_pos / max(total_valid, 1)
+    binary_metrics = compute_binary_metrics(
+        np.concatenate(all_probs, axis=0) if all_probs else np.array([], dtype=np.float64),
+        np.concatenate(all_targets, axis=0) if all_targets else np.array([], dtype=np.int64),
+    )
     avg_losses = {
         f"loss_{name}": value / max(n_batches, 1)
         for name, value in loss_sums.items()
@@ -728,6 +1349,7 @@ def evaluate_stage(model, loader, device):
         'loss': avg_loss,
         'patch_acc': patch_acc,
         'positive_rate': pos_rate,
+        **binary_metrics,
         **avg_losses,
     }
 
@@ -798,6 +1420,29 @@ def run_stage_pretraining(
     val_meta = summarize_stage_dataset(val_ds)
     log.info("  Stage train windows: %s", train_meta)
     log.info("  Stage val windows: %s", val_meta)
+    train_patch_stats = estimate_stage_patch_statistics(
+        train_ds,
+        ignore_index=-100,
+    )
+    val_patch_stats = estimate_stage_patch_statistics(
+        val_ds,
+        ignore_index=-100,
+    )
+    log.info(
+        "  Stage patch stats(train): valid=%d pos=%d neg=%d pos_rate=%.3f class_weight=%s",
+        train_patch_stats['valid_patches'],
+        train_patch_stats['positive_patches'],
+        train_patch_stats['negative_patches'],
+        train_patch_stats['positive_rate'],
+        [round(float(x), 4) for x in train_patch_stats['class_weight'].tolist()],
+    )
+    log.info(
+        "  Stage patch stats(val): valid=%d pos=%d neg=%d pos_rate=%.3f",
+        val_patch_stats['valid_patches'],
+        val_patch_stats['positive_patches'],
+        val_patch_stats['negative_patches'],
+        val_patch_stats['positive_rate'],
+    )
 
     if len(train_ds) == 0 or len(val_ds) == 0:
         log.warning("  Stage pretraining skipped because train/val windows are empty.")
@@ -824,6 +1469,13 @@ def run_stage_pretraining(
         collate_fn=stage_collate_fn,
         pin_memory=True,
     )
+    log.info(
+        "  Stage loaders ready: train_batches=%d val_batches=%d batch_size=%d workers=%d",
+        len(train_loader),
+        len(val_loader),
+        args.batch_size,
+        args.workers,
+    )
 
     cfg = IntegrationConfig(
         task_mode='stage_pretrain',
@@ -836,11 +1488,25 @@ def run_stage_pretraining(
         output_mode=args.output_mode,
         w_region=args.w_region,
         w_hemisphere=args.w_hemisphere,
+        n_frozen_layers=0,
     )
     model = TimeFilter_LaBraM_BrainNetwork_Integration(cfg).to(device)
+    base_model = model
+    base_model.configure_stage_pretraining(train_backbone=args.stage_train_backbone)
+    if args.stage_use_class_weight:
+        class_weight = train_patch_stats['class_weight'].to(device)
+        base_model.set_stage_class_weight(class_weight)
+    trainable_params, total_params = count_trainable_parameters(base_model)
+    log.info(
+        "  Stage param setup: train_backbone=%s use_class_weight=%s trainable params=%d/%d",
+        args.stage_train_backbone,
+        args.stage_use_class_weight,
+        trainable_params,
+        total_params,
+    )
     if world > 1:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-    base_model = model.module if hasattr(model, 'module') else model
+        base_model = model.module
 
     optimizer = torch.optim.AdamW(
         base_model.get_param_groups(args.stage_lr),
@@ -853,51 +1519,127 @@ def run_stage_pretraining(
     scaler = torch.amp.GradScaler('cuda') if args.amp else None
     writer = SummaryWriter(str(output_dir / 'tb_stage_pretrain')) if (_HAS_TB and is_main(rank)) else None
 
-    best_patch_acc = -1.0
+    best_metric = float('-inf')
+    best_epoch = -1
+    patience_counter = 0
     best_path = output_dir / 'best_pretrain_ckpt.pth'
 
     for epoch in range(args.stage_epochs):
+        if is_main(rank):
+            log.info("  [stage] starting epoch %03d/%03d", epoch + 1, args.stage_epochs)
         if world > 1:
             train_sampler.set_epoch(epoch)
 
         train_metrics = train_stage_one_epoch(
-            model, train_loader, optimizer, scaler, device, epoch, writer,
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            device,
+            epoch,
+            writer,
+            show_progress=is_main(rank),
+            log_every=args.stage_log_every,
         )
-        val_metrics = evaluate_stage(model, val_loader, device)
+        val_metrics = evaluate_stage(
+            model,
+            val_loader,
+            device,
+            show_progress=is_main(rank),
+            log_every=args.stage_log_every,
+        )
         scheduler.step()
+
+        current_metric = stage_metric_value(val_metrics, args.stage_selection_metric)
+        best_metric_for_log = stage_metric_display_value(best_metric, args.stage_selection_metric)
+        improved = current_metric > best_metric + 1e-6
+        if improved:
+            best_metric = current_metric
+            best_epoch = epoch
+            patience_counter = 0
+            best_metric_for_log = stage_metric_display_value(best_metric, args.stage_selection_metric)
+        else:
+            patience_counter += 1
 
         if is_main(rank):
             log.info(
-                "  [stage] epoch %03d/%03d train_loss=%.4f train_acc=%.3f "
-                "val_loss=%.4f val_acc=%.3f val_pos=%.3f",
+                "  [stage] epoch %03d/%03d "
+                "train_loss=%.4f train_acc=%.3f train_rec=%.3f train_f1=%.3f train_auc=%.3f "
+                "val_loss=%.4f val_acc=%.3f val_rec=%.3f val_f1=%.3f val_auc=%.3f val_pos=%.3f",
                 epoch + 1,
                 args.stage_epochs,
                 train_metrics['loss'],
                 train_metrics['patch_acc'],
+                train_metrics['recall'],
+                train_metrics['f1'],
+                train_metrics['auc'],
                 val_metrics['loss'],
                 val_metrics['patch_acc'],
+                val_metrics['recall'],
+                val_metrics['f1'],
+                val_metrics['auc'],
                 val_metrics['positive_rate'],
             )
             if writer:
                 writer.add_scalar('val/loss', val_metrics['loss'], epoch)
                 writer.add_scalar('val/patch_acc', val_metrics['patch_acc'], epoch)
                 writer.add_scalar('val/positive_rate', val_metrics['positive_rate'], epoch)
+                writer.add_scalar('val/precision', val_metrics['precision'], epoch)
+                writer.add_scalar('val/recall', val_metrics['recall'], epoch)
+                writer.add_scalar('val/f1', val_metrics['f1'], epoch)
+                writer.add_scalar('val/balanced_acc', val_metrics['balanced_acc'], epoch)
+                writer.add_scalar('val/auc', val_metrics['auc'], epoch)
                 for key in ('loss_stage', 'loss_moe', 'loss_total'):
                     if key in val_metrics:
                         writer.add_scalar(f'val/{key}', val_metrics[key], epoch)
                 writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
 
-            if val_metrics['patch_acc'] >= best_patch_acc:
-                best_patch_acc = val_metrics['patch_acc']
+            if improved:
                 base_model.save_checkpoint(
                     str(best_path),
                     extra={
                         'epoch': epoch,
-                        'best_patch_acc': best_patch_acc,
+                        'best_stage_metric': best_metric,
+                        'best_stage_metric_name': args.stage_selection_metric,
                         'stage_metrics': val_metrics,
                     },
                 )
+                log.info(
+                    "  [stage] new best %s=%.4f at epoch %03d -> %s",
+                    args.stage_selection_metric,
+                    best_metric_for_log,
+                    epoch + 1,
+                    best_path,
+                )
+            else:
+                log.info(
+                    "  [stage] no improvement in %s for %d epoch(s) "
+                    "(best=%.4f @ epoch %03d)",
+                    args.stage_selection_metric,
+                    patience_counter,
+                    best_metric_for_log,
+                    best_epoch + 1 if best_epoch >= 0 else 0,
+                )
+        if args.stage_early_stop_patience > 0 and patience_counter >= args.stage_early_stop_patience:
+            if is_main(rank):
+                log.info(
+                    "  [stage] early stopping triggered at epoch %03d "
+                    "(patience=%d, best_%s=%.4f @ epoch %03d)",
+                    epoch + 1,
+                    args.stage_early_stop_patience,
+                    args.stage_selection_metric,
+                    best_metric_for_log,
+                    best_epoch + 1 if best_epoch >= 0 else 0,
+                )
+            break
 
+    if is_main(rank):
+        log.info(
+            "  [stage] finished with best_%s=%.4f at epoch %03d",
+            args.stage_selection_metric,
+            stage_metric_display_value(best_metric, args.stage_selection_metric),
+            best_epoch + 1 if best_epoch >= 0 else 0,
+        )
     if writer:
         writer.close()
     if torch.cuda.is_available():
@@ -971,6 +1713,16 @@ def parse_args():
     p.add_argument('--private-data-root', default='', help='preprocessed data root')
     p.add_argument('--tusz-data-root', default='', help='TUSZ EDF root')
     p.add_argument('--source', default='all', choices=['tusz', 'private', 'all'])
+    p.add_argument(
+        '--split-strategy',
+        default='auto',
+        choices=['auto', 'random', 'private_target'],
+        help=(
+            "Dataset split strategy for SOZ finetuning: "
+            "auto=use private patient-wise split when source is all/private, "
+            "otherwise random"
+        ),
+    )
 
     # model
     p.add_argument('--labram-ckpt', default='', help='LaBraM pretrained weights')
@@ -995,6 +1747,27 @@ def parse_args():
                    help='Epochs for binary stage pretraining')
     p.add_argument('--stage-lr', type=float, default=1e-4,
                    help='Learning rate for stage pretraining')
+    p.add_argument('--stage-log-every', type=int, default=20,
+                   help='Log every N steps during stage pretraining')
+    p.add_argument('--stage-early-stop-patience', type=int, default=6,
+                   help='Early-stop patience for stage pretraining (0 disables)')
+    p.add_argument('--stage-selection-metric', default='f1',
+                   choices=['f1', 'recall', 'auc', 'acc', 'loss'],
+                   help='Validation metric used to save best stage checkpoint and early stop')
+    p.add_argument('--stage-train-backbone', dest='stage_train_backbone',
+                   action='store_true',
+                   help='Train the full LaBraM backbone during stage pretraining')
+    p.add_argument('--no-stage-train-backbone', dest='stage_train_backbone',
+                   action='store_false',
+                   help='Freeze LaBraM backbone and train only TimeFilter + stage head')
+    p.set_defaults(stage_train_backbone=True)
+    p.add_argument('--stage-use-class-weight', dest='stage_use_class_weight',
+                   action='store_true',
+                   help='Use inverse-frequency class weights for stage CrossEntropy')
+    p.add_argument('--no-stage-use-class-weight', dest='stage_use_class_weight',
+                   action='store_false',
+                   help='Disable class weighting for stage CrossEntropy')
+    p.set_defaults(stage_use_class_weight=True)
 
     # Sequence length configurations
     p.add_argument('--pre-onset-sec', type=float, default=5.0, help='Seconds before onset to extract')
@@ -1087,28 +1860,24 @@ def main():
         patch_len=patch_len
     )
     
-    manifest_ds = ManifestSOZDataset(
-        manifest_path=args.manifest,
-        private_data_root=args.private_data_root,
-        tusz_data_root=args.tusz_data_root,
-        source_filter=args.source,
-        label_mode=args.output_mode,
+    if args.source in ('all', 'private') and not args.private_data_root:
+        log.warning(
+            "  --private-data-root is empty while private samples are enabled; "
+            "private EDF relative paths may fail to resolve."
+        )
+
+    train_ds, val_ds, test_ds, split_meta = build_soz_datasets(
+        args=args,
         pipeline_cfg=pipeline_cfg,
     )
-    log.info(f"  Manifest loaded: {len(manifest_ds)} samples")
+    log.info("  SOZ split strategy: %s", split_meta['strategy'])
+    for line in split_meta.get('log_lines', []):
+        log.info("  %s", line)
 
-    dataset = SOZBrainNetworkDataset(manifest_ds, precomputed_dir=args.precomputed_dir)
-
-    # split (simple random; for LOPO use external loop)
-    n = len(dataset)
-    n_test = int(n * args.test_split)
-    n_val = int(n * args.val_split)
-    n_train = n - n_val - n_test
-    train_ds, val_ds, test_ds = torch.utils.data.random_split(
-        dataset, [n_train, n_val, n_test],
-        generator=torch.Generator().manual_seed(args.seed),
-    )
-    log.info(f"  Split: train={n_train}, val={n_val}, test={n_test}")
+    n_train = len(train_ds)
+    n_val = len(val_ds)
+    n_test = len(test_ds)
+    log.info("  Final dataset sizes: train=%d, val=%d, test=%d", n_train, n_val, n_test)
 
     # check sample size
     if n_train < 50:

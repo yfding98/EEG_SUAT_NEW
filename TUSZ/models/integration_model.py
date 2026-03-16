@@ -443,6 +443,32 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             pos_weight=pos_weight,
         )
 
+    def set_stage_class_weight(self, class_weight: torch.Tensor):
+        """Set class weights for stage-pretraining CrossEntropy loss."""
+        self.stage_ce = nn.CrossEntropyLoss(
+            weight=class_weight,
+            reduction='mean',
+            ignore_index=self.cfg.stage_ignore_index,
+        )
+
+    def configure_stage_pretraining(self, train_backbone: bool = True):
+        """
+        Enable only the modules used in stage pretraining.
+
+        This keeps branch-B parameters frozen so the optimizer only updates
+        LaBraM, TimeFilter, and the patch-level stage head.
+        """
+        for p in self.parameters():
+            p.requires_grad = False
+
+        if train_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = True
+        for p in self.timefilter.parameters():
+            p.requires_grad = True
+        for p in self.stage_head.parameters():
+            p.requires_grad = True
+
     # -----------------------------------------------------------------
     # forward
     # -----------------------------------------------------------------
