@@ -39,6 +39,12 @@ log = logging.getLogger(__name__)
 NON_SEIZURE_LABEL = 0
 SEIZURE_LABEL = 1
 STAGE_IGNORE_INDEX = -100
+LOAD_STATUS_OK = 'ok'
+LOAD_STATUS_WINDOW_NONE = 'window_none'
+LOAD_STATUS_BAD_WINDOW = 'bad_window'
+LOAD_STATUS_INSUFFICIENT_CHANNELS = 'insufficient_channels'
+LOAD_STATUS_NO_VALID_PATCH = 'no_valid_patch'
+LOAD_STATUS_EXCEPTION = 'exception'
 _STAGE_MANIFEST_COLS = [
     'source',
     'split',
@@ -193,6 +199,15 @@ def stage_collate_fn(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
         'patient_id': [item['patient_id'] for item in batch],
         'edf_path': [item['edf_path'] for item in batch],
         'sample_role': [item['sample_role'] for item in batch],
+        'load_status': [item['load_status'] for item in batch],
+        'stage_valid_count': torch.tensor(
+            [item['stage_valid_count'] for item in batch],
+            dtype=torch.long,
+        ),
+        'channel_valid_count': torch.tensor(
+            [item['channel_valid_count'] for item in batch],
+            dtype=torch.long,
+        ),
         'window_start_sec': torch.tensor([item['window_start_sec'] for item in batch], dtype=torch.float32),
         'sample_center_sec': torch.tensor([item['sample_center_sec'] for item in batch], dtype=torch.float32),
         'seizure_start_sec': torch.tensor([item['seizure_start_sec'] for item in batch], dtype=torch.float32),
@@ -345,7 +360,7 @@ class EEGStagePretrainDataset(Dataset):
             return str(Path(self.tusz_data_root) / sample.edf_path)
         return sample.edf_path
 
-    def _empty_item(self, sample: StageSample, window_start_sec: float) -> Dict[str, object]:
+    def _empty_item(self, sample: StageSample, window_start_sec: float, load_status: str) -> Dict[str, object]:
         return {
             'x': self.zero_x.clone(),
             'channel_mask': self.zero_channel_mask.clone(),
@@ -354,6 +369,9 @@ class EEGStagePretrainDataset(Dataset):
             'patient_id': sample.patient_id,
             'edf_path': sample.edf_path,
             'sample_role': sample.role,
+            'load_status': load_status,
+            'stage_valid_count': 0,
+            'channel_valid_count': 0,
             'window_start_sec': float(window_start_sec),
             'sample_center_sec': float(sample.center_sec),
             'seizure_start_sec': float(sample.seizure_start_sec),
@@ -370,14 +388,14 @@ class EEGStagePretrainDataset(Dataset):
             data_21, fs = self.pipeline.load_edf(self._resolve_edf_path(sample), onset=sample.center_sec)
             window = self.pipeline.extract_window(data_21, fs, sample.center_sec)
             if window is None:
-                return self._empty_item(sample, window_start_sec)
+                return self._empty_item(sample, window_start_sec, LOAD_STATUS_WINDOW_NONE)
             if self.pipeline.is_bad_window(window, fs):
-                return self._empty_item(sample, window_start_sec)
+                return self._empty_item(sample, window_start_sec, LOAD_STATUS_BAD_WINDOW)
 
             clipped = self.pipeline.clip_by_baseline(window, baseline_n)
             bipolar, channel_mask = self.pipeline.to_tcp_bipolar(clipped)
             if int(channel_mask.sum()) < cfg.min_valid_channels:
-                return self._empty_item(sample, window_start_sec)
+                return self._empty_item(sample, window_start_sec, LOAD_STATUS_INSUFFICIENT_CHANNELS)
 
             bipolar = self.pipeline.normalize_by_baseline(bipolar, baseline_n)
             stage_labels, valid_patch_mask = assign_patch_binary_labels(
@@ -390,6 +408,10 @@ class EEGStagePretrainDataset(Dataset):
                 fs=cfg.target_fs,
                 ignore_index=self.ignore_index,
             )
+            stage_valid_count = int(valid_patch_mask.sum())
+            channel_valid_count = int(channel_mask.sum())
+            if stage_valid_count <= 0:
+                return self._empty_item(sample, window_start_sec, LOAD_STATUS_NO_VALID_PATCH)
 
             return {
                 'x': torch.from_numpy(bipolar.astype(np.float32)),
@@ -399,6 +421,9 @@ class EEGStagePretrainDataset(Dataset):
                 'patient_id': sample.patient_id,
                 'edf_path': sample.edf_path,
                 'sample_role': sample.role,
+                'load_status': LOAD_STATUS_OK,
+                'stage_valid_count': stage_valid_count,
+                'channel_valid_count': channel_valid_count,
                 'window_start_sec': float(window_start_sec),
                 'sample_center_sec': float(sample.center_sec),
                 'seizure_start_sec': float(sample.seizure_start_sec),
@@ -406,7 +431,7 @@ class EEGStagePretrainDataset(Dataset):
             }
         except Exception as exc:
             log.warning("Stage window failed for %s (%s): %s", sample.edf_path, sample.role, exc)
-            return self._empty_item(sample, window_start_sec)
+            return self._empty_item(sample, window_start_sec, LOAD_STATUS_EXCEPTION)
 
 
 def summarize_stage_dataset(dataset: EEGStagePretrainDataset) -> Dict[str, object]:

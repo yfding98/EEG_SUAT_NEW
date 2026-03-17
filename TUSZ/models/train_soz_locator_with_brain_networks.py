@@ -677,6 +677,13 @@ def stage_metric_display_value(metric_value: float, metric_name: str) -> float:
     return float(metric_value)
 
 
+def summarize_status_counts(status_counts: Dict[str, int], top_k: int = 6) -> str:
+    if not status_counts:
+        return 'none'
+    counter = Counter({str(k): int(v) for k, v in status_counts.items()})
+    return ', '.join(f'{key}:{value}' for key, value in counter.most_common(top_k))
+
+
 def compute_pos_weight(loader, device='cpu') -> torch.Tensor:
     """Compute pos_weight = n_neg / n_pos per channel from the full dataset."""
     pos_sum = None
@@ -1127,6 +1134,10 @@ def train_stage_one_epoch(
     fp = 0.0
     tn = 0.0
     fn = 0.0
+    seen_windows = 0
+    effective_windows = 0
+    skipped_windows = 0
+    status_counts: Counter = Counter()
 
     iterator = loader
     if show_progress:
@@ -1140,6 +1151,22 @@ def train_stage_one_epoch(
     for step, batch in enumerate(iterator, start=1):
         x = batch['x'].to(device)
         stage_labels = batch['stage_labels'].to(device)
+        load_status = [str(s) for s in batch.get('load_status', [])]
+        stage_valid_count = batch.get('stage_valid_count', None)
+        if stage_valid_count is not None:
+            batch_valid_counts = stage_valid_count.cpu()
+            effective_step_windows = int((batch_valid_counts > 0).sum().item())
+            skipped_step_windows = int((batch_valid_counts <= 0).sum().item())
+        else:
+            batch_valid_counts = (stage_labels != base.cfg.stage_ignore_index).sum(dim=1).cpu()
+            effective_step_windows = int((batch_valid_counts > 0).sum().item())
+            skipped_step_windows = int((batch_valid_counts <= 0).sum().item())
+        seen_windows += len(load_status) if load_status else int(stage_labels.size(0))
+        effective_windows += effective_step_windows
+        skipped_windows += skipped_step_windows
+        if load_status:
+            status_counts.update(load_status)
+
         valid_patches = int((stage_labels != base.cfg.stage_ignore_index).sum().item())
         if valid_patches == 0:
             continue
@@ -1190,17 +1217,20 @@ def train_stage_one_epoch(
         running_binary = compute_binary_metrics_from_counts(tp, fp, tn, fn)
         running_f1 = running_binary['f1']
         running_recall = running_binary['recall']
+        running_skip_rate = skipped_windows / max(seen_windows, 1)
         if show_progress:
             iterator.set_postfix(
                 loss=f'{running_loss:.4f}',
                 acc=f'{running_acc:.3f}',
                 rec=f'{running_recall:.3f}',
                 f1=f'{running_f1:.3f}',
+                skip=f'{running_skip_rate:.2%}',
                 pos=f'{running_pos:.3f}',
             )
         if log_every > 0 and (step == 1 or step % log_every == 0):
             log.info(
-                "  [stage train] epoch=%d step=%d/%d loss=%.4f acc=%.3f rec=%.3f f1=%.3f pos=%.3f valid_patches=%d",
+                "  [stage train] epoch=%d step=%d/%d loss=%.4f acc=%.3f rec=%.3f f1=%.3f "
+                "pos=%.3f valid_patches=%d seen=%d effective=%d skipped=%d status=%s",
                 epoch + 1,
                 step,
                 len(loader),
@@ -1210,6 +1240,10 @@ def train_stage_one_epoch(
                 running_f1,
                 running_pos,
                 total_valid,
+                seen_windows,
+                effective_windows,
+                skipped_windows,
+                summarize_status_counts(status_counts),
             )
 
     avg_loss = total_loss / max(n_batches, 1)
@@ -1233,6 +1267,16 @@ def train_stage_one_epoch(
         writer.add_scalar('train/f1', binary_metrics['f1'], epoch)
         writer.add_scalar('train/balanced_acc', binary_metrics['balanced_acc'], epoch)
         writer.add_scalar('train/auc', binary_metrics['auc'], epoch)
+        writer.add_scalar('train/valid_patches', total_valid, epoch)
+        writer.add_scalar('train/seen_windows', seen_windows, epoch)
+        writer.add_scalar('train/effective_windows', effective_windows, epoch)
+        writer.add_scalar('train/skipped_windows', skipped_windows, epoch)
+        writer.add_scalar('train/skip_rate', skipped_windows / max(seen_windows, 1), epoch)
+        writer.add_scalar(
+            'train/mean_valid_patches_per_effective_window',
+            total_valid / max(effective_windows, 1),
+            epoch,
+        )
         for name, value in avg_losses.items():
             writer.add_scalar(f'train/{name}', value, epoch)
 
@@ -1240,6 +1284,13 @@ def train_stage_one_epoch(
         'loss': avg_loss,
         'patch_acc': patch_acc,
         'positive_rate': pos_rate,
+        'valid_patches': int(total_valid),
+        'seen_windows': int(seen_windows),
+        'effective_windows': int(effective_windows),
+        'skipped_windows': int(skipped_windows),
+        'skip_rate': float(skipped_windows / max(seen_windows, 1)),
+        'mean_valid_patches_per_effective_window': float(total_valid / max(effective_windows, 1)),
+        'load_status_counts': dict(status_counts),
         **binary_metrics,
         **avg_losses,
     }
@@ -1267,6 +1318,10 @@ def evaluate_stage(
     fp = 0.0
     tn = 0.0
     fn = 0.0
+    seen_windows = 0
+    effective_windows = 0
+    skipped_windows = 0
+    status_counts: Counter = Counter()
 
     iterator = loader
     if show_progress:
@@ -1280,6 +1335,22 @@ def evaluate_stage(
     for step, batch in enumerate(iterator, start=1):
         x = batch['x'].to(device)
         stage_labels = batch['stage_labels'].to(device)
+        load_status = [str(s) for s in batch.get('load_status', [])]
+        stage_valid_count = batch.get('stage_valid_count', None)
+        if stage_valid_count is not None:
+            batch_valid_counts = stage_valid_count.cpu()
+            effective_step_windows = int((batch_valid_counts > 0).sum().item())
+            skipped_step_windows = int((batch_valid_counts <= 0).sum().item())
+        else:
+            batch_valid_counts = (stage_labels != base.cfg.stage_ignore_index).sum(dim=1).cpu()
+            effective_step_windows = int((batch_valid_counts > 0).sum().item())
+            skipped_step_windows = int((batch_valid_counts <= 0).sum().item())
+        seen_windows += len(load_status) if load_status else int(stage_labels.size(0))
+        effective_windows += effective_step_windows
+        skipped_windows += skipped_step_windows
+        if load_status:
+            status_counts.update(load_status)
+
         valid_patches = int((stage_labels != base.cfg.stage_ignore_index).sum().item())
         if valid_patches == 0:
             continue
@@ -1319,11 +1390,13 @@ def evaluate_stage(
                 acc=f'{total_correct / max(total_valid, 1):.3f}',
                 rec=f'{running_recall:.3f}',
                 f1=f'{running_f1:.3f}',
+                skip=f'{skipped_windows / max(seen_windows, 1):.2%}',
                 pos=f'{total_pos / max(total_valid, 1):.3f}',
             )
         if log_every > 0 and (step == 1 or step % log_every == 0):
             log.info(
-                "  [stage val] step=%d/%d loss=%.4f acc=%.3f rec=%.3f f1=%.3f pos=%.3f valid_patches=%d",
+                "  [stage val] step=%d/%d loss=%.4f acc=%.3f rec=%.3f f1=%.3f "
+                "pos=%.3f valid_patches=%d seen=%d effective=%d skipped=%d status=%s",
                 step,
                 len(loader),
                 total_loss / max(n_batches, 1),
@@ -1332,6 +1405,10 @@ def evaluate_stage(
                 running_f1,
                 total_pos / max(total_valid, 1),
                 total_valid,
+                seen_windows,
+                effective_windows,
+                skipped_windows,
+                summarize_status_counts(status_counts),
             )
 
     avg_loss = total_loss / max(n_batches, 1)
@@ -1349,6 +1426,13 @@ def evaluate_stage(
         'loss': avg_loss,
         'patch_acc': patch_acc,
         'positive_rate': pos_rate,
+        'valid_patches': int(total_valid),
+        'seen_windows': int(seen_windows),
+        'effective_windows': int(effective_windows),
+        'skipped_windows': int(skipped_windows),
+        'skip_rate': float(skipped_windows / max(seen_windows, 1)),
+        'mean_valid_patches_per_effective_window': float(total_valid / max(effective_windows, 1)),
+        'load_status_counts': dict(status_counts),
         **binary_metrics,
         **avg_losses,
     }
@@ -1562,6 +1646,8 @@ def run_stage_pretraining(
             patience_counter += 1
 
         if is_main(rank):
+            train_coverage = train_metrics['valid_patches'] / max(train_patch_stats['valid_patches'], 1)
+            val_coverage = val_metrics['valid_patches'] / max(val_patch_stats['valid_patches'], 1)
             log.info(
                 "  [stage] epoch %03d/%03d "
                 "train_loss=%.4f train_acc=%.3f train_rec=%.3f train_f1=%.3f train_auc=%.3f "
@@ -1580,6 +1666,35 @@ def run_stage_pretraining(
                 val_metrics['auc'],
                 val_metrics['positive_rate'],
             )
+            log.info(
+                "  [stage data] train_valid=%d/%d coverage=%.3f effective=%d/%d skip_rate=%.3f "
+                "status=%s",
+                train_metrics['valid_patches'],
+                train_patch_stats['valid_patches'],
+                train_coverage,
+                train_metrics['effective_windows'],
+                train_metrics['seen_windows'],
+                train_metrics['skip_rate'],
+                summarize_status_counts(train_metrics['load_status_counts']),
+            )
+            log.info(
+                "  [stage data] val_valid=%d/%d coverage=%.3f effective=%d/%d skip_rate=%.3f "
+                "status=%s",
+                val_metrics['valid_patches'],
+                val_patch_stats['valid_patches'],
+                val_coverage,
+                val_metrics['effective_windows'],
+                val_metrics['seen_windows'],
+                val_metrics['skip_rate'],
+                summarize_status_counts(val_metrics['load_status_counts']),
+            )
+            if train_coverage < 0.8 or val_coverage < 0.8:
+                log.warning(
+                    "  [stage data] low valid-patch coverage detected "
+                    "(train=%.3f, val=%.3f); many windows may be failing in __getitem__",
+                    train_coverage,
+                    val_coverage,
+                )
             if writer:
                 writer.add_scalar('val/loss', val_metrics['loss'], epoch)
                 writer.add_scalar('val/patch_acc', val_metrics['patch_acc'], epoch)
@@ -1589,6 +1704,18 @@ def run_stage_pretraining(
                 writer.add_scalar('val/f1', val_metrics['f1'], epoch)
                 writer.add_scalar('val/balanced_acc', val_metrics['balanced_acc'], epoch)
                 writer.add_scalar('val/auc', val_metrics['auc'], epoch)
+                writer.add_scalar('val/valid_patches', val_metrics['valid_patches'], epoch)
+                writer.add_scalar('val/seen_windows', val_metrics['seen_windows'], epoch)
+                writer.add_scalar('val/effective_windows', val_metrics['effective_windows'], epoch)
+                writer.add_scalar('val/skipped_windows', val_metrics['skipped_windows'], epoch)
+                writer.add_scalar('val/skip_rate', val_metrics['skip_rate'], epoch)
+                writer.add_scalar(
+                    'val/mean_valid_patches_per_effective_window',
+                    val_metrics['mean_valid_patches_per_effective_window'],
+                    epoch,
+                )
+                writer.add_scalar('val/coverage_vs_static', val_coverage, epoch)
+                writer.add_scalar('train/coverage_vs_static', train_coverage, epoch)
                 for key in ('loss_stage', 'loss_moe', 'loss_total'):
                     if key in val_metrics:
                         writer.add_scalar(f'val/{key}', val_metrics[key], epoch)
