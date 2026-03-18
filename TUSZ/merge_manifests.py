@@ -55,6 +55,36 @@ TCP_BIPOLAR = [
 # CSV列名（减号→下划线）
 TCP_COL_NAMES = [ch.replace('-', '_') for ch in TCP_BIPOLAR]
 TCP_SET = {ch: col for ch, col in zip(TCP_BIPOLAR, TCP_COL_NAMES)}
+MAX_TUSZ_POSITIVE_CHANNEL_RATIO = 0.5
+
+
+def infer_hemisphere_from_electrodes(electrodes) -> str:
+    hemispheres = set()
+    for elec in electrodes:
+        e = str(elec).strip().upper()
+        if not e:
+            continue
+        if e.endswith('Z'):
+            hemispheres.add('M')
+        elif e.endswith(('1', '3', '5', '7', '9')):
+            hemispheres.add('L')
+        elif e.endswith(('2', '4', '6', '8', '0')):
+            hemispheres.add('R')
+    if not hemispheres:
+        return 'U'
+    if hemispheres == {'L'}:
+        return 'L'
+    if hemispheres == {'R'}:
+        return 'R'
+    if 'L' in hemispheres and 'R' in hemispheres:
+        return 'B'
+    if hemispheres == {'M'}:
+        return 'M'
+    if 'L' in hemispheres:
+        return 'L'
+    if 'R' in hemispheres:
+        return 'R'
+    return 'M'
 
 
 def bipolar_str_to_01(bipolar_str: str) -> dict:
@@ -86,6 +116,9 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
     print(f"[TUSZ] 共 {before} 行，过滤后保留 {len(df)} 行（n_seizure_events > 0）")
 
     rows = []
+    skipped_union_multi = 0
+    skipped_missing_onset = 0
+    skipped_dense_events = 0
     for _, r in df.iterrows():
         starts = [s.strip() for s in str(r['sz_starts']).split(';') if s.strip()]
         ends   = [e.strip() for e in str(r['sz_ends']).split(';') if e.strip()]
@@ -97,6 +130,9 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
         # backward compatibility: if no pipe separator, treat as single group
         if not per_event_onset and onset_ch_raw.strip():
             per_event_onset = [onset_ch_raw.strip()]
+
+        event_hemi_raw = str(r.get('event_hemispheres', '')) if pd.notna(r.get('event_hemispheres', '')) else ''
+        per_event_hemi = [h.strip().upper() for h in event_hemi_raw.split('|') if h.strip()]
 
         # seizure_types: pipe-separated per-event format (e.g. "fnsz|gnsz|fnsz")
         # backward compat: old format was comma-separated union (e.g. "fnsz,gnsz")
@@ -114,8 +150,13 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
 
         n_events = int(r['n_seizure_events'])
         n_pairs = min(len(starts), len(ends))
+        n_rows = max(n_events, n_pairs, len(per_event_onset), len(per_event_types), len(per_event_hemi), 1)
 
-        for i in range(max(n_pairs, 1)):
+        if n_events > 1 and len(per_event_onset) <= 1:
+            skipped_union_multi += 1
+            continue
+
+        for i in range(n_rows):
             sz_start = float(starts[i]) if i < len(starts) else float('nan')
             sz_end   = float(ends[i])   if i < len(ends)   else float('nan')
             sz_dur   = (sz_end - sz_start) if (not pd.isna(sz_start) and not pd.isna(sz_end)) else float('nan')
@@ -127,6 +168,10 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
                 event_onset_str = per_event_onset[-1]
             else:
                 event_onset_str = ''
+
+            if not event_onset_str:
+                skipped_missing_onset += 1
+                continue
 
             # per-event seizure type
             if i < len(per_event_types):
@@ -141,6 +186,10 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
             soz_bipolar_norm = ','.join(
                 c.strip() for c in event_onset_str.split(',') if c.strip()
             )
+            pos_count = int(sum(bipolar_01[col] for col in TCP_COL_NAMES))
+            if pos_count > len(TCP_COL_NAMES) * MAX_TUSZ_POSITIVE_CHANNEL_RATIO:
+                skipped_dense_events += 1
+                continue
 
             electrodes = []
             for bp_ch in event_onset_str.split(','):
@@ -154,6 +203,11 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
                     if bp_ch not in electrodes:
                         electrodes.append(bp_ch)
             onset_channels_unipolar = ';'.join(electrodes)
+            event_hemisphere = infer_hemisphere_from_electrodes(electrodes)
+            if event_hemisphere == 'U' and i < len(per_event_hemi):
+                event_hemisphere = per_event_hemi[i]
+            if event_hemisphere == 'U':
+                event_hemisphere = str(r.get('hemisphere', 'U')).strip().upper() or 'U'
 
             row = {
                 'source':           'tusz',
@@ -166,12 +220,22 @@ def process_tusz(tusz_path: str) -> pd.DataFrame:
                 'sz_duration':      sz_dur,
                 'n_seizure_events': n_events,
                 'seizure_type':     event_sz_type,
-                'hemisphere':       r.get('hemisphere', 'U'),
+                'hemisphere':       event_hemisphere,
                 'onset_channels':   onset_channels_unipolar,
                 'soz_bipolar':      soz_bipolar_norm,
             }
             row.update(bipolar_01)
             rows.append(row)
+
+    if skipped_union_multi:
+        print(f"[TUSZ] skipped {skipped_union_multi} multi-event files with ambiguous file-level onset labels")
+    if skipped_missing_onset:
+        print(f"[TUSZ] skipped {skipped_missing_onset} seizure events with empty onset labels")
+    if skipped_dense_events:
+        print(
+            f"[TUSZ] skipped {skipped_dense_events} dense seizure events "
+            f"(>{MAX_TUSZ_POSITIVE_CHANNEL_RATIO:.0%} positive channels)"
+        )
 
     return pd.DataFrame(rows)
 

@@ -153,11 +153,13 @@ class FocalLoss(nn.Module):
             self.pos_weight = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor, sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Use raw sigmoid probabilities for pt; exp(-weighted_bce) is incorrect when pos_weight != 1.
         bce = F.binary_cross_entropy_with_logits(
             logits, targets, reduction='none',
             pos_weight=self.pos_weight,
         )
-        pt = torch.exp(-bce)
+        prob = torch.sigmoid(logits)
+        pt = prob * targets + (1.0 - prob) * (1.0 - targets)
         # alpha_t: alpha for positive, (1-alpha) for negative
         alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
         focal = alpha_t * (1.0 - pt) ** self.gamma * bce
@@ -659,19 +661,29 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         total = losses['soz']
 
         if region_targets is not None:
-            losses['region'] = self.region_bce(
+            region_loss = F.binary_cross_entropy_with_logits(
                 outputs['region_logits'],
                 region_targets,
+                reduction='none',
             )
+            if sample_weight is not None:
+                region_loss = region_loss * sample_weight.unsqueeze(1)
+            losses['region'] = region_loss.mean()
             total = total + c.w_region * losses['region']
 
         if hemisphere_targets is not None:
             valid_hemisphere = hemisphere_targets != -100
             if valid_hemisphere.any():
-                losses['hemisphere'] = self.hemisphere_ce(
+                hemisphere_loss = F.cross_entropy(
                     outputs['hemisphere_logits'],
                     hemisphere_targets,
+                    reduction='none',
+                    ignore_index=-100,
                 )
+                hemisphere_loss = hemisphere_loss[valid_hemisphere]
+                if sample_weight is not None:
+                    hemisphere_loss = hemisphere_loss * sample_weight[valid_hemisphere]
+                losses['hemisphere'] = hemisphere_loss.mean()
                 total = total + c.w_hemisphere * losses['hemisphere']
             else:
                 losses['hemisphere'] = outputs['hemisphere_logits'].new_zeros(())
@@ -679,14 +691,22 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         # auxiliary 1: transition detection
         if transition_targets is not None:
             tp = outputs['transition_logits']
-            losses['transition'] = self.transition_bce(tp, transition_targets)
+            transition_loss = F.binary_cross_entropy_with_logits(
+                tp, transition_targets, reduction='none',
+            )
+            if sample_weight is not None:
+                transition_loss = transition_loss * sample_weight.unsqueeze(1)
+            losses['transition'] = transition_loss.mean()
             total = total + c.w_transition * losses['transition']
 
         # auxiliary 2: pattern classification
         if pattern_targets is not None:
-            losses['pattern'] = self.pattern_ce(
-                outputs['pattern_logits'], pattern_targets,
+            pattern_loss = F.cross_entropy(
+                outputs['pattern_logits'], pattern_targets, reduction='none',
             )
+            if sample_weight is not None:
+                pattern_loss = pattern_loss * sample_weight
+            losses['pattern'] = pattern_loss.mean()
             total = total + c.w_pattern * losses['pattern']
 
         # MoE auxiliary loss (both branches)

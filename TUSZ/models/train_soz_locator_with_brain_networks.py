@@ -474,25 +474,109 @@ def build_soz_datasets(
 # Metrics
 # =====================================================================
 
-def compute_top_k(probs: np.ndarray, targets: np.ndarray, k: int = 3) -> float:
-    """For each sample, check if any of the top-k predicted channels is an actual SOZ."""
-    correct = 0
+def compute_localization_ranking_metrics(
+    probs: np.ndarray,
+    targets: np.ndarray,
+    ks: Tuple[int, ...] = (1, 3, 5),
+) -> Dict[str, float]:
+    """Ranking metrics better aligned with multi-channel SOZ localization."""
+    probs = np.asarray(probs)
+    targets = np.asarray(targets)
+    metrics: Dict[str, float] = {'mrr': 0.0, 'valid_localization_samples': 0.0}
+    if probs.size == 0 or targets.size == 0 or probs.ndim != 2 or targets.ndim != 2:
+        for k in ks:
+            metrics[f'recall_at_{k}'] = 0.0
+            metrics[f'precision_at_{k}'] = 0.0
+            metrics[f'ndcg_at_{k}'] = 0.0
+        return metrics
+
+    recall_sums = {k: 0.0 for k in ks}
+    precision_sums = {k: 0.0 for k in ks}
+    ndcg_sums = {k: 0.0 for k in ks}
+    mrr_sum = 0.0
+    valid = 0
+
     for p, t in zip(probs, targets):
-        top_k_idx = p.argsort()[-k:]
-        soz_idx = np.where(t > 0.5)[0]
-        if len(soz_idx) > 0 and len(set(top_k_idx) & set(soz_idx)) > 0:
-            correct += 1
-    return correct / len(probs) if len(probs) > 0 else 0.0
+        pos_idx = np.flatnonzero(t > 0.5)
+        if len(pos_idx) == 0:
+            continue
+        valid += 1
+        order = np.argsort(p)[::-1]
+        pos_set = set(pos_idx.tolist())
+
+        first_positive_rank = None
+        for rank, idx in enumerate(order, start=1):
+            if idx in pos_set:
+                first_positive_rank = rank
+                break
+        if first_positive_rank is not None:
+            mrr_sum += 1.0 / first_positive_rank
+
+        for k in ks:
+            topk = order[:min(k, len(order))]
+            hits = sum(1 for idx in topk if idx in pos_set)
+            recall_sums[k] += hits / max(len(pos_idx), 1)
+            precision_sums[k] += hits / max(len(topk), 1)
+
+            dcg = 0.0
+            for rank, idx in enumerate(topk, start=1):
+                if idx in pos_set:
+                    dcg += 1.0 / np.log2(rank + 1)
+            ideal_hits = min(len(pos_idx), len(topk))
+            idcg = sum(1.0 / np.log2(rank + 1) for rank in range(1, ideal_hits + 1))
+            ndcg_sums[k] += dcg / idcg if idcg > 0 else 0.0
+
+    metrics['valid_localization_samples'] = float(valid)
+    if valid == 0:
+        for k in ks:
+            metrics[f'recall_at_{k}'] = 0.0
+            metrics[f'precision_at_{k}'] = 0.0
+            metrics[f'ndcg_at_{k}'] = 0.0
+        return metrics
+
+    metrics['mrr'] = mrr_sum / valid
+    for k in ks:
+        metrics[f'recall_at_{k}'] = recall_sums[k] / valid
+        metrics[f'precision_at_{k}'] = precision_sums[k] / valid
+        metrics[f'ndcg_at_{k}'] = ndcg_sums[k] / valid
+    return metrics
+
+
+def get_auc_valid_mask(targets: np.ndarray) -> np.ndarray:
+    """AUC is only defined when a channel has both positive and negative samples."""
+    targets = np.asarray(targets)
+    if targets.size == 0 or targets.ndim != 2:
+        return np.zeros((0,), dtype=bool)
+    pos = targets.sum(axis=0)
+    neg = targets.shape[0] - pos
+    return np.logical_and(pos > 0, neg > 0)
 
 
 def compute_auc(probs: np.ndarray, targets: np.ndarray) -> float:
-    try:
-        valid = targets.sum(axis=0) > 0
-        if valid.sum() < 2:
-            return 0.0
-        return roc_auc_score(targets[:, valid], probs[:, valid], average='macro')
-    except Exception:
+    if roc_auc_score is None:
         return 0.0
+    valid = get_auc_valid_mask(targets)
+    if valid.sum() == 0:
+        return 0.0
+    auc_values: List[float] = []
+    for idx in np.where(valid)[0]:
+        try:
+            auc_values.append(float(roc_auc_score(targets[:, idx], probs[:, idx])))
+        except ValueError:
+            continue
+    return float(np.mean(auc_values)) if auc_values else 0.0
+
+
+def build_selection_key(metrics: Dict[str, float]) -> Tuple[float, float, float, float, float, float]:
+    """Prefer calibrated ranking quality, then localization quality and auxiliary heads."""
+    return (
+        float(metrics.get('auc', 0.0)),
+        float(metrics.get('ndcg_at_3', 0.0)),
+        float(metrics.get('mrr', 0.0)),
+        float(metrics.get('recall_at_3', metrics.get('top3', 0.0))),
+        float(metrics.get('region_acc', 0.0)),
+        float(metrics.get('hemisphere_acc', 0.0)),
+    )
 
 
 def compute_multilabel_accuracy(
@@ -962,8 +1046,12 @@ def train_one_epoch(
     region_targets = np.concatenate(all_region_targets, axis=0)
     hemi_logits = np.concatenate(all_hemi_logits, axis=0)
     hemi_targets = np.concatenate(all_hemi_targets, axis=0)
-    top3 = compute_top_k(probs, targets, k=3)
+    rank_metrics = compute_localization_ranking_metrics(probs, targets, ks=(1, 3, 5))
+    recall_at_1 = rank_metrics['recall_at_1']
+    recall_at_3 = rank_metrics['recall_at_3']
+    recall_at_5 = rank_metrics['recall_at_5']
     auc = compute_auc(probs, targets) if roc_auc_score else 0.0
+    auc_valid_channels = int(get_auc_valid_mask(targets).sum())
     region_acc = compute_multilabel_accuracy(region_probs, region_targets)
     hemisphere_acc = compute_multiclass_accuracy(hemi_logits, hemi_targets)
     avg_losses = {
@@ -973,7 +1061,12 @@ def train_one_epoch(
 
     if writer:
         writer.add_scalar('train/loss', avg_loss, epoch)
-        writer.add_scalar('train/top3', top3, epoch)
+        writer.add_scalar('train/recall_at_1', recall_at_1, epoch)
+        writer.add_scalar('train/recall_at_3', recall_at_3, epoch)
+        writer.add_scalar('train/recall_at_5', recall_at_5, epoch)
+        writer.add_scalar('train/precision_at_3', rank_metrics['precision_at_3'], epoch)
+        writer.add_scalar('train/ndcg_at_3', rank_metrics['ndcg_at_3'], epoch)
+        writer.add_scalar('train/mrr', rank_metrics['mrr'], epoch)
         writer.add_scalar('train/auc', auc, epoch)
         writer.add_scalar('train/region_acc', region_acc, epoch)
         writer.add_scalar('train/hemisphere_acc', hemisphere_acc, epoch)
@@ -987,10 +1080,14 @@ def train_one_epoch(
 
     return {
         'loss': avg_loss,
-        'top3': top3,
+        'top1': recall_at_1,
+        'top3': recall_at_3,
+        'top5': recall_at_5,
         'auc': auc,
+        'auc_valid_channels': auc_valid_channels,
         'region_acc': region_acc,
         'hemisphere_acc': hemisphere_acc,
+        **rank_metrics,
         **avg_losses,
     }
 
@@ -1071,10 +1168,12 @@ def evaluate(model, loader, device):
     region_targets = np.concatenate(all_region_targets, axis=0)
     hemi_logits = np.concatenate(all_hemi_logits, axis=0)
     hemi_targets = np.concatenate(all_hemi_targets, axis=0)
-    top1 = compute_top_k(probs, targets, k=1)
-    top3 = compute_top_k(probs, targets, k=3)
-    top5 = compute_top_k(probs, targets, k=5)
+    rank_metrics = compute_localization_ranking_metrics(probs, targets, ks=(1, 3, 5))
+    recall_at_1 = rank_metrics['recall_at_1']
+    recall_at_3 = rank_metrics['recall_at_3']
+    recall_at_5 = rank_metrics['recall_at_5']
     auc = compute_auc(probs, targets) if roc_auc_score else 0.0
+    auc_valid_channels = int(get_auc_valid_mask(targets).sum())
     region_acc = compute_multilabel_accuracy(region_probs, region_targets)
     hemisphere_acc = compute_multiclass_accuracy(hemi_logits, hemi_targets)
     avg_losses = {
@@ -1088,17 +1187,23 @@ def evaluate(model, loader, device):
         f"probs(min={probs.min():.3f}, max={probs.max():.3f}, "
         f"mean={probs.mean():.3f}) "
         f"label_pos_rate={targets.mean():.4f} "
+        f"r3={recall_at_3:.3f} "
+        f"ndcg3={rank_metrics['ndcg_at_3']:.3f} "
+        f"mrr={rank_metrics['mrr']:.3f} "
+        f"auc_valid_ch={auc_valid_channels}/{targets.shape[1]} "
         f"region_acc={region_acc:.3f} "
         f"hemi_acc={hemisphere_acc:.3f}"
     )
 
     return {
-        'top1': top1,
-        'top3': top3,
-        'top5': top5,
+        'top1': recall_at_1,
+        'top3': recall_at_3,
+        'top5': recall_at_5,
         'auc': auc,
+        'auc_valid_channels': auc_valid_channels,
         'region_acc': region_acc,
         'hemisphere_acc': hemisphere_acc,
+        **rank_metrics,
         'probs': probs,
         'targets': targets,
         'region_probs': region_probs,
@@ -2107,12 +2212,25 @@ def main():
     # resume
     start_epoch = 0
     best_top3 = 0.0
+    best_selection_key = (-1.0, -1.0, -1.0, -1.0, -1.0, -1.0)
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         base_model.load_state_dict(ckpt['model_state'])
         start_epoch = ckpt.get('epoch', 0) + 1
         best_top3 = ckpt.get('best_top3', 0.0)
-        log.info(f"  Resumed from epoch {start_epoch}, best_top3={best_top3:.4f}")
+        raw_best_key = ckpt.get('best_selection_key', None)
+        if raw_best_key is not None:
+            best_selection_key = tuple(float(x) for x in raw_best_key)
+            if len(best_selection_key) < 6:
+                best_selection_key = best_selection_key + (-1.0,) * (6 - len(best_selection_key))
+        else:
+            best_selection_key = (0.0, 0.0, 0.0, float(best_top3), 0.0, 0.0)
+        log.info(
+            "  Resumed from epoch %d, best_recall@3=%.4f, best_key=%s",
+            start_epoch,
+            best_top3,
+            best_selection_key,
+        )
 
     total_epochs = args.finetune_epochs
     phase1_end = total_epochs // 5       # 20% frozen backbone
@@ -2185,17 +2303,26 @@ def main():
                 f"soz={train_metrics.get('loss_soz', 0.0):.4f} "
                 f"region={train_metrics.get('loss_region', 0.0):.4f} "
                 f"hemi={train_metrics.get('loss_hemisphere', 0.0):.4f} "
-                f"train_top3={train_metrics['top3']:.3f} "
+                f"train_r3={train_metrics['recall_at_3']:.3f} "
+                f"train_ndcg3={train_metrics['ndcg_at_3']:.3f} "
+                f"train_mrr={train_metrics['mrr']:.3f} "
                 f"train_region_acc={train_metrics['region_acc']:.3f} "
                 f"train_hemi_acc={train_metrics['hemisphere_acc']:.3f} "
-                f"val_top3={val_metrics['top3']:.3f} "
+                f"val_r3={val_metrics['recall_at_3']:.3f} "
+                f"val_ndcg3={val_metrics['ndcg_at_3']:.3f} "
+                f"val_mrr={val_metrics['mrr']:.3f} "
                 f"val_auc={val_metrics['auc']:.3f} "
                 f"val_region_acc={val_metrics['region_acc']:.3f} "
                 f"val_hemi_acc={val_metrics['hemisphere_acc']:.3f} "
                 f"({dt:.1f}s)"
             )
             if writer:
-                writer.add_scalar('val/top3', val_metrics['top3'], epoch)
+                writer.add_scalar('val/recall_at_1', val_metrics['recall_at_1'], epoch)
+                writer.add_scalar('val/recall_at_3', val_metrics['recall_at_3'], epoch)
+                writer.add_scalar('val/recall_at_5', val_metrics['recall_at_5'], epoch)
+                writer.add_scalar('val/precision_at_3', val_metrics['precision_at_3'], epoch)
+                writer.add_scalar('val/ndcg_at_3', val_metrics['ndcg_at_3'], epoch)
+                writer.add_scalar('val/mrr', val_metrics['mrr'], epoch)
                 writer.add_scalar('val/auc', val_metrics['auc'], epoch)
                 writer.add_scalar('val/region_acc', val_metrics['region_acc'], epoch)
                 writer.add_scalar('val/hemisphere_acc', val_metrics['hemisphere_acc'], epoch)
@@ -2205,20 +2332,40 @@ def main():
                 writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
 
             # save best
-            if val_metrics['top3'] > best_top3:
-                best_top3 = val_metrics['top3']
+            val_selection_key = build_selection_key(val_metrics)
+            if val_selection_key > best_selection_key:
+                best_selection_key = val_selection_key
+                best_top3 = val_metrics['recall_at_3']
                 base_model.save_checkpoint(
                     str(output_dir / 'best_model.pt'),
-                    extra={'epoch': epoch, 'best_top3': best_top3,
-                           'val_metrics': val_summary},
+                    extra={
+                        'epoch': epoch,
+                        'best_top3': best_top3,
+                        'best_recall_at_3': best_top3,
+                        'best_selection_key': list(best_selection_key),
+                        'val_metrics': val_summary,
+                    },
                 )
-                log.info(f"  ** New best: top3={best_top3:.4f}")
+                log.info(
+                    "  ** New best: auc=%.4f ndcg3=%.4f mrr=%.4f r3=%.4f region_acc=%.4f hemi_acc=%.4f",
+                    val_metrics['auc'],
+                    val_metrics['ndcg_at_3'],
+                    val_metrics['mrr'],
+                    val_metrics['recall_at_3'],
+                    val_metrics['region_acc'],
+                    val_metrics['hemisphere_acc'],
+                )
 
             # periodic save
             if (epoch + 1) % args.save_every == 0:
                 base_model.save_checkpoint(
                     str(output_dir / f'ckpt_epoch{epoch:03d}.pt'),
-                    extra={'epoch': epoch, 'best_top3': best_top3},
+                    extra={
+                        'epoch': epoch,
+                        'best_top3': best_top3,
+                        'best_recall_at_3': best_top3,
+                        'best_selection_key': list(best_selection_key),
+                    },
                 )
 
     # ── 5. Test evaluation ──
@@ -2234,9 +2381,12 @@ def main():
     if is_main(rank):
         log.info(
             f"\nTest results:\n"
-            f"  Top-1: {test_metrics['top1']:.4f}\n"
-            f"  Top-3: {test_metrics['top3']:.4f}\n"
-            f"  Top-5: {test_metrics['top5']:.4f}\n"
+            f"  Recall@1: {test_metrics['recall_at_1']:.4f}\n"
+            f"  Recall@3: {test_metrics['recall_at_3']:.4f}\n"
+            f"  Recall@5: {test_metrics['recall_at_5']:.4f}\n"
+            f"  Precision@3: {test_metrics['precision_at_3']:.4f}\n"
+            f"  nDCG@3: {test_metrics['ndcg_at_3']:.4f}\n"
+            f"  MRR:   {test_metrics['mrr']:.4f}\n"
             f"  AUC:   {test_metrics['auc']:.4f}\n"
             f"  Region acc: {test_metrics['region_acc']:.4f}\n"
             f"  Hemisphere acc: {test_metrics['hemisphere_acc']:.4f}"
@@ -2257,13 +2407,21 @@ def main():
             f"- Output mode: {args.output_mode}\n\n"
             f"## Test Metrics\n\n"
             f"| Metric | Value |\n|--------|-------|\n"
-            f"| Top-1 | {test_metrics['top1']:.4f} |\n"
-            f"| Top-3 | {test_metrics['top3']:.4f} |\n"
-            f"| Top-5 | {test_metrics['top5']:.4f} |\n"
-            f"| AUC   | {test_metrics['auc']:.4f} |\n"
+            f"| Recall@1 | {test_metrics['recall_at_1']:.4f} |\n"
+            f"| Recall@3 | {test_metrics['recall_at_3']:.4f} |\n"
+            f"| Recall@5 | {test_metrics['recall_at_5']:.4f} |\n"
+            f"| Precision@3 | {test_metrics['precision_at_3']:.4f} |\n"
+            f"| nDCG@3 | {test_metrics['ndcg_at_3']:.4f} |\n"
+            f"| MRR | {test_metrics['mrr']:.4f} |\n"
+            f"| AUC | {test_metrics['auc']:.4f} |\n"
             f"| Region acc | {test_metrics['region_acc']:.4f} |\n"
             f"| Hemisphere acc | {test_metrics['hemisphere_acc']:.4f} |\n\n"
-            f"## Best validation Top-3: {best_top3:.4f}\n"
+            f"## Best validation key: auc={best_selection_key[0]:.4f}, "
+            f"ndcg3={best_selection_key[1]:.4f}, "
+            f"mrr={best_selection_key[2]:.4f}, "
+            f"r3={best_selection_key[3]:.4f}, "
+            f"region_acc={best_selection_key[4]:.4f}, "
+            f"hemi_acc={best_selection_key[5]:.4f}\n"
         )
         (output_dir / 'report.md').write_text(report, encoding='utf-8')
         log.info(f"Report saved to {output_dir / 'report.md'}")

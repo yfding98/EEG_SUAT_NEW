@@ -73,6 +73,9 @@ class ManifestEntry:
     # 通道级SOZ标签（22个通道的01值）
     # 使用独立列存储每个通道的标签
     
+    event_onset_regions: str = ''   # pipe-separated per-event onset regions
+    event_hemispheres: str = ''     # pipe-separated per-event hemispheres
+
     def to_dict(self, channel_list: List[str] = None) -> Dict:
         """转换为字典，包含通道级标签列。
         
@@ -214,6 +217,8 @@ def process_edf_file(file_info: Dict, data_root: str) -> Optional[ManifestEntry]
     onset_channels = ''
     onset_regions = ''
     hemisphere = 'U'
+    event_onset_regions = ''
+    event_hemispheres = ''
     
     try:
         # 解析.csv标注（每通道多类别）
@@ -233,6 +238,8 @@ def process_edf_file(file_info: Dict, data_root: str) -> Optional[ManifestEntry]
                     all_starts = []
                     all_ends = []
                     per_event_onset_channels = []
+                    per_event_onset_regions = []
+                    per_event_hemispheres = []
                     all_onset_regions = set()
                     hemispheres = set()
                     
@@ -244,6 +251,10 @@ def process_edf_file(file_info: Dict, data_root: str) -> Optional[ManifestEntry]
                         per_event_onset_channels.append(
                             ','.join(sorted(event.onset_channels))
                         )
+                        per_event_onset_regions.append(
+                            ','.join(sorted(event.onset_regions))
+                        )
+                        per_event_hemispheres.append(event.hemisphere or 'U')
                         all_onset_regions.update(event.onset_regions)
                         hemispheres.add(event.hemisphere)
                         total_seizure_duration += event.duration
@@ -254,6 +265,8 @@ def process_edf_file(file_info: Dict, data_root: str) -> Optional[ManifestEntry]
                     sz_ends = ';'.join(all_ends)
                     # pipe-separated per-event onset channels
                     onset_channels = '|'.join(per_event_onset_channels)
+                    event_onset_regions = '|'.join(per_event_onset_regions)
+                    event_hemispheres = '|'.join(per_event_hemispheres)
                     onset_regions = ','.join(sorted(all_onset_regions))
                     
                     # 确定整体半球
@@ -313,6 +326,8 @@ def process_edf_file(file_info: Dict, data_root: str) -> Optional[ManifestEntry]
         onset_channels=onset_channels,
         onset_regions=onset_regions,
         hemisphere=hemisphere,
+        event_onset_regions=event_onset_regions,
+        event_hemispheres=event_hemispheres,
     )
 
 
