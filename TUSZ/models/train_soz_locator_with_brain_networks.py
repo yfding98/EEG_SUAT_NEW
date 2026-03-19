@@ -1551,8 +1551,6 @@ def run_stage_pretraining(
     world: int,
     local_rank: int,
     patch_len: int,
-    n_pre_patches: int,
-    n_post_patches: int,
 ):
     log.info("=== Stage pretraining (binary seizure vs non-seizure) ===")
     support = inspect_stage_annotation_support(
@@ -1572,11 +1570,36 @@ def run_stage_pretraining(
     except ImportError:
         from ..data_preprocess.eeg_pipeline import PipelineConfig
 
+    stage_pre_sec = float(args.stage_pre_onset_sec)
+    stage_post_sec = float(args.stage_post_onset_sec)
+    if stage_pre_sec <= 0.0 or stage_post_sec <= 0.0:
+        raise ValueError(
+            f"stage_pre_onset_sec and stage_post_onset_sec must be > 0, got "
+            f"{stage_pre_sec} and {stage_post_sec}"
+        )
+    stage_roles = tuple(
+        str(role).strip().lower()
+        for role in args.stage_sample_roles
+        if str(role).strip()
+    )
+    if not stage_roles:
+        stage_roles = ('onset',)
+    stage_n_pre_patches = int(np.ceil(stage_pre_sec / args.patch_duration))
+    stage_n_post_patches = int(np.ceil(stage_post_sec / args.patch_duration))
+    log.info(
+        "  Stage sampling: roles=%s pre=%.1fs post=%.1fs pre_patches=%d post_patches=%d",
+        list(stage_roles),
+        stage_pre_sec,
+        stage_post_sec,
+        stage_n_pre_patches,
+        stage_n_post_patches,
+    )
+
     pipeline_cfg = PipelineConfig(
         target_fs=args.fs,
-        pre_onset_sec=args.pre_onset_sec,
-        post_onset_sec=args.post_onset_sec,
-        n_patches=n_pre_patches + n_post_patches,
+        pre_onset_sec=stage_pre_sec,
+        post_onset_sec=stage_post_sec,
+        n_patches=stage_n_pre_patches + stage_n_post_patches,
         patch_len=patch_len,
     )
 
@@ -1586,6 +1609,7 @@ def run_stage_pretraining(
         pipeline_cfg=pipeline_cfg,
         source_filter='tusz',
         split_filter=['train'],
+        roles=stage_roles,
     )
     val_splits = ['dev']
     val_ds = EEGStagePretrainDataset(
@@ -1594,6 +1618,7 @@ def run_stage_pretraining(
         pipeline_cfg=pipeline_cfg,
         source_filter='tusz',
         split_filter=val_splits,
+        roles=stage_roles,
     )
     if len(val_ds) == 0:
         val_splits = ['eval']
@@ -1603,6 +1628,7 @@ def run_stage_pretraining(
             pipeline_cfg=pipeline_cfg,
             source_filter='tusz',
             split_filter=val_splits,
+            roles=stage_roles,
         )
 
     train_meta = summarize_stage_dataset(train_ds)
@@ -1670,8 +1696,8 @@ def run_stage_pretraining(
         task_mode='stage_pretrain',
         embed_dim=args.embed_dim,
         patch_len=patch_len,
-        n_pre_patches=n_pre_patches,
-        n_post_patches=n_post_patches,
+        n_pre_patches=stage_n_pre_patches,
+        n_post_patches=stage_n_post_patches,
         fs=args.fs,
         labram_checkpoint=args.labram_ckpt,
         output_mode=args.output_mode,
@@ -2000,6 +2026,14 @@ def parse_args():
                    action='store_false',
                    help='Disable class weighting for stage CrossEntropy')
     p.set_defaults(stage_use_class_weight=True)
+    p.add_argument('--stage-pre-onset-sec', type=float, default=8.0,
+                   help='Seconds before seizure onset used only for stage-1 sampling')
+    p.add_argument('--stage-post-onset-sec', type=float, default=4.0,
+                   help='Seconds after seizure onset used only for stage-1 sampling')
+    p.add_argument('--stage-sample-roles', nargs='+',
+                   default=['onset'],
+                   choices=['onset', 'mid', 'offset'],
+                   help='Stage-1 sampling centers to include')
 
     # Sequence length configurations
     p.add_argument('--pre-onset-sec', type=float, default=5.0, help='Seconds before onset to extract')
@@ -2069,8 +2103,6 @@ def main():
             world=world,
             local_rank=local_rank,
             patch_len=patch_len,
-            n_pre_patches=n_pre_patches,
-            n_post_patches=n_post_patches,
         )
         if is_main(rank):
             log.info("Stage-1 pretraining finished: %s", stage_pretrain_ckpt)
@@ -2151,8 +2183,6 @@ def main():
             world=world,
             local_rank=local_rank,
             patch_len=patch_len,
-            n_pre_patches=n_pre_patches,
-            n_post_patches=n_post_patches,
         )
 
     log.info("=== Step 2: Initializing model ===")
