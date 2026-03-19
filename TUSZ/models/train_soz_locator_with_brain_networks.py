@@ -1586,13 +1586,15 @@ def run_stage_pretraining(
         stage_roles = ('onset',)
     stage_n_pre_patches = int(np.ceil(stage_pre_sec / args.patch_duration))
     stage_n_post_patches = int(np.ceil(stage_post_sec / args.patch_duration))
+    stage_onset_jitter_sec = max(float(args.stage_onset_jitter_sec), 0.0)
     log.info(
-        "  Stage sampling: roles=%s pre=%.1fs post=%.1fs pre_patches=%d post_patches=%d",
+        "  Stage sampling: roles=%s pre=%.1fs post=%.1fs pre_patches=%d post_patches=%d onset_jitter=%.1fs(train)",
         list(stage_roles),
         stage_pre_sec,
         stage_post_sec,
         stage_n_pre_patches,
         stage_n_post_patches,
+        stage_onset_jitter_sec,
     )
 
     pipeline_cfg = PipelineConfig(
@@ -1610,6 +1612,7 @@ def run_stage_pretraining(
         source_filter='tusz',
         split_filter=['train'],
         roles=stage_roles,
+        center_jitter_sec=stage_onset_jitter_sec,
     )
     val_splits = ['dev']
     val_ds = EEGStagePretrainDataset(
@@ -1619,6 +1622,7 @@ def run_stage_pretraining(
         source_filter='tusz',
         split_filter=val_splits,
         roles=stage_roles,
+        center_jitter_sec=0.0,
     )
     if len(val_ds) == 0:
         val_splits = ['eval']
@@ -1629,6 +1633,7 @@ def run_stage_pretraining(
             source_filter='tusz',
             split_filter=val_splits,
             roles=stage_roles,
+            center_jitter_sec=0.0,
         )
 
     train_meta = summarize_stage_dataset(train_ds)
@@ -2034,6 +2039,8 @@ def parse_args():
                    default=['onset'],
                    choices=['onset', 'mid', 'offset'],
                    help='Stage-1 sampling centers to include')
+    p.add_argument('--stage-onset-jitter-sec', type=float, default=3.0,
+                   help='Random jitter applied only to stage-1 train onset windows to vary seizure start position; 0 disables')
 
     # Sequence length configurations
     p.add_argument('--pre-onset-sec', type=float, default=5.0, help='Seconds before onset to extract')

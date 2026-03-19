@@ -227,6 +227,7 @@ class EEGStagePretrainDataset(Dataset):
         split_filter: Optional[Sequence[str]] = None,
         roles: Sequence[str] = ('onset', 'mid', 'offset'),
         ignore_index: int = STAGE_IGNORE_INDEX,
+        center_jitter_sec: float = 0.0,
     ):
         if not _HAS_TORCH:
             raise ImportError("PyTorch is required for EEGStagePretrainDataset")
@@ -237,6 +238,7 @@ class EEGStagePretrainDataset(Dataset):
         self.pipeline = EEGPipeline(pipeline_cfg)
         self.roles = tuple(roles)
         self.ignore_index = ignore_index
+        self.center_jitter_sec = max(float(center_jitter_sec), 0.0)
         self.df = self._load_manifest(manifest_path, source_filter, split_filter)
         self.samples = self._build_samples(self.df)
         self.zero_x = torch.zeros(
@@ -378,24 +380,49 @@ class EEGStagePretrainDataset(Dataset):
             'seizure_end_sec': float(sample.seizure_end_sec),
         }
 
+    def _sample_center_sec(self, sample: StageSample) -> float:
+        center_sec = float(sample.center_sec)
+        if self.center_jitter_sec <= 0.0 or sample.role != 'onset':
+            return center_sec
+
+        patch_sec = float(self.pipeline.cfg.patch_len) / float(self.pipeline.cfg.target_fs)
+        jitter_min = -(max(float(self.pipeline.cfg.post_onset_sec) - patch_sec, 0.0))
+        jitter_max = max(float(self.pipeline.cfg.pre_onset_sec) - patch_sec, 0.0)
+        lower = max(-self.center_jitter_sec, jitter_min, -center_sec)
+        upper = min(
+            self.center_jitter_sec,
+            jitter_max,
+            max(float(sample.duration_sec) - center_sec, 0.0),
+        )
+        if upper <= lower + 1e-6:
+            return center_sec
+        return float(center_sec + np.random.uniform(lower, upper))
+
     def __getitem__(self, idx: int) -> Dict[str, object]:
         sample = self.samples[idx]
         cfg = self.pipeline.cfg
         baseline_n = int(cfg.pre_onset_sec * cfg.target_fs)
-        window_start_sec = float(sample.center_sec - cfg.pre_onset_sec)
+        sample_center_sec = self._sample_center_sec(sample)
+        window_start_sec = float(sample_center_sec - cfg.pre_onset_sec)
 
         try:
-            data_21, fs = self.pipeline.load_edf(self._resolve_edf_path(sample), onset=sample.center_sec)
-            window = self.pipeline.extract_window(data_21, fs, sample.center_sec)
+            data_21, fs = self.pipeline.load_edf(self._resolve_edf_path(sample), onset=sample_center_sec)
+            window = self.pipeline.extract_window(data_21, fs, sample_center_sec)
             if window is None:
-                return self._empty_item(sample, window_start_sec, LOAD_STATUS_WINDOW_NONE)
+                item = self._empty_item(sample, window_start_sec, LOAD_STATUS_WINDOW_NONE)
+                item['sample_center_sec'] = float(sample_center_sec)
+                return item
 
             clipped = self.pipeline.clip_by_baseline(window, baseline_n)
             bipolar, channel_mask = self.pipeline.to_tcp_bipolar(clipped)
             if int(channel_mask.sum()) < cfg.min_valid_channels:
-                return self._empty_item(sample, window_start_sec, LOAD_STATUS_INSUFFICIENT_CHANNELS)
+                item = self._empty_item(sample, window_start_sec, LOAD_STATUS_INSUFFICIENT_CHANNELS)
+                item['sample_center_sec'] = float(sample_center_sec)
+                return item
             if self.pipeline.is_bad_bipolar_window(bipolar, channel_mask, fs):
-                return self._empty_item(sample, window_start_sec, LOAD_STATUS_BAD_WINDOW)
+                item = self._empty_item(sample, window_start_sec, LOAD_STATUS_BAD_WINDOW)
+                item['sample_center_sec'] = float(sample_center_sec)
+                return item
 
             bipolar = self.pipeline.normalize_by_baseline(bipolar, baseline_n)
             stage_labels, valid_patch_mask = assign_patch_binary_labels(
@@ -411,7 +438,9 @@ class EEGStagePretrainDataset(Dataset):
             stage_valid_count = int(valid_patch_mask.sum())
             channel_valid_count = int(channel_mask.sum())
             if stage_valid_count <= 0:
-                return self._empty_item(sample, window_start_sec, LOAD_STATUS_NO_VALID_PATCH)
+                item = self._empty_item(sample, window_start_sec, LOAD_STATUS_NO_VALID_PATCH)
+                item['sample_center_sec'] = float(sample_center_sec)
+                return item
 
             return {
                 'x': torch.from_numpy(bipolar.astype(np.float32)),
@@ -425,13 +454,15 @@ class EEGStagePretrainDataset(Dataset):
                 'stage_valid_count': stage_valid_count,
                 'channel_valid_count': channel_valid_count,
                 'window_start_sec': float(window_start_sec),
-                'sample_center_sec': float(sample.center_sec),
+                'sample_center_sec': float(sample_center_sec),
                 'seizure_start_sec': float(sample.seizure_start_sec),
                 'seizure_end_sec': float(sample.seizure_end_sec),
             }
         except Exception as exc:
             log.warning("Stage window failed for %s (%s): %s", sample.edf_path, sample.role, exc)
-            return self._empty_item(sample, window_start_sec, LOAD_STATUS_EXCEPTION)
+            item = self._empty_item(sample, window_start_sec, LOAD_STATUS_EXCEPTION)
+            item['sample_center_sec'] = float(sample_center_sec)
+            return item
 
 
 def summarize_stage_dataset(dataset: EEGStagePretrainDataset) -> Dict[str, object]:
