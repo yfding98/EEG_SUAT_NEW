@@ -621,6 +621,31 @@ def compute_patch_accuracy(
     return float(correct), valid
 
 
+def shuffle_stage_batch_patches(
+    x: torch.Tensor,
+    stage_labels: torch.Tensor,
+    patch_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Shuffle patch order within each sample and keep labels aligned."""
+    if x.dim() != 3 or stage_labels.dim() != 2:
+        return x, stage_labels
+
+    batch_size, n_channels, total_len = x.shape
+    n_patches = stage_labels.size(1)
+    if n_patches <= 1 or patch_len <= 0 or total_len != n_patches * patch_len:
+        return x, stage_labels
+
+    patches = x.view(batch_size, n_channels, n_patches, patch_len)
+    perms = torch.stack(
+        [torch.randperm(n_patches, device=x.device) for _ in range(batch_size)],
+        dim=0,
+    )
+    patch_index = perms.view(batch_size, 1, n_patches, 1).expand(-1, n_channels, -1, patch_len)
+    shuffled_x = patches.gather(2, patch_index).reshape(batch_size, n_channels, total_len)
+    shuffled_labels = stage_labels.gather(1, perms)
+    return shuffled_x, shuffled_labels
+
+
 def count_trainable_parameters(model) -> Tuple[int, int]:
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -1224,6 +1249,7 @@ def train_stage_one_epoch(
     writer=None,
     show_progress: bool = False,
     log_every: int = 20,
+    shuffle_patches: bool = False,
 ):
     model.train()
     base = model.module if hasattr(model, 'module') else model
@@ -1256,6 +1282,12 @@ def train_stage_one_epoch(
     for step, batch in enumerate(iterator, start=1):
         x = batch['x'].to(device)
         stage_labels = batch['stage_labels'].to(device)
+        if shuffle_patches:
+            x, stage_labels = shuffle_stage_batch_patches(
+                x,
+                stage_labels,
+                patch_len=base.cfg.patch_len,
+            )
         load_status = [str(s) for s in batch.get('load_status', [])]
         stage_valid_count = batch.get('stage_valid_count', None)
         if stage_valid_count is not None:
@@ -1588,13 +1620,15 @@ def run_stage_pretraining(
     stage_n_post_patches = int(np.ceil(stage_post_sec / args.patch_duration))
     stage_onset_jitter_sec = max(float(args.stage_onset_jitter_sec), 0.0)
     log.info(
-        "  Stage sampling: roles=%s pre=%.1fs post=%.1fs pre_patches=%d post_patches=%d onset_jitter=%.1fs(train)",
+        "  Stage sampling: roles=%s pre=%.1fs post=%.1fs pre_patches=%d post_patches=%d "
+        "onset_jitter=%.1fs(train) shuffle=%s",
         list(stage_roles),
         stage_pre_sec,
         stage_post_sec,
         stage_n_pre_patches,
         stage_n_post_patches,
         stage_onset_jitter_sec,
+        args.stage_shuffle_patches,
     )
 
     pipeline_cfg = PipelineConfig(
@@ -1718,9 +1752,11 @@ def run_stage_pretraining(
         base_model.set_stage_class_weight(class_weight)
     trainable_params, total_params = count_trainable_parameters(base_model)
     log.info(
-        "  Stage param setup: train_backbone=%s use_class_weight=%s trainable params=%d/%d",
+        "  Stage param setup: train_backbone=%s use_class_weight=%s shuffle_patches=%s "
+        "trainable params=%d/%d",
         args.stage_train_backbone,
         args.stage_use_class_weight,
+        args.stage_shuffle_patches,
         trainable_params,
         total_params,
     )
@@ -1760,6 +1796,7 @@ def run_stage_pretraining(
             writer,
             show_progress=is_main(rank),
             log_every=args.stage_log_every,
+            shuffle_patches=args.stage_shuffle_patches,
         )
         val_metrics = evaluate_stage(
             model,
@@ -1992,6 +2029,8 @@ def parse_args():
     p.add_argument('--patch-duration', type=float, default=1.0)
     p.add_argument('--fs', type=float, default=200.0)
     p.add_argument('--embed-dim', type=int, default=200)
+    p.add_argument('--labram-frozen-layers', type=int, default=10,
+                   help='During SOZ finetuning, keep the bottom N LaBraM transformer blocks frozen; patch/embed and pos/time embeddings stay frozen with them')
     p.add_argument('--output-mode', default='monopolar', choices=['monopolar', 'bipolar'])
 
     # brain networks
@@ -2022,7 +2061,7 @@ def parse_args():
                    help='Train the full LaBraM backbone during stage pretraining')
     p.add_argument('--no-stage-train-backbone', dest='stage_train_backbone',
                    action='store_false',
-                   help='Freeze LaBraM backbone and train only TimeFilter + stage head')
+                   help='Freeze LaBraM backbone and train only the patch classification head')
     p.set_defaults(stage_train_backbone=True)
     p.add_argument('--stage-use-class-weight', dest='stage_use_class_weight',
                    action='store_true',
@@ -2041,6 +2080,13 @@ def parse_args():
                    help='Stage-1 sampling centers to include')
     p.add_argument('--stage-onset-jitter-sec', type=float, default=3.0,
                    help='Random jitter applied only to stage-1 train onset windows to vary seizure start position; 0 disables')
+    p.add_argument('--stage-shuffle-patches', dest='stage_shuffle_patches',
+                   action='store_true',
+                   help='Randomly shuffle patch order within each stage-1 training sample and shuffle labels in the same way')
+    p.add_argument('--no-stage-shuffle-patches', dest='stage_shuffle_patches',
+                   action='store_false',
+                   help='Keep the original patch order during stage-1 training')
+    p.set_defaults(stage_shuffle_patches=True)
 
     # Sequence length configurations
     p.add_argument('--pre-onset-sec', type=float, default=5.0, help='Seconds before onset to extract')
@@ -2201,6 +2247,7 @@ def main():
         n_post_patches=n_post_patches,
         fs=args.fs,
         labram_checkpoint=args.labram_ckpt,
+        n_frozen_layers=args.labram_frozen_layers,
         output_mode=args.output_mode,
         w_region=args.w_region,
         w_hemisphere=args.w_hemisphere,
@@ -2208,9 +2255,9 @@ def main():
     model = TimeFilter_LaBraM_BrainNetwork_Integration(cfg).to(device)
     log.info(model.summary())
     if stage_pretrain_ckpt is not None:
-        load_info = model.load_a_branch_weights(str(stage_pretrain_ckpt), map_location=device)
+        load_info = model.load_backbone_weights(str(stage_pretrain_ckpt), map_location=device)
         log.info(
-            "  Loaded stage-pretrained A-branch from %s (loaded=%d, missing=%d, unexpected=%d)",
+            "  Loaded stage-pretrained LaBraM backbone from %s (loaded=%d, missing=%d, unexpected=%d)",
             stage_pretrain_ckpt,
             len(load_info['loaded_keys']),
             len(load_info['missing_keys']),
@@ -2280,8 +2327,11 @@ def main():
         base_model.unfreeze_timefilter()
         log.info("  Finetune setup: LaBraM backbone frozen, TimeFilter + downstream heads trainable")
     elif has_stage_init:
-        base_model.unfreeze_all()
-        log.info("  Finetune setup: loaded stage-pretrained A-branch, all parameters trainable")
+        log.info(
+            "  Finetune setup: stage-pretrained LaBraM loaded; bottom %d transformer blocks "
+            "+ patch/embed tokens remain frozen, upper LaBraM blocks stay trainable",
+            args.labram_frozen_layers,
+        )
 
     optimizer = torch.optim.AdamW(
         base_model.get_param_groups(args.lr), weight_decay=args.weight_decay,
@@ -2439,7 +2489,8 @@ def main():
             f"- Stage pretraining: {args.use_pretrain_stage}\n"
             f"- Stage only mode: {args.stage_only}\n"
             f"- Stage init ckpt: `{args.stage_pretrain_ckpt or stage_pretrain_ckpt or ''}`\n"
-            f"- Freeze LaBraM backbone: {args.freeze_labram}\n"
+            f"- Freeze LaBraM backbone: {bool(args.freeze_labram)}\n"
+            f"- LaBraM frozen layers during finetune: {'all' if args.freeze_labram else args.labram_frozen_layers}\n"
             f"- Finetune epochs: {total_epochs}\n"
             f"- Output mode: {args.output_mode}\n\n"
             f"## Test Metrics\n\n"

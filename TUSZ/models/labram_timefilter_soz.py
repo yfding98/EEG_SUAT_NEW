@@ -580,7 +580,12 @@ class LaBraMBackbone(nn.Module):
             f"frozen={n_freeze}+embed, trainable params={n_trainable:,}/{n_total:,}"
         )
 
-    def forward(self, x: torch.Tensor, input_chans=None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_chans=None,
+        use_time_embed: bool = True,
+    ) -> torch.Tensor:
         """
         Args:
             x: [B, N_channels, N_patches, patch_size]  e.g. [B, 22, 10, 200]
@@ -603,7 +608,7 @@ class LaBraMBackbone(nn.Module):
             pos_e = pos_e.flatten(1, 2)                       # [B, n_ch*n_patches, D]
             x = x + pos_e
 
-        if self.time_embed is not None:
+        if self.time_embed is not None and use_time_embed:
             time_e = self.time_embed[:, :n_patches, :]        # [1, n_patches, D]
             time_e = time_e.unsqueeze(1).expand(batch_size, n_ch, -1, -1)
             time_e = time_e.flatten(1, 2)                     # [B, n_ch*n_patches, D]

@@ -457,8 +457,9 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         """
         Enable only the modules used in stage pretraining.
 
-        This keeps branch-B parameters frozen so the optimizer only updates
-        LaBraM, TimeFilter, and the patch-level stage head.
+        Stage-1 only optimizes the LaBraM backbone and the lightweight
+        patch-level detection head. Branch-B, TimeFilter, fusion, and SOZ
+        heads stay frozen.
         """
         for p in self.parameters():
             p.requires_grad = False
@@ -466,8 +467,6 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         if train_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = True
-        for p in self.timefilter.parameters():
-            p.requires_grad = True
         for p in self.stage_head.parameters():
             p.requires_grad = True
 
@@ -529,10 +528,13 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
 
             patches_a = patches.permute(0, 2, 1, 3)
             if c.use_checkpoint and self.training:
-                h = checkpoint(self.backbone, patches_a, use_reentrant=False)
+                h = checkpoint(
+                    lambda inp: self.backbone(inp, use_time_embed=False),
+                    patches_a,
+                    use_reentrant=False,
+                )
             else:
-                h = self.backbone(patches_a)
-            h, moe_loss_a = self.timefilter(h, is_training=self.training)
+                h = self.backbone(patches_a, use_time_embed=False)
 
             stage_logits = self.stage_head(h)
             outputs = {
@@ -540,7 +542,6 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
                 'stage_probs': torch.softmax(stage_logits, dim=-1),
                 'valid_patch_counts': vp_counts,
                 'seizure_relative_time': rel_time,
-                'moe_loss': moe_loss_a,
             }
             self._last = {
                 k: (v.detach() if isinstance(v, torch.Tensor) else v)
@@ -833,6 +834,36 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             key for key in own_state.keys()
             if (key.startswith('backbone.') or key.startswith('timefilter.'))
             and key not in branch_state
+        ]
+        return {
+            'loaded_keys': sorted(loaded_keys),
+            'missing_keys': sorted(missing_keys),
+            'unexpected_keys': sorted(unexpected_keys),
+        }
+
+    def load_backbone_weights(self, path: str, map_location='cpu') -> Dict[str, List[str]]:
+        """Load only LaBraM backbone weights from a checkpoint."""
+        ckpt = torch.load(path, map_location=map_location)
+        state = ckpt.get('model_state', ckpt.get('state_dict', ckpt))
+        backbone_state = {}
+        for key, value in state.items():
+            clean_key = key[7:] if key.startswith('module.') else key
+            if clean_key.startswith('backbone.'):
+                backbone_state[clean_key] = value
+
+        own_state = self.state_dict()
+        loaded_keys: List[str] = []
+        unexpected_keys: List[str] = []
+        for key, value in backbone_state.items():
+            if key not in own_state or own_state[key].shape != value.shape:
+                unexpected_keys.append(key)
+                continue
+            own_state[key].copy_(value)
+            loaded_keys.append(key)
+
+        missing_keys = [
+            key for key in own_state.keys()
+            if key.startswith('backbone.') and key not in backbone_state
         ]
         return {
             'loaded_keys': sorted(loaded_keys),
