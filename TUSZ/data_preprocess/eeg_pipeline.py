@@ -370,46 +370,36 @@ class EEGPipeline:
         """
         pre = int(self.cfg.pre_onset_sec * fs)
         post = int(self.cfg.post_onset_sec * fs)
+        min_pre = int(self.cfg.min_pre_sec * fs)
+        min_post = int(self.cfg.min_post_sec * fs)
         win_len = pre + post
-        onset_samp = int(onset * fs)
         n_total = data.shape[1]
+        onset_samp_abs = int(onset * fs)
 
-        # 检查最小数据要求
-        avail_pre = min(pre, max(0, onset_samp))
-        avail_post = min(post, max(0, n_total - onset_samp))
-        if avail_pre < int(self.cfg.min_pre_sec * fs):
-            return None
-        if avail_post < int(self.cfg.min_post_sec * fs):
-            return None
+        def _calc_indices(onset_samp_ref: int) -> Optional[Tuple[int, int, int, int]]:
+            avail_pre = min(pre, max(0, onset_samp_ref))
+            avail_post = min(post, max(0, n_total - onset_samp_ref))
+            if avail_pre < min_pre or avail_post < min_post:
+                return None
 
-        # 提取 (边界处零填充)
-        window = np.zeros((data.shape[0], win_len), dtype=np.float64)
-        
-        # If we cropped during load_edf, onset_samp is relative to the cropped start
-        # The crop started at `max(0, onset - (pre_onset_sec + 2.0))`
-        # To be safe, we just take the center segment since we know the window limits
-        # We will assume data was cropped if it's smaller than the full edf would normally be.
-        # It's better to calculate relative to crop
-        
-        # A simpler way when data is already cropped with a 2-second margin:
-        # Expected cropped length: (pre + 2.0 + post + 2.0) * fs
-        # Target start index within this cropped data: 2.0 * fs
-        if data.shape[1] < (pre + post + 10) * fs: # It was cropped
-            cropped_tmin_sec = max(0.0, onset - (self.cfg.pre_onset_sec + 2.0))
+            src_s = max(0, onset_samp_ref - pre)
+            src_e = min(n_total, onset_samp_ref + post)
+            dst_s = pre - (onset_samp_ref - src_s)
+            dst_e = dst_s + (src_e - src_s)
+            return src_s, src_e, dst_s, dst_e
+
+        indices = _calc_indices(onset_samp_abs)
+        if indices is None:
+            crop_margin_sec = 2.0
+            cropped_tmin_sec = max(0.0, onset - (self.cfg.pre_onset_sec + crop_margin_sec))
             onset_samp_rel = int((onset - cropped_tmin_sec) * fs)
-            src_s = max(0, onset_samp_rel - pre)
-            src_e = min(n_total, onset_samp_rel + post)
-            dst_s = pre - (onset_samp_rel - src_s)
-            dst_e = dst_s + (src_e - src_s)
-        else: # Full file (e.g. if onset was not provided to load_edf)
-            src_s = max(0, onset_samp - pre)
-            src_e = min(n_total, onset_samp + post)
-            dst_s = max(0, pre - onset_samp) if onset_samp < pre else 0 
-            # Equivalently: dst_s = pre - (onset_samp - src_s)
-            dst_e = dst_s + (src_e - src_s)
-            
-        window[:, dst_s:dst_e] = data[:, src_s:src_e]
+            indices = _calc_indices(onset_samp_rel)
+            if indices is None:
+                return None
 
+        src_s, src_e, dst_s, dst_e = indices
+        window = np.zeros((data.shape[0], win_len), dtype=np.float64)
+        window[:, dst_s:dst_e] = data[:, src_s:src_e]
         return window
 
     # -----------------------------------------------------------------
@@ -1479,4 +1469,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
