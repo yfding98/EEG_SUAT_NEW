@@ -389,13 +389,13 @@ class EEGStagePretrainDataset(Dataset):
             window = self.pipeline.extract_window(data_21, fs, sample.center_sec)
             if window is None:
                 return self._empty_item(sample, window_start_sec, LOAD_STATUS_WINDOW_NONE)
-            if self.pipeline.is_bad_window(window, fs):
-                return self._empty_item(sample, window_start_sec, LOAD_STATUS_BAD_WINDOW)
 
             clipped = self.pipeline.clip_by_baseline(window, baseline_n)
             bipolar, channel_mask = self.pipeline.to_tcp_bipolar(clipped)
             if int(channel_mask.sum()) < cfg.min_valid_channels:
                 return self._empty_item(sample, window_start_sec, LOAD_STATUS_INSUFFICIENT_CHANNELS)
+            if self.pipeline.is_bad_bipolar_window(bipolar, channel_mask, fs):
+                return self._empty_item(sample, window_start_sec, LOAD_STATUS_BAD_WINDOW)
 
             bipolar = self.pipeline.normalize_by_baseline(bipolar, baseline_n)
             stage_labels, valid_patch_mask = assign_patch_binary_labels(

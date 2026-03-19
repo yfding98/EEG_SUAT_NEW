@@ -406,7 +406,7 @@ class EEGPipeline:
     # 坏段检测
     # -----------------------------------------------------------------
 
-    def is_bad_window(self, window: np.ndarray, fs: float) -> bool:
+    def _is_bad_window_legacy(self, window: np.ndarray, fs: float) -> bool:
         """
         检测坏窗口:
           - 幅值 > 500μV (对MNE返回的Volts数据: > 5e-4 V)
@@ -421,6 +421,99 @@ class EEGPipeline:
         for ch in range(window.shape[0]):
             if self._max_flat_run(window[ch]) >= flat_limit:
                 return True
+        return False
+
+    def is_bad_bipolar_window(
+        self,
+        window: np.ndarray,
+        channel_mask: np.ndarray,
+        fs: float,
+    ) -> bool:
+        """
+        Artifact screening tuned for seizure-onset detection.
+
+        The check runs after bipolar conversion and only inspects valid bipolar
+        channels. Whole-window rejection is triggered only when artifact-like
+        behavior affects a meaningful fraction of valid channels.
+        """
+        valid = np.asarray(channel_mask, dtype=np.float32) > 0.5
+        n_valid = int(valid.sum())
+        if n_valid <= 0:
+            return True
+
+        valid_window = np.asarray(window[valid], dtype=np.float64)
+        if valid_window.size == 0:
+            return True
+
+        active_cols = np.any(np.abs(valid_window) > 1e-12, axis=0)
+        if np.any(active_cols):
+            active_idx = np.flatnonzero(active_cols)
+            valid_window = valid_window[:, active_idx[0]: active_idx[-1] + 1]
+        if valid_window.shape[1] <= 1:
+            return True
+
+        bad_amp_uv = max(float(getattr(self.cfg, 'bad_amp_uv', 1000.0)), 1000.0)
+        bad_amp_v = bad_amp_uv * 1e-6
+        bad_amp_sample_ratio = float(getattr(self.cfg, 'bad_amp_sample_ratio', 0.01))
+        bad_channel_ratio = float(getattr(self.cfg, 'bad_channel_ratio', 0.25))
+        flat_sec = max(float(getattr(self.cfg, 'flat_sec', 2.0)), 2.0)
+        flat_channel_ratio = float(getattr(self.cfg, 'flat_channel_ratio', 0.25))
+
+        amp_ratio = np.mean(np.abs(valid_window) > bad_amp_v, axis=1)
+        n_amp_bad = int(np.sum(amp_ratio >= bad_amp_sample_ratio))
+        if (n_amp_bad / float(n_valid)) >= bad_channel_ratio:
+            return True
+
+        flat_limit = max(int(flat_sec * fs), 1)
+        n_flat_bad = 0
+        for ch in valid_window:
+            if self._max_flat_run(ch) >= flat_limit:
+                n_flat_bad += 1
+        if (n_flat_bad / float(n_valid)) >= flat_channel_ratio:
+            return True
+
+        return False
+
+    def is_bad_window(self, window: np.ndarray, fs: float) -> bool:
+        """
+        Backward-compatible raw-window check.
+
+        This version ignores fully empty channels and shared zero-padding at
+        the edges, then applies ratio-based amplitude/flatline rejection.
+        """
+        valid = np.any(np.abs(window) > 1e-12, axis=1)
+        n_valid = int(valid.sum())
+        if n_valid <= 0:
+            return True
+
+        valid_window = np.asarray(window[valid], dtype=np.float64)
+        active_cols = np.any(np.abs(valid_window) > 1e-12, axis=0)
+        if np.any(active_cols):
+            active_idx = np.flatnonzero(active_cols)
+            valid_window = valid_window[:, active_idx[0]: active_idx[-1] + 1]
+        if valid_window.shape[1] <= 1:
+            return True
+
+        bad_amp_uv = max(float(getattr(self.cfg, 'bad_amp_uv', 1000.0)), 1000.0)
+        bad_amp_v = bad_amp_uv * 1e-6
+        bad_amp_sample_ratio = float(getattr(self.cfg, 'bad_amp_sample_ratio', 0.01))
+        bad_channel_ratio = float(getattr(self.cfg, 'bad_channel_ratio', 0.25))
+        flat_sec = max(float(getattr(self.cfg, 'flat_sec', 2.0)), 2.0)
+        flat_channel_ratio = float(getattr(self.cfg, 'flat_channel_ratio', 0.25))
+
+        amp_ratio = np.mean(np.abs(valid_window) > bad_amp_v, axis=1)
+        n_amp_bad = int(np.sum(amp_ratio >= bad_amp_sample_ratio))
+        if (n_amp_bad / float(n_valid)) >= bad_channel_ratio:
+            return True
+
+        flat_limit = max(int(flat_sec * fs), 1)
+        n_flat_bad = 0
+        for ch in valid_window:
+            if self._max_flat_run(ch) >= flat_limit:
+                n_flat_bad += 1
+        if (n_flat_bad / float(n_valid)) >= flat_channel_ratio:
+            return True
+
         return False
 
     @staticmethod
@@ -629,6 +722,10 @@ class EEGPipeline:
             return None
 
         # (f) 标准化: 基于双极基线期 z-score
+        if self.is_bad_bipolar_window(bipolar, ch_mask, fs):
+            logger.debug(f"é§å¿”î†Œé“æ—ˆæ«Ž: onset={event.onset:.1f}s")
+            return None
+
         bipolar = self.normalize_by_baseline(bipolar, bl_n)
 
         # (g) 补丁分割: (22, 2000) → (22, 20, 100)
