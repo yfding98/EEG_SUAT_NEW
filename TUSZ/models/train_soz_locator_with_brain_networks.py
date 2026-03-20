@@ -52,6 +52,7 @@ try:
     from models.brain_network_extractor import MultiScaleBrainNetworkExtractor
     from models.dynamic_network_evolution import DynamicNetworkEvolutionModel
     from models.manifest_dataset import ManifestSOZDataset
+    from models.region_confusion import save_region_confusion_report
     from tasks.stage_detection import (
         EEGStagePretrainDataset,
         NON_SEIZURE_LABEL,
@@ -71,6 +72,7 @@ except ImportError:
     from .brain_network_extractor import MultiScaleBrainNetworkExtractor
     from .dynamic_network_evolution import DynamicNetworkEvolutionModel
     from .manifest_dataset import ManifestSOZDataset
+    from .region_confusion import save_region_confusion_report
     from ..tasks.stage_detection import (
         EEGStagePretrainDataset,
         NON_SEIZURE_LABEL,
@@ -338,11 +340,14 @@ def build_soz_datasets(
             f"split_strategy='private_target' requires --source all/private, got {args.source}"
         )
 
+    hemisphere_label_mode = 'lrb'
+
     dataset_kwargs = dict(
         manifest_path=args.manifest,
         private_data_root=args.private_data_root,
         tusz_data_root=args.tusz_data_root,
         label_mode=args.output_mode,
+        hemisphere_label_mode=hemisphere_label_mode,
         pipeline_cfg=pipeline_cfg,
     )
 
@@ -367,6 +372,7 @@ def build_soz_datasets(
         train_parts: List[torch.utils.data.Dataset] = []
         split_meta: Dict[str, object] = {
             'strategy': 'private_target',
+            'hemisphere_label_mode': hemisphere_label_mode,
             'private_patient_split': patient_split,
             'log_lines': [],
         }
@@ -462,6 +468,7 @@ def build_soz_datasets(
     )
     split_meta = {
         'strategy': 'random',
+        'hemisphere_label_mode': hemisphere_label_mode,
         'log_lines': [
             _format_subset_summary('all_sources', _summarize_manifest_subset(manifest_ds)),
             f"random_split train={n_train} val={n_val} test={n_test}",
@@ -839,6 +846,21 @@ def compute_pos_weight(loader, device='cpu') -> torch.Tensor:
     return pw.to(device)
 
 
+def build_generalized_sample_weight(
+    label: torch.Tensor,
+    device: torch.device,
+    pos_ratio_threshold: float = 0.5,
+    positive_weight: float = 0.05,
+) -> torch.Tensor:
+    """Down-weight samples with a high fraction of positive SOZ channels."""
+    pos_ratio = label.sum(dim=1) / max(label.shape[1], 1)
+    return torch.where(
+        pos_ratio > pos_ratio_threshold,
+        torch.tensor(positive_weight, device=device, dtype=torch.float32),
+        torch.tensor(1.0, device=device, dtype=torch.float32),
+    )
+
+
 # =====================================================================
 # Dataset wrapper (adds onset / window metadata for patching)
 # =====================================================================
@@ -991,12 +1013,11 @@ def train_one_epoch(
                 outputs['seizure_relative_time'], vm,
             )
 
-            # Compute sample_weight for soft suppression of generalized seizures (pos_ratio > 0.5)
-            pos_ratio = label.sum(dim=1) / max(label.shape[1], 1)
-            sample_weight = torch.where(
-                pos_ratio > 0.5, 
-                torch.tensor(0.05, device=device, dtype=torch.float32), 
-                torch.tensor(1.0, device=device, dtype=torch.float32)
+            sample_weight = build_generalized_sample_weight(
+                label=label,
+                device=device,
+                pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+                positive_weight=args.generalized_sample_weight,
             )
 
             loss, losses = base.compute_loss(
@@ -1159,11 +1180,11 @@ def evaluate(model, loader, device):
         aux = DynamicNetworkEvolutionModel.compute_auxiliary_targets(
             out['seizure_relative_time'], vm,
         )
-        pos_ratio = label.sum(dim=1) / max(label.shape[1], 1)
-        sample_weight = torch.where(
-            pos_ratio > 0.5,
-            torch.tensor(0.05, device=device, dtype=torch.float32),
-            torch.tensor(1.0, device=device, dtype=torch.float32),
+        sample_weight = build_generalized_sample_weight(
+            label=label,
+            device=device,
+            pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+            positive_weight=args.generalized_sample_weight,
         )
         _, losses = base.compute_loss(
             out,
@@ -2097,10 +2118,22 @@ def parse_args():
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight-decay', type=float, default=1e-4)
+    p.add_argument('--w-transition', type=float, default=0.3,
+                   help='Loss weight for patch-level transition detection auxiliary task')
+    p.add_argument('--w-pattern', type=float, default=0.2,
+                   help='Loss weight for seizure pattern classification auxiliary task')
     p.add_argument('--w-region', type=float, default=0.5,
                    help='Loss weight for coarse region classifier')
     p.add_argument('--w-hemisphere', type=float, default=0.5,
                    help='Loss weight for hemisphere classifier')
+    p.add_argument('--focal-alpha', type=float, default=0.75,
+                   help='Positive-class balancing factor for the SOZ focal loss')
+    p.add_argument('--focal-gamma', type=float, default=2.0,
+                   help='Focusing parameter for the SOZ focal loss')
+    p.add_argument('--generalized-pos-ratio-threshold', type=float, default=0.5,
+                   help='Samples with positive-channel ratio above this threshold are down-weighted')
+    p.add_argument('--generalized-sample-weight', type=float, default=0.05,
+                   help='Sample weight applied to samples above --generalized-pos-ratio-threshold')
     p.add_argument('--amp', action='store_true', help='mixed precision')
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--seed', type=int, default=42)
@@ -2188,6 +2221,7 @@ def main():
         pipeline_cfg=pipeline_cfg,
     )
     log.info("  SOZ split strategy: %s", split_meta['strategy'])
+    log.info("  Hemisphere label mode: %s", split_meta.get('hemisphere_label_mode', 'lrb'))
     for line in split_meta.get('log_lines', []):
         log.info("  %s", line)
 
@@ -2239,6 +2273,7 @@ def main():
         )
 
     log.info("=== Step 2: Initializing model ===")
+    n_hemisphere_classes = 2 if split_meta.get('hemisphere_label_mode') == 'lr_ignore_b' else 3
     cfg = IntegrationConfig(
         task_mode='soz',
         embed_dim=args.embed_dim,
@@ -2249,11 +2284,29 @@ def main():
         labram_checkpoint=args.labram_ckpt,
         n_frozen_layers=args.labram_frozen_layers,
         output_mode=args.output_mode,
+        n_hemisphere_classes=n_hemisphere_classes,
+        w_transition=args.w_transition,
+        w_pattern=args.w_pattern,
         w_region=args.w_region,
         w_hemisphere=args.w_hemisphere,
+        focal_gamma=args.focal_gamma,
+        focal_alpha=args.focal_alpha,
     )
     model = TimeFilter_LaBraM_BrainNetwork_Integration(cfg).to(device)
     log.info(model.summary())
+    log.info(
+        "  Loss setup: w_transition=%.3f w_pattern=%.3f w_region=%.3f "
+        "w_hemisphere=%.3f focal_alpha=%.3f focal_gamma=%.3f "
+        "generalized_pos_ratio_threshold=%.3f generalized_sample_weight=%.3f",
+        args.w_transition,
+        args.w_pattern,
+        args.w_region,
+        args.w_hemisphere,
+        args.focal_alpha,
+        args.focal_gamma,
+        args.generalized_pos_ratio_threshold,
+        args.generalized_sample_weight,
+    )
     if stage_pretrain_ckpt is not None:
         load_info = model.load_backbone_weights(str(stage_pretrain_ckpt), map_location=device)
         log.info(
@@ -2524,6 +2577,14 @@ def main():
             hemisphere_logits=test_metrics['hemisphere_logits'],
             hemisphere_targets=test_metrics['hemisphere_targets'],
         )
+        region_md_path, region_csv_path = save_region_confusion_report(
+            region_probs=test_metrics['region_probs'],
+            region_targets=test_metrics['region_targets'],
+            output_dir=output_dir,
+            threshold=0.5,
+        )
+        log.info("Region confusion report saved to %s", region_md_path)
+        log.info("Region confusion CSV saved to %s", region_csv_path)
 
     if writer:
         writer.close()

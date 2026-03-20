@@ -72,6 +72,8 @@ REGION_NAMES = ['FP', 'F', 'C', 'T', 'P', 'O']
 REGION_TO_INDEX = {name: idx for idx, name in enumerate(REGION_NAMES)}
 HEMISPHERE_NAMES = ['L', 'R', 'B']
 HEMISPHERE_TO_INDEX = {name: idx for idx, name in enumerate(HEMISPHERE_NAMES)}
+HEMISPHERE_NAMES_LR = ['L', 'R']
+HEMISPHERE_TO_INDEX_LR = {name: idx for idx, name in enumerate(HEMISPHERE_NAMES_LR)}
 HEMISPHERE_IGNORE_INDEX = -100
 
 
@@ -121,8 +123,13 @@ def _build_region_target(onset_channels: str, bipolar_label: np.ndarray) -> np.n
     return region_target
 
 
-def _map_hemisphere_label(raw_value: str) -> int:
-    return HEMISPHERE_TO_INDEX.get(str(raw_value).strip().upper(), HEMISPHERE_IGNORE_INDEX)
+def _map_hemisphere_label(raw_value: str, mode: str = 'lrb') -> int:
+    value = str(raw_value).strip().upper()
+    if mode == 'lrb':
+        return HEMISPHERE_TO_INDEX.get(value, HEMISPHERE_IGNORE_INDEX)
+    if mode == 'lr_ignore_b':
+        return HEMISPHERE_TO_INDEX_LR.get(value, HEMISPHERE_IGNORE_INDEX)
+    raise ValueError(f"Unsupported hemisphere label mode: {mode}")
 
 
 def _build_bipolar_to_monopolar_matrix() -> np.ndarray:
@@ -198,6 +205,7 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         patient_ids: Optional[List[str]] = None,
         soz_only: bool = False,
         label_mode: str = 'bipolar',       # 'bipolar' or 'monopolar'
+        hemisphere_label_mode: str = 'lrb',
         pipeline_cfg: 'PipelineConfig' = None,
         exclude_montages: Optional[List[str]] = None,
         min_valid_channels: int = 0,
@@ -208,6 +216,11 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         self.tusz_data_root = tusz_data_root
         self.private_data_root = private_data_root
         self.label_mode = label_mode
+        if hemisphere_label_mode not in ('lrb', 'lr_ignore_b'):
+            raise ValueError(
+                f"Unsupported hemisphere_label_mode: {hemisphere_label_mode}"
+            )
+        self.hemisphere_label_mode = hemisphere_label_mode
 
         # 初始化 EEG 预处理管道
         if _HAS_PIPELINE:
@@ -304,7 +317,8 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         logger.info(
             f"ManifestSOZDataset: {n0} -> {len(self.df)} rows "
             f"(source={source_filter}, split={split_filter}, "
-            f"patients={len(self.df['patient_id'].unique())}, label_mode={self.label_mode})"
+            f"patients={len(self.df['patient_id'].unique())}, "
+            f"label_mode={self.label_mode}, hemisphere_mode={self.hemisphere_label_mode})"
         )
 
     def __len__(self) -> int:
@@ -343,7 +357,10 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
             str(row.get('onset_channels', '')),
             bipolar_label,
         )
-        hemisphere_label = _map_hemisphere_label(str(row.get('hemisphere', '')))
+        hemisphere_label = _map_hemisphere_label(
+            str(row.get('hemisphere', '')),
+            mode=self.hemisphere_label_mode,
+        )
 
         # ── 元数据 ────────────────────────────────────────────────────────
         meta = {
