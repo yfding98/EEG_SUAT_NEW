@@ -967,7 +967,16 @@ def collate_fn(batch):
 # =====================================================================
 
 def train_one_epoch(
-    model, loader, optimizer, scaler, device, epoch, cfg, writer=None,
+    model,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    epoch,
+    cfg,
+    writer=None,
+    generalized_pos_ratio_threshold: float = 0.5,
+    generalized_sample_weight: float = 0.05,
 ):
     model.train()
     base = model.module if hasattr(model, 'module') else model
@@ -1016,8 +1025,8 @@ def train_one_epoch(
             sample_weight = build_generalized_sample_weight(
                 label=label,
                 device=device,
-                pos_ratio_threshold=args.generalized_pos_ratio_threshold,
-                positive_weight=args.generalized_sample_weight,
+                pos_ratio_threshold=generalized_pos_ratio_threshold,
+                positive_weight=generalized_sample_weight,
             )
 
             loss, losses = base.compute_loss(
@@ -1139,7 +1148,13 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(
+    model,
+    loader,
+    device,
+    generalized_pos_ratio_threshold: float = 0.5,
+    generalized_sample_weight: float = 0.05,
+):
     model.eval()
     base = model.module if hasattr(model, 'module') else model
     all_probs, all_targets, all_logits = [], [], []
@@ -1183,8 +1198,8 @@ def evaluate(model, loader, device):
         sample_weight = build_generalized_sample_weight(
             label=label,
             device=device,
-            pos_ratio_threshold=args.generalized_pos_ratio_threshold,
-            positive_weight=args.generalized_sample_weight,
+            pos_ratio_threshold=generalized_pos_ratio_threshold,
+            positive_weight=generalized_sample_weight,
         )
         _, losses = base.compute_loss(
             out,
@@ -2424,13 +2439,28 @@ def main():
         # train
         t0 = time.time()
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, scaler, device, epoch, cfg, writer,
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            device,
+            epoch,
+            cfg,
+            writer,
+            generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+            generalized_sample_weight=args.generalized_sample_weight,
         )
         scheduler.step()
         dt = time.time() - t0
 
         # validate
-        val_metrics = evaluate(model, val_loader, device)
+        val_metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+            generalized_sample_weight=args.generalized_sample_weight,
+        )
 
         if is_main(rank):
             val_summary = {
@@ -2516,7 +2546,13 @@ def main():
         ckpt_best = torch.load(str(best_path), map_location=device)
         base_model.load_state_dict(ckpt_best['model_state'])
 
-    test_metrics = evaluate(model, test_loader, device)
+    test_metrics = evaluate(
+        model,
+        test_loader,
+        device,
+        generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+        generalized_sample_weight=args.generalized_sample_weight,
+    )
 
     if is_main(rank):
         log.info(
