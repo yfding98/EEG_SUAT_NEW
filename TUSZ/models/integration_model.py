@@ -17,6 +17,7 @@ Output: [B, 19] SOZ probabilities  +  auxiliary outputs
 from __future__ import annotations
 
 import copy
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -24,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+log = logging.getLogger(__name__)
 
 # ── Local imports (sibling modules) ──
 try:
@@ -808,7 +811,38 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         if isinstance(cfg, dict):
             cfg = IntegrationConfig(**cfg)
         model = cls(cfg)
-        model.load_state_dict(ckpt['model_state'])
+        state = ckpt.get('model_state', ckpt.get('state_dict', ckpt))
+        if not isinstance(state, dict):
+            raise KeyError("Checkpoint does not contain a valid model state dict")
+
+        own_state = model.state_dict()
+        filtered_state: Dict[str, torch.Tensor] = {}
+        unexpected_keys: List[str] = []
+        for key, value in state.items():
+            clean_key = key[7:] if key.startswith('module.') else key
+            if clean_key not in own_state:
+                unexpected_keys.append(clean_key)
+                continue
+            if own_state[clean_key].shape != value.shape:
+                unexpected_keys.append(
+                    f"{clean_key} (ckpt={tuple(value.shape)} != model={tuple(own_state[clean_key].shape)})"
+                )
+                continue
+            filtered_state[clean_key] = value
+
+        missing_keys = [key for key in own_state.keys() if key not in filtered_state]
+        model.load_state_dict(filtered_state, strict=False)
+        log.info(
+            "Loaded checkpoint %s with compatible keys: loaded=%d missing=%d unexpected_or_mismatch=%d",
+            path,
+            len(filtered_state),
+            len(missing_keys),
+            len(unexpected_keys),
+        )
+        if missing_keys:
+            log.warning("Missing keys when loading checkpoint: %s", missing_keys[:20])
+        if unexpected_keys:
+            log.warning("Unexpected or mismatched keys in checkpoint: %s", unexpected_keys[:20])
         return model, ckpt
 
     def load_a_branch_weights(self, path: str, map_location='cpu') -> Dict[str, List[str]]:
