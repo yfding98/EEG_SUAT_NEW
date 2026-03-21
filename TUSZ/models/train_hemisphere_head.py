@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import logging
 import sys
@@ -11,7 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import ConcatDataset, DataLoader, RandomSampler
 from tqdm.auto import tqdm
 
 _PARENT = Path(__file__).resolve().parent.parent
@@ -21,14 +22,18 @@ if str(_PARENT) not in sys.path:
 try:
     from data_preprocess.eeg_pipeline import PipelineConfig
     from models.integration_model import TimeFilter_LaBraM_BrainNetwork_Integration
+    from models.manifest_dataset import ManifestSOZDataset
     from models.train_soz_locator_with_brain_networks import (
+        SOZBrainNetworkDataset,
         build_soz_datasets,
         collate_fn,
     )
 except ImportError:
     from ..data_preprocess.eeg_pipeline import PipelineConfig
     from .integration_model import TimeFilter_LaBraM_BrainNetwork_Integration
+    from .manifest_dataset import ManifestSOZDataset
     from .train_soz_locator_with_brain_networks import (
+        SOZBrainNetworkDataset,
         build_soz_datasets,
         collate_fn,
     )
@@ -60,6 +65,17 @@ def compute_accuracy(logits: np.ndarray, targets: np.ndarray, ignore_index: int 
     return float((preds[mask] == targets[mask]).mean())
 
 
+def compute_balanced_accuracy(logits: np.ndarray, targets: np.ndarray, ignore_index: int = -100) -> float:
+    matrix = compute_confusion_matrix(logits, targets, ignore_index=ignore_index)
+    recalls = []
+    for class_idx in range(matrix.shape[0]):
+        support = int(matrix[class_idx].sum())
+        if support <= 0:
+            continue
+        recalls.append(float(matrix[class_idx, class_idx]) / float(support))
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
 def compute_class_weight(loader: DataLoader, n_classes: int, ignore_index: int = -100) -> torch.Tensor:
     counts = torch.zeros(n_classes, dtype=torch.float32)
     for batch in loader:
@@ -72,6 +88,114 @@ def compute_class_weight(loader: DataLoader, n_classes: int, ignore_index: int =
         if count > 0:
             weights[idx] = total / (n_classes * count)
     return weights
+
+
+def summarize_hemisphere_counts(dataset) -> Dict[str, int]:
+    if isinstance(dataset, ConcatDataset):
+        counter: Counter = Counter()
+        for sub_ds in dataset.datasets:
+            counter.update(summarize_hemisphere_counts(sub_ds))
+        return {str(k): int(v) for k, v in counter.items()}
+    if hasattr(dataset, "ds") and hasattr(dataset.ds, "df"):
+        df = dataset.ds.df
+        return {
+            str(k): int(v)
+            for k, v in df["hemisphere"].astype(str).value_counts().to_dict().items()
+        }
+    return {}
+
+
+def sample_patient_balanced_rows(df, max_rows: int, seed: int) -> np.ndarray:
+    if max_rows <= 0 or len(df) <= max_rows:
+        return df.index.to_numpy()
+
+    rng = np.random.default_rng(seed)
+    patient_groups: List[List[int]] = []
+    for _, patient_df in df.groupby("patient_id", sort=False):
+        indices = patient_df.index.to_numpy().copy()
+        rng.shuffle(indices)
+        patient_groups.append(indices.tolist())
+    rng.shuffle(patient_groups)
+
+    selected: List[int] = []
+    while len(selected) < max_rows:
+        progressed = False
+        for group in patient_groups:
+            if not group:
+                continue
+            selected.append(group.pop())
+            progressed = True
+            if len(selected) >= max_rows:
+                break
+        if not progressed:
+            break
+    return np.array(selected, dtype=np.int64)
+
+
+def build_tusz_b_subset_dataset(
+    args: argparse.Namespace,
+    pipeline_cfg: PipelineConfig,
+    max_rows: int,
+    subset_name: str,
+    exclude_patient_ids: Optional[Sequence[str]] = None,
+    seed_offset: int = 0,
+) -> Tuple[Optional[SOZBrainNetworkDataset], List[str]]:
+    if max_rows <= 0:
+        return None, []
+
+    manifest_ds = ManifestSOZDataset(
+        manifest_path=args.manifest,
+        private_data_root=args.private_data_root,
+        tusz_data_root=args.tusz_data_root,
+        source_filter="tusz",
+        label_mode=args.output_mode,
+        hemisphere_label_mode="lrb",
+        pipeline_cfg=pipeline_cfg,
+    )
+    df = manifest_ds.df
+    df = df[df["hemisphere"].astype(str).str.upper() == "B"].copy()
+    if exclude_patient_ids:
+        df = df[~df["patient_id"].isin(list(exclude_patient_ids))].copy()
+    if len(df) == 0:
+        log.warning("No eligible TUSZ hemisphere=B samples found for %s set", subset_name)
+        return None, []
+
+    selected_indices = sample_patient_balanced_rows(
+        df=df,
+        max_rows=max_rows,
+        seed=args.seed + seed_offset,
+    )
+    selected_df = df.loc[selected_indices].reset_index(drop=True)
+    manifest_ds.df = selected_df
+    patient_ids = sorted(selected_df["patient_id"].astype(str).unique().tolist())
+    log.info(
+        "  Added TUSZ-B %s set: rows=%d patients=%d hemisphere=%s",
+        subset_name,
+        len(selected_df),
+        len(patient_ids),
+        {str(k): int(v) for k, v in selected_df["hemisphere"].value_counts().to_dict().items()},
+    )
+    return SOZBrainNetworkDataset(
+        manifest_ds,
+        precomputed_dir=args.precomputed_dir,
+    ), patient_ids
+
+
+def merge_epoch_metrics(metrics_list: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    logits_list = [m["logits"] for m in metrics_list if len(m.get("logits", [])) > 0]
+    targets_list = [m["targets"] for m in metrics_list if len(m.get("targets", [])) > 0]
+    if logits_list:
+        logits = np.concatenate(logits_list, axis=0)
+        targets = np.concatenate(targets_list, axis=0)
+    else:
+        logits = np.empty((0, len(HEMISPHERE_NAMES)), dtype=np.float32)
+        targets = np.empty((0,), dtype=np.int64)
+    return {
+        "logits": logits,
+        "targets": targets,
+        "acc": compute_accuracy(logits, targets),
+        "balanced_acc": compute_balanced_accuracy(logits, targets),
+    }
 
 
 def compute_confusion_matrix(
@@ -246,6 +370,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-class-weight", dest="use_class_weight", action="store_true")
     parser.add_argument("--no-use-class-weight", dest="use_class_weight", action="store_false")
     parser.set_defaults(use_class_weight=True)
+    parser.add_argument(
+        "--tusz-b-augment-rows",
+        type=int,
+        default=0,
+        help="Append up to this many TUSZ hemisphere=B samples to the stage-3 training set only",
+    )
+    parser.add_argument(
+        "--tusz-b-val-rows",
+        type=int,
+        default=0,
+        help="Build a small TUSZ hemisphere=B validation set for stage-3 model selection",
+    )
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args()
 
@@ -280,6 +416,40 @@ def main() -> int:
     for line in split_meta.get("log_lines", []):
         log.info("  %s", line)
 
+    tusz_b_val_ds, tusz_b_val_patients = build_tusz_b_subset_dataset(
+        args=args,
+        pipeline_cfg=pipeline_cfg,
+        max_rows=args.tusz_b_val_rows,
+        subset_name="validation",
+        exclude_patient_ids=None,
+        seed_offset=1000,
+    )
+    tusz_b_ds, _ = build_tusz_b_subset_dataset(
+        args=args,
+        pipeline_cfg=pipeline_cfg,
+        max_rows=args.tusz_b_augment_rows,
+        subset_name="augmentation",
+        exclude_patient_ids=tusz_b_val_patients,
+        seed_offset=0,
+    )
+    if tusz_b_ds is not None:
+        train_ds = ConcatDataset([train_ds, tusz_b_ds])
+        log.info(
+            "  Final stage-3 train hemisphere distribution after TUSZ-B augmentation: %s",
+            summarize_hemisphere_counts(train_ds),
+        )
+    else:
+        log.info(
+            "  Final stage-3 train hemisphere distribution: %s",
+            summarize_hemisphere_counts(train_ds),
+        )
+
+    if tusz_b_val_ds is not None:
+        log.info(
+            "  Supplemental TUSZ-B validation distribution: %s",
+            summarize_hemisphere_counts(tusz_b_val_ds),
+        )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -295,6 +465,15 @@ def main() -> int:
         num_workers=args.workers,
         collate_fn=collate_fn,
     )
+    val_b_loader = None
+    if tusz_b_val_ds is not None:
+        val_b_loader = DataLoader(
+            tusz_b_val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+            collate_fn=collate_fn,
+        )
     test_loader = DataLoader(
         test_ds,
         batch_size=args.batch_size,
@@ -328,6 +507,7 @@ def main() -> int:
     scaler = torch.amp.GradScaler("cuda") if args.amp else None
 
     best_val_acc = -1.0
+    best_selection_score = -1.0
     best_ckpt_path = output_dir / "best_model.pt"
 
     log.info("=== Step 3: Hemisphere-head-only training ===")
@@ -348,30 +528,81 @@ def main() -> int:
             optimizer=None,
             scaler=None,
             class_weight=None,
-            desc="hemi-val",
+            desc="hemi-val-private",
         )
+        val_b_metrics = None
+        combined_val_metrics = None
+        selection_score = float(val_metrics["acc"])
+        if val_b_loader is not None:
+            val_b_metrics = run_epoch(
+                model=model,
+                loader=val_b_loader,
+                device=device,
+                optimizer=None,
+                scaler=None,
+                class_weight=None,
+                desc="hemi-val-tusz-b",
+            )
+            combined_val_metrics = merge_epoch_metrics([val_metrics, val_b_metrics])
+            selection_score = float(combined_val_metrics["balanced_acc"])
         scheduler.step()
 
-        log.info(
-            "Epoch %03d/%03d train_loss=%.4f train_acc=%.4f val_loss=%.4f val_acc=%.4f",
-            epoch + 1,
-            args.epochs,
-            train_metrics["loss"],
-            train_metrics["acc"],
-            val_metrics["loss"],
-            val_metrics["acc"],
-        )
+        if combined_val_metrics is None:
+            log.info(
+                "Epoch %03d/%03d train_loss=%.4f train_acc=%.4f val_loss=%.4f val_acc=%.4f",
+                epoch + 1,
+                args.epochs,
+                train_metrics["loss"],
+                train_metrics["acc"],
+                val_metrics["loss"],
+                val_metrics["acc"],
+            )
+        else:
+            log.info(
+                "Epoch %03d/%03d train_loss=%.4f train_acc=%.4f private_val_loss=%.4f private_val_acc=%.4f tusz_b_val_loss=%.4f tusz_b_val_acc=%.4f combined_val_acc=%.4f combined_bal_acc=%.4f",
+                epoch + 1,
+                args.epochs,
+                train_metrics["loss"],
+                train_metrics["acc"],
+                val_metrics["loss"],
+                val_metrics["acc"],
+                val_b_metrics["loss"],
+                val_b_metrics["acc"],
+                combined_val_metrics["acc"],
+                combined_val_metrics["balanced_acc"],
+            )
 
-        if val_metrics["acc"] > best_val_acc:
+        if selection_score > best_selection_score:
+            best_selection_score = selection_score
             best_val_acc = float(val_metrics["acc"])
+            extra = {
+                "epoch": epoch,
+                "best_val_acc": best_val_acc,
+                "best_selection_score": best_selection_score,
+            }
+            if combined_val_metrics is not None:
+                extra.update(
+                    {
+                        "best_private_val_acc": float(val_metrics["acc"]),
+                        "best_tusz_b_val_acc": float(val_b_metrics["acc"]),
+                        "best_combined_val_acc": float(combined_val_metrics["acc"]),
+                        "best_combined_bal_acc": float(combined_val_metrics["balanced_acc"]),
+                    }
+                )
             model.save_checkpoint(
                 str(best_ckpt_path),
-                extra={
-                    "epoch": epoch,
-                    "best_val_acc": best_val_acc,
-                },
+                extra=extra,
             )
-            log.info("  ** New best val_acc=%.4f -> %s", best_val_acc, best_ckpt_path)
+            if combined_val_metrics is None:
+                log.info("  ** New best val_acc=%.4f -> %s", best_val_acc, best_ckpt_path)
+            else:
+                log.info(
+                    "  ** New best combined_bal_acc=%.4f (private_val_acc=%.4f, tusz_b_val_acc=%.4f) -> %s",
+                    best_selection_score,
+                    val_metrics["acc"],
+                    val_b_metrics["acc"],
+                    best_ckpt_path,
+                )
 
     log.info("=== Step 4: Test evaluation ===")
     best_model, best_ckpt = TimeFilter_LaBraM_BrainNetwork_Integration.load_checkpoint(
