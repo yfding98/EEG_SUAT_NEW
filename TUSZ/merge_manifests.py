@@ -268,10 +268,13 @@ def process_private(private_path: str) -> pd.DataFrame:
 
         # onset_channels: 使用 soz_unipolar 列（分号分隔的单极通道名）
         soz_uni = str(r.get('soz_unipolar', ''))
+        onset_electrodes = []
         if soz_uni and soz_uni.strip() and soz_uni.strip().lower() != 'nan':
-            onset_channels = ';'.join(
-                c.strip().upper() for c in soz_uni.split(';') if c.strip()
-            )
+            for token in soz_uni.replace(',', ';').split(';'):
+                elec = token.strip().upper()
+                if elec and elec not in onset_electrodes:
+                    onset_electrodes.append(elec)
+            onset_channels = ';'.join(onset_electrodes)
         else:
             onset_channels = ''
 
@@ -294,8 +297,10 @@ def process_private(private_path: str) -> pd.DataFrame:
             nsz = 0
 
         # 半球
-        hemi_raw = str(r.get('hemi', '')).strip()
-        hemisphere = HEMI_MAP.get(hemi_raw, HEMI_MAP.get(hemi_raw.capitalize(), 'U'))
+        hemisphere = infer_hemisphere_from_electrodes(onset_electrodes)
+        if hemisphere == 'U':
+            hemi_raw = str(r.get('hemi', '')).strip()
+            hemisphere = HEMI_MAP.get(hemi_raw, HEMI_MAP.get(hemi_raw.capitalize(), 'U'))
 
         # edf_path ← loc 字段（数据文件相对路径）
         edf_path = str(r.get('loc', '')).replace('\\', '/')
