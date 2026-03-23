@@ -36,6 +36,8 @@ from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Sequentia
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
+SUPPORTED_BRAIN_NETWORK_FEATURES: Tuple[str, ...] = ('gc', 'te', 'aec', 'wpli')
+
 # ── project path ──
 _PARENT = Path(__file__).resolve().parent.parent
 if str(_PARENT) not in sys.path:
@@ -584,6 +586,29 @@ def build_selection_key(metrics: Dict[str, float]) -> Tuple[float, float, float,
         float(metrics.get('region_acc', 0.0)),
         float(metrics.get('hemisphere_acc', 0.0)),
     )
+
+
+def parse_brain_network_features(spec: str) -> Tuple[str, ...]:
+    raw = str(spec).strip().lower()
+    if not raw or raw == 'all':
+        return SUPPORTED_BRAIN_NETWORK_FEATURES
+
+    selected: List[str] = []
+    for item in raw.split(','):
+        name = item.strip().lower()
+        if not name:
+            continue
+        if name not in SUPPORTED_BRAIN_NETWORK_FEATURES:
+            raise ValueError(
+                f"Unsupported brain-network feature '{name}'. "
+                f"Choose from {SUPPORTED_BRAIN_NETWORK_FEATURES} or use 'all'."
+            )
+        if name not in selected:
+            selected.append(name)
+
+    if not selected:
+        raise ValueError("At least one brain-network feature must be selected")
+    return tuple(selected)
 
 
 def compute_multilabel_accuracy(
@@ -2168,6 +2193,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    selected_brain_features = parse_brain_network_features(args.brain_network_features)
     rank, world, local_rank = setup_ddp()
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 
@@ -2300,6 +2326,7 @@ def main():
         n_frozen_layers=args.labram_frozen_layers,
         output_mode=args.output_mode,
         n_hemisphere_classes=n_hemisphere_classes,
+        brain_network_features=selected_brain_features,
         w_transition=args.w_transition,
         w_pattern=args.w_pattern,
         w_region=args.w_region,
@@ -2321,6 +2348,10 @@ def main():
         args.focal_gamma,
         args.generalized_pos_ratio_threshold,
         args.generalized_sample_weight,
+    )
+    log.info(
+        "  Brain-network feature ablation: %s",
+        ','.join(selected_brain_features),
     )
     if stage_pretrain_ckpt is not None:
         load_info = model.load_backbone_weights(str(stage_pretrain_ckpt), map_location=device)

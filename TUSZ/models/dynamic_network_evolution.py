@@ -20,7 +20,7 @@ Pipeline:
   [B, P] probs              [B, 3] logits
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -187,6 +187,23 @@ class MultiBranchSnapshotEncoder(nn.Module):
             nn.Linear(out_dim // 2, 1),
         )
         self.norm = nn.LayerNorm(out_dim)
+        self.register_buffer(
+            'active_feature_mask',
+            torch.ones(n_features, dtype=torch.float32),
+            persistent=False,
+        )
+        self.set_active_features(FEATURE_NAMES[:n_features])
+
+    def set_active_features(self, active_features: Sequence[str]) -> None:
+        normalized = tuple(str(name).lower() for name in active_features)
+        mask = torch.tensor(
+            [1.0 if name in normalized else 0.0 for name in FEATURE_NAMES[:self.n_features]],
+            dtype=self.active_feature_mask.dtype,
+            device=self.active_feature_mask.device,
+        )
+        if mask.sum() <= 0:
+            raise ValueError("MultiBranchSnapshotEncoder requires at least one active feature")
+        self.active_feature_mask.copy_(mask)
 
     def forward(
         self, nets: torch.Tensor,
@@ -201,24 +218,37 @@ class MultiBranchSnapshotEncoder(nn.Module):
         C = nets.shape[-3]
         flat = nets.reshape(-1, C, C, self.n_features)  # [N, C, C, F]
         N = flat.shape[0]
+        active_mask = self.active_feature_mask.to(device=flat.device, dtype=flat.dtype)
 
         branch_outs = []  # will be [N, F, branch_hidden]
         for f_idx, branch in enumerate(self.branches):
             adj_f = flat[..., f_idx]                # [N, C, C]
             node_f = flat[..., f_idx]               # [N, C, C] -> use row as node feat
             h_f = branch(node_f, adj_f)             # [N, branch_hidden]
+            h_f = h_f * active_mask[f_idx]
             branch_outs.append(h_f)
 
         tokens = torch.stack(branch_outs, dim=1)    # [N, 4, branch_hidden]
         tokens = self.branch_proj(tokens)            # [N, 4, out_dim]
+        tokens = tokens * active_mask.view(1, self.n_features, 1)
 
         # cross-branch self-attention
-        attn_out, _ = self.cross_attn(tokens, tokens, tokens)  # [N, 4, out_dim]
+        key_padding_mask = active_mask.unsqueeze(0).expand(N, -1) <= 0
+        has_inactive = bool(key_padding_mask.any().item())
+        attn_out, _ = self.cross_attn(
+            tokens, tokens, tokens,
+            key_padding_mask=key_padding_mask if has_inactive else None,
+        )  # [N, 4, out_dim]
         attn_out = attn_out + tokens                 # residual
+        attn_out = attn_out * active_mask.view(1, self.n_features, 1)
 
         # branch importance weights
         gate_logits = self.attn_gate(self.attn_norm(attn_out)).squeeze(-1)  # [N, 4]
+        if has_inactive:
+            gate_logits = gate_logits.masked_fill(key_padding_mask, -1e9)
         branch_wts = torch.softmax(gate_logits, dim=-1)     # [N, 4]
+        branch_wts = branch_wts * active_mask.view(1, -1)
+        branch_wts = branch_wts / branch_wts.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
         # weighted fusion
         fused = (attn_out * branch_wts.unsqueeze(-1)).sum(dim=1)  # [N, out_dim]
@@ -322,6 +352,9 @@ class DynamicNetworkEvolutionModel(nn.Module):
 
         # cached for visualization
         self._last: Optional[Dict] = None
+
+    def set_active_features(self, active_features: Sequence[str]) -> None:
+        self.snapshot_enc.set_active_features(active_features)
 
     # -----------------------------------------------------------------
     # helpers

@@ -28,6 +28,8 @@ from torch.utils.checkpoint import checkpoint
 
 log = logging.getLogger(__name__)
 
+BRAIN_NETWORK_FEATURE_NAMES: Tuple[str, ...] = ('gc', 'te', 'aec', 'wpli')
+
 # ── Local imports (sibling modules) ──
 try:
     from .seizure_aligned_patching import SeizureAlignedAdaptivePatching
@@ -93,6 +95,9 @@ class IntegrationConfig:
     # brain network
     gc_order: int = 20
     te_n_bins: int = 8
+    brain_network_features: Tuple[str, ...] = field(
+        default_factory=lambda: BRAIN_NETWORK_FEATURE_NAMES,
+    )
 
     # DirectedBrainTimeFilter (Branch B)
     brain_tf_n_blocks: int = 1
@@ -354,6 +359,30 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         self.cfg = cfg or IntegrationConfig()
         c = self.cfg
         max_patches = c.n_pre_patches + c.n_post_patches
+        selected_features = tuple(str(name).lower() for name in c.brain_network_features)
+        invalid_features = sorted(set(selected_features) - set(BRAIN_NETWORK_FEATURE_NAMES))
+        if invalid_features:
+            raise ValueError(
+                f"Unsupported brain network features: {invalid_features}; "
+                f"supported={BRAIN_NETWORK_FEATURE_NAMES}"
+            )
+        if not selected_features:
+            raise ValueError("At least one brain network feature must be enabled")
+        self.active_brain_network_features = tuple(
+            name for name in BRAIN_NETWORK_FEATURE_NAMES if name in selected_features
+        )
+        feature_mask = torch.tensor(
+            [1.0 if name in self.active_brain_network_features else 0.0
+             for name in BRAIN_NETWORK_FEATURE_NAMES],
+            dtype=torch.float32,
+        )
+        if feature_mask.sum() <= 0:
+            raise ValueError("Brain-network feature mask disabled every feature")
+        self.register_buffer(
+            'brain_feature_mask',
+            feature_mask.view(1, 1, 1, 1, -1),
+            persistent=False,
+        )
 
         # ── Step 1: Adaptive patching ──
         self.patching = SeizureAlignedAdaptivePatching(
@@ -400,6 +429,8 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             gru_layers=c.gru_layers,
             use_checkpoint=c.use_checkpoint,
         )
+        self.brain_timefilter.set_active_features(self.active_brain_network_features)
+        self.net_evolution.set_active_features(self.active_brain_network_features)
 
         # ── Step 3: Gated fusion ──
         self.fusion = GatedFusion(
@@ -581,6 +612,10 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             brain_nets = net_result['all']                        # [B, P, 22, 22, 4]
         else:
             brain_nets = brain_networks
+        brain_nets = brain_nets * self.brain_feature_mask.to(
+            device=brain_nets.device,
+            dtype=brain_nets.dtype,
+        )
 
         # 有向图过滤
         brain_nets_filtered, moe_loss_b = self.brain_timefilter(
@@ -947,6 +982,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             f"  Total params:     {n_total:,}\n"
             f"  Trainable params: {n_train:,}\n"
             f"  Output mode:      {self.cfg.output_mode}\n"
+            f"  Brain features:   {','.join(self.active_brain_network_features)}\n"
             f"  Max patches:      {self.patching.max_patches}\n"
         )
 

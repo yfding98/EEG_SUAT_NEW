@@ -290,7 +290,6 @@ class DirectedBrainGraphBlock(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 4),
-            nn.Softmax(dim=-1),
         )
         self.proj_out = nn.Linear(hidden, n_channels)
 
@@ -308,7 +307,12 @@ class DirectedBrainGraphBlock(nn.Module):
         norm_adj = adj_mean * deg_inv_sqrt.unsqueeze(-1) * deg_inv_sqrt.unsqueeze(-2)
         return self.undirected_conv(torch.bmm(norm_adj, h))
 
-    def forward(self, nets: torch.Tensor, alpha: float = 0.15):
+    def forward(
+        self,
+        nets: torch.Tensor,
+        alpha: float = 0.15,
+        feature_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Args:
             nets: [B, C, C, 4]  单个时间步的脑网络特征
@@ -316,6 +320,11 @@ class DirectedBrainGraphBlock(nn.Module):
             out: [B, C, C, 4]  过滤后特征
         """
         B, C, _, F_ = nets.shape
+        active_mask = (
+            torch.ones(F_, device=nets.device, dtype=nets.dtype)
+            if feature_mask is None
+            else feature_mask.to(device=nets.device, dtype=nets.dtype).flatten()[:F_]
+        )
         branch_outs = []
 
         for f_idx in range(F_):
@@ -338,17 +347,26 @@ class DirectedBrainGraphBlock(nn.Module):
                     h_f, learned_adj
                 )  # [B, C, hidden]
 
+            out_f = out_f * active_mask[f_idx]
             branch_outs.append(out_f)
 
         # 特征门控融合
         stacked = torch.stack(branch_outs, dim=-1)        # [B, C, hidden, 4]
         concat = torch.cat(branch_outs, dim=-1)           # [B, C, hidden*4]
-        gates = self.feat_gate(self.gate_norm(concat))     # [B, C, 4]
+        gate_logits = self.feat_gate(self.gate_norm(concat))  # [B, C, 4]
+        inactive = active_mask <= 0
+        has_inactive = bool(inactive.any().item())
+        if has_inactive:
+            gate_logits = gate_logits.masked_fill(inactive.view(1, 1, -1), -1e9)
+        gates = torch.softmax(gate_logits, dim=-1)
+        gates = gates * active_mask.view(1, 1, -1)
+        gates = gates / gates.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         fused = (stacked * gates.unsqueeze(2)).sum(dim=-1)  # [B, C, hidden]
         fused = self.proj_out(fused)                        # [B, C, C]
 
         # 重构为4特征输出 (残差)
         out = nets + fused.unsqueeze(-1).expand_as(nets) * 0.1  # 轻残差
+        out = out * active_mask.view(1, 1, 1, -1)
         return out
 
 
@@ -403,6 +421,23 @@ class DirectedBrainTimeFilter(nn.Module):
         # 特征ID寄存器
         feat_ids = torch.arange(c.n_features).unsqueeze(1).expand(-1, c.n_channels)
         self.register_buffer('feat_ids', feat_ids.flatten())  # [n_features*n_channels]
+        self.register_buffer(
+            'feature_active_mask',
+            torch.ones(c.n_features, dtype=torch.float32),
+            persistent=False,
+        )
+        self.set_active_features(tuple(FEATURE_NAMES[:c.n_features]))
+
+    def set_active_features(self, active_features: Tuple[str, ...]) -> None:
+        normalized = tuple(str(name).lower() for name in active_features)
+        mask = torch.tensor(
+            [1.0 if name in normalized else 0.0 for name in FEATURE_NAMES[:self.cfg.n_features]],
+            dtype=self.feature_active_mask.dtype,
+            device=self.feature_active_mask.device,
+        )
+        if mask.sum() <= 0:
+            raise ValueError("DirectedBrainTimeFilter requires at least one active feature")
+        self.feature_active_mask.copy_(mask)
 
     def forward(self, brain_networks: torch.Tensor,
                 is_training: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -415,16 +450,21 @@ class DirectedBrainTimeFilter(nn.Module):
         """
         B, P, C, _, F_ = brain_networks.shape
         moe_loss = torch.tensor(0.0, device=brain_networks.device)
+        feature_mask = self.feature_active_mask[:F_].to(
+            device=brain_networks.device,
+            dtype=brain_networks.dtype,
+        )
 
         # 1. 每个时间步做有向图过滤
         filtered_steps = []
         for t in range(P):
             x_t = brain_networks[:, t]  # [B, C, C, 4]
             for block in self.graph_blocks:
-                x_t = block(x_t, alpha=self.cfg.alpha)
+                x_t = block(x_t, alpha=self.cfg.alpha, feature_mask=feature_mask)
             filtered_steps.append(x_t)
 
         filtered = torch.stack(filtered_steps, dim=1)  # [B, P, C, C, 4]
+        filtered = filtered * feature_mask.view(1, 1, 1, 1, F_)
 
         # 2. 时序注意力 (跨补丁维度)
         flat = filtered.reshape(B, P, -1)               # [B, P, C*C*4]
@@ -432,6 +472,7 @@ class DirectedBrainTimeFilter(nn.Module):
         attn_out, _ = self.temporal_attn(flat_normed, flat_normed, flat_normed)
         flat = flat + attn_out                            # 残差
         filtered = flat.reshape(B, P, C, C, F_)
+        filtered = filtered * feature_mask.view(1, 1, 1, 1, F_)
 
         # 3. MoE路由 (获取辅助损失)
         dummy_input = filtered.mean(dim=(2, 3))          # [B, P, 4]
