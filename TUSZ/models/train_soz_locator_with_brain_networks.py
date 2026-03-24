@@ -327,6 +327,47 @@ def _split_private_patients(
     }
 
 
+def _build_private_loo_patient_split(
+    patient_infos: List[Dict[str, object]],
+    fold_index: int,
+    val_offset: int = 1,
+) -> Dict[str, List[str]]:
+    n_patients = len(patient_infos)
+    if n_patients < 3:
+        raise ValueError(
+            f"private_loo split requires at least 3 private patients, got {n_patients}"
+        )
+
+    ordered = sorted(str(info['patient_id']) for info in patient_infos)
+    test_idx = int(fold_index) % n_patients
+    test_patient = ordered[test_idx]
+
+    if val_offset <= 0:
+        raise ValueError(f"private_loo requires val_offset >= 1, got {val_offset}")
+
+    val_idx = (test_idx + int(val_offset)) % n_patients
+    if val_idx == test_idx:
+        val_idx = (test_idx + 1) % n_patients
+    val_patient = ordered[val_idx]
+
+    train_patients = [
+        patient_id
+        for patient_id in ordered
+        if patient_id not in {test_patient, val_patient}
+    ]
+    if not train_patients:
+        raise ValueError("private_loo split produced an empty private train set")
+
+    return {
+        'train': train_patients,
+        'val': [val_patient],
+        'test': [test_patient],
+        'fold_index': test_idx,
+        'n_folds': n_patients,
+        'val_offset': int(val_offset),
+    }
+
+
 def build_soz_datasets(
     args,
     pipeline_cfg,
@@ -337,9 +378,9 @@ def build_soz_datasets(
     if split_strategy == 'auto':
         split_strategy = 'private_target' if private_available else 'random'
 
-    if split_strategy == 'private_target' and args.source not in ('all', 'private'):
+    if split_strategy in ('private_target', 'private_loo') and args.source not in ('all', 'private'):
         raise ValueError(
-            f"split_strategy='private_target' requires --source all/private, got {args.source}"
+            f"split_strategy='{split_strategy}' requires --source all/private, got {args.source}"
         )
 
     hemisphere_label_mode = 'lrb'
@@ -353,31 +394,44 @@ def build_soz_datasets(
         pipeline_cfg=pipeline_cfg,
     )
 
-    if split_strategy == 'private_target':
+    if split_strategy in ('private_target', 'private_loo'):
         private_all = ManifestSOZDataset(
             source_filter='private',
             **dataset_kwargs,
         )
         if len(private_all) == 0:
             raise ValueError(
-                "split_strategy='private_target' requires private samples, but none were found"
+                f"split_strategy='{split_strategy}' requires private samples, but none were found"
             )
 
         patient_infos = _build_private_patient_infos(private_all)
-        patient_split = _split_private_patients(
-            patient_infos,
-            val_ratio=args.val_split,
-            test_ratio=args.test_split,
-            seed=args.seed,
-        )
+        if split_strategy == 'private_target':
+            patient_split = _split_private_patients(
+                patient_infos,
+                val_ratio=args.val_split,
+                test_ratio=args.test_split,
+                seed=args.seed,
+            )
+        else:
+            patient_split = _build_private_loo_patient_split(
+                patient_infos,
+                fold_index=args.private_loo_fold_index,
+                val_offset=args.private_loo_val_offset,
+            )
 
         train_parts: List[torch.utils.data.Dataset] = []
         split_meta: Dict[str, object] = {
-            'strategy': 'private_target',
+            'strategy': split_strategy,
             'hemisphere_label_mode': hemisphere_label_mode,
             'private_patient_split': patient_split,
             'log_lines': [],
         }
+        if split_strategy == 'private_loo':
+            split_meta['log_lines'].append(
+                "private_loo fold="
+                f"{patient_split['fold_index'] + 1}/{patient_split['n_folds']} "
+                f"(test={patient_split['test'][0]}, val={patient_split['val'][0]})"
+            )
 
         if args.source == 'all':
             tusz_train_manifest = ManifestSOZDataset(
@@ -609,6 +663,40 @@ def parse_brain_network_features(spec: str) -> Tuple[str, ...]:
     if not selected:
         raise ValueError("At least one brain-network feature must be selected")
     return tuple(selected)
+
+
+def load_compatible_model_weights(
+    model: nn.Module,
+    path: str,
+    map_location='cpu',
+) -> Dict[str, List[str]]:
+    ckpt = torch.load(path, map_location=map_location)
+    state = ckpt.get('model_state', ckpt.get('state_dict', ckpt))
+    if not isinstance(state, dict):
+        raise KeyError(f"Checkpoint does not contain a valid model state dict: {path}")
+
+    own_state = model.state_dict()
+    filtered_state: Dict[str, torch.Tensor] = {}
+    unexpected_keys: List[str] = []
+    for key, value in state.items():
+        clean_key = key[7:] if key.startswith('module.') else key
+        if clean_key not in own_state:
+            unexpected_keys.append(clean_key)
+            continue
+        if own_state[clean_key].shape != value.shape:
+            unexpected_keys.append(
+                f"{clean_key} (ckpt={tuple(value.shape)} != model={tuple(own_state[clean_key].shape)})"
+            )
+            continue
+        filtered_state[clean_key] = value
+
+    missing_keys = [key for key in own_state.keys() if key not in filtered_state]
+    model.load_state_dict(filtered_state, strict=False)
+    return {
+        'loaded_keys': sorted(filtered_state.keys()),
+        'missing_keys': sorted(missing_keys),
+        'unexpected_keys': sorted(unexpected_keys),
+    }
 
 
 def compute_multilabel_accuracy(
@@ -2077,12 +2165,24 @@ def parse_args():
     p.add_argument(
         '--split-strategy',
         default='auto',
-        choices=['auto', 'random', 'private_target'],
+        choices=['auto', 'random', 'private_target', 'private_loo'],
         help=(
             "Dataset split strategy for SOZ finetuning: "
             "auto=use private patient-wise split when source is all/private, "
             "otherwise random"
         ),
+    )
+    p.add_argument(
+        '--private-loo-fold-index',
+        type=int,
+        default=0,
+        help='When split_strategy=private_loo, hold out this private patient fold as test (0-based, wraps around)',
+    )
+    p.add_argument(
+        '--private-loo-val-offset',
+        type=int,
+        default=1,
+        help='When split_strategy=private_loo, pick the validation patient by offsetting from the test fold',
     )
 
     # model
@@ -2181,6 +2281,11 @@ def parse_args():
     # output
     p.add_argument('--output-dir', default='output/train_bn')
     p.add_argument('--precomputed-dir', default=None, help='Directory with precomputed brain networks')
+    p.add_argument(
+        '--init-soz-ckpt',
+        default='',
+        help='Initialize the full stage-2 model from a previous SOZ checkpoint, but start a fresh run (unlike --resume)',
+    )
     p.add_argument('--resume', default='', help='checkpoint to resume from')
     p.add_argument('--save-every', type=int, default=10)
 
@@ -2194,6 +2299,8 @@ def parse_args():
 def main():
     args = parse_args()
     selected_brain_features = parse_brain_network_features(args.brain_network_features)
+    if args.init_soz_ckpt and args.resume:
+        raise ValueError("--init-soz-ckpt and --resume cannot be used together")
     rank, world, local_rank = setup_ddp()
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 
@@ -2358,6 +2465,18 @@ def main():
         log.info(
             "  Loaded stage-pretrained LaBraM backbone from %s (loaded=%d, missing=%d, unexpected=%d)",
             stage_pretrain_ckpt,
+            len(load_info['loaded_keys']),
+            len(load_info['missing_keys']),
+            len(load_info['unexpected_keys']),
+        )
+    if args.init_soz_ckpt:
+        init_candidate = Path(args.init_soz_ckpt)
+        if not init_candidate.exists():
+            raise FileNotFoundError(f"SOZ init checkpoint not found: {init_candidate}")
+        load_info = load_compatible_model_weights(model, str(init_candidate), map_location=device)
+        log.info(
+            "  Loaded full SOZ init checkpoint from %s (loaded=%d, missing=%d, unexpected=%d)",
+            init_candidate,
             len(load_info['loaded_keys']),
             len(load_info['missing_keys']),
             len(load_info['unexpected_keys']),
