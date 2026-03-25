@@ -150,8 +150,13 @@ class FocalLoss(nn.Module):
     Also supports dynamic pos_weight computed from label statistics.
     """
 
-    def __init__(self, gamma: float = 2.0, alpha: float = 0.75,
-                 pos_weight: Optional[torch.Tensor] = None):
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: float = 0.75,
+        pos_weight: Optional[torch.Tensor] = None,
+        channel_weight: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
@@ -159,6 +164,10 @@ class FocalLoss(nn.Module):
             self.register_buffer('pos_weight', pos_weight)
         else:
             self.pos_weight = None
+        if channel_weight is not None:
+            self.register_buffer('channel_weight', channel_weight)
+        else:
+            self.channel_weight = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor, sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Use raw sigmoid probabilities for pt; exp(-weighted_bce) is incorrect when pos_weight != 1.
@@ -171,6 +180,8 @@ class FocalLoss(nn.Module):
         # alpha_t: alpha for positive, (1-alpha) for negative
         alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
         focal = alpha_t * (1.0 - pt) ** self.gamma * bce
+        if self.channel_weight is not None:
+            focal = focal * self.channel_weight.view(1, -1)
         
         if sample_weight is not None:
             focal = focal * sample_weight.unsqueeze(1)
@@ -477,6 +488,16 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         self.focal_loss = FocalLoss(
             gamma=self.cfg.focal_gamma, alpha=self.cfg.focal_alpha,
             pos_weight=pos_weight,
+            channel_weight=self.focal_loss.channel_weight,
+        )
+
+    def set_channel_weight(self, channel_weight: torch.Tensor):
+        """Set per-channel weights for the SOZ focal loss."""
+        self.focal_loss = FocalLoss(
+            gamma=self.cfg.focal_gamma,
+            alpha=self.cfg.focal_alpha,
+            pos_weight=self.focal_loss.pos_weight,
+            channel_weight=channel_weight,
         )
 
     def set_stage_class_weight(self, class_weight: torch.Tensor):

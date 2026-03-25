@@ -28,11 +28,19 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import (
+    ConcatDataset,
+    DataLoader,
+    RandomSampler,
+    SequentialSampler,
+    Subset,
+    WeightedRandomSampler,
+)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
@@ -53,7 +61,13 @@ try:
     )
     from models.brain_network_extractor import MultiScaleBrainNetworkExtractor
     from models.dynamic_network_evolution import DynamicNetworkEvolutionModel
-    from models.manifest_dataset import ManifestSOZDataset
+    from models.manifest_dataset import (
+        ManifestSOZDataset,
+        STANDARD_19,
+        TCP_BIPOLAR_NAMES,
+        TCP_COL_NAMES,
+        _build_bipolar_to_monopolar_matrix,
+    )
     from models.region_confusion import save_region_confusion_report
     from tasks.stage_detection import (
         EEGStagePretrainDataset,
@@ -73,7 +87,13 @@ except ImportError:
     )
     from .brain_network_extractor import MultiScaleBrainNetworkExtractor
     from .dynamic_network_evolution import DynamicNetworkEvolutionModel
-    from .manifest_dataset import ManifestSOZDataset
+    from .manifest_dataset import (
+        ManifestSOZDataset,
+        STANDARD_19,
+        TCP_BIPOLAR_NAMES,
+        TCP_COL_NAMES,
+        _build_bipolar_to_monopolar_matrix,
+    )
     from .region_confusion import save_region_confusion_report
     from ..tasks.stage_detection import (
         EEGStagePretrainDataset,
@@ -97,6 +117,30 @@ except ImportError:
     _HAS_TB = False
 
 log = logging.getLogger('train_bn')
+MONOPOLAR_NAMES: Tuple[str, ...] = tuple(str(ch) for ch in STANDARD_19)
+MIRROR_ELECTRODE_MAP: Dict[str, str] = {
+    'FP1': 'FP2',
+    'FP2': 'FP1',
+    'F3': 'F4',
+    'F4': 'F3',
+    'C3': 'C4',
+    'C4': 'C3',
+    'P3': 'P4',
+    'P4': 'P3',
+    'O1': 'O2',
+    'O2': 'O1',
+    'F7': 'F8',
+    'F8': 'F7',
+    'T3': 'T4',
+    'T4': 'T3',
+    'T5': 'T6',
+    'T6': 'T5',
+    'A1': 'A2',
+    'A2': 'A1',
+    'FZ': 'FZ',
+    'CZ': 'CZ',
+    'PZ': 'PZ',
+}
 
 
 # =====================================================================
@@ -144,6 +188,422 @@ def _format_subset_summary(name: str, summary: Dict[str, object]) -> str:
         f"{name}: rows={summary['rows']} patients={summary['patients']} "
         f"sources={summary['sources']} hemisphere={summary['hemisphere']}"
     )
+
+
+def _build_signed_bipolar_mirror_permutation(
+    channel_names: Tuple[str, ...],
+) -> Tuple[Tuple[int, ...], Tuple[float, ...]]:
+    name_to_index = {str(name): idx for idx, name in enumerate(channel_names)}
+    mirror_index: List[int] = []
+    mirror_sign: List[float] = []
+    for name in channel_names:
+        left, right = str(name).split('-', 1)
+        mirrored = f"{MIRROR_ELECTRODE_MAP[left]}-{MIRROR_ELECTRODE_MAP[right]}"
+        if mirrored in name_to_index:
+            mirror_index.append(name_to_index[mirrored])
+            mirror_sign.append(1.0)
+            continue
+        reversed_mirrored = f"{MIRROR_ELECTRODE_MAP[right]}-{MIRROR_ELECTRODE_MAP[left]}"
+        if reversed_mirrored not in name_to_index:
+            raise KeyError(f"Cannot build left-right mirror mapping for bipolar channel: {name}")
+        mirror_index.append(name_to_index[reversed_mirrored])
+        mirror_sign.append(-1.0)
+    return tuple(mirror_index), tuple(mirror_sign)
+
+
+def _build_monopolar_mirror_permutation(
+    channel_names: Tuple[str, ...],
+) -> Tuple[int, ...]:
+    name_to_index = {str(name): idx for idx, name in enumerate(channel_names)}
+    mirror_index: List[int] = []
+    for name in channel_names:
+        mirrored = MIRROR_ELECTRODE_MAP[str(name)]
+        if mirrored not in name_to_index:
+            raise KeyError(f"Cannot build left-right mirror mapping for monopolar channel: {name}")
+        mirror_index.append(name_to_index[mirrored])
+    return tuple(mirror_index)
+
+
+BIPOLAR_MIRROR_INDEX, BIPOLAR_MIRROR_SIGN = _build_signed_bipolar_mirror_permutation(
+    tuple(TCP_BIPOLAR_NAMES)
+)
+MONOPOLAR_MIRROR_INDEX = _build_monopolar_mirror_permutation(MONOPOLAR_NAMES)
+
+
+def apply_lateral_mirror_augmentation(
+    x: torch.Tensor,
+    label: torch.Tensor,
+    bipolar_label: torch.Tensor,
+    monopolar_label: torch.Tensor,
+    region_label: torch.Tensor,
+    hemisphere_label: torch.Tensor,
+    mirror_prob: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if mirror_prob <= 0.0 or x.size(0) == 0:
+        return x, label, bipolar_label, monopolar_label, region_label, hemisphere_label
+
+    eligible_mask = (hemisphere_label == 0) | (hemisphere_label == 1)
+    random_mask = torch.rand(x.size(0), device=x.device) < float(mirror_prob)
+    mirror_mask = eligible_mask & random_mask
+    if not bool(mirror_mask.any()):
+        return x, label, bipolar_label, monopolar_label, region_label, hemisphere_label
+
+    x = x.clone()
+    label = label.clone()
+    bipolar_label = bipolar_label.clone()
+    monopolar_label = monopolar_label.clone()
+    hemisphere_label = hemisphere_label.clone()
+
+    selected = torch.nonzero(mirror_mask, as_tuple=False).flatten()
+    bipolar_index = torch.tensor(BIPOLAR_MIRROR_INDEX, device=x.device, dtype=torch.long)
+    bipolar_sign = torch.tensor(BIPOLAR_MIRROR_SIGN, device=x.device, dtype=x.dtype).view(1, -1, 1)
+    mono_index = torch.tensor(MONOPOLAR_MIRROR_INDEX, device=monopolar_label.device, dtype=torch.long)
+
+    mirrored_x = x[selected].index_select(1, bipolar_index) * bipolar_sign
+    mirrored_bipolar = bipolar_label[selected].index_select(1, bipolar_index)
+    mirrored_monopolar = monopolar_label[selected].index_select(1, mono_index)
+
+    x[selected] = mirrored_x
+    bipolar_label[selected] = mirrored_bipolar
+    monopolar_label[selected] = mirrored_monopolar
+
+    if label.shape[1] == mirrored_bipolar.shape[1]:
+        label[selected] = mirrored_bipolar
+    elif label.shape[1] == mirrored_monopolar.shape[1]:
+        label[selected] = mirrored_monopolar
+    else:
+        raise ValueError(
+            f"Unsupported label dimension for mirror augmentation: {tuple(label.shape)}"
+        )
+
+    left_mask = hemisphere_label[selected] == 0
+    right_mask = hemisphere_label[selected] == 1
+    hemisphere_label[selected[left_mask]] = 1
+    hemisphere_label[selected[right_mask]] = 0
+    return x, label, bipolar_label, monopolar_label, region_label, hemisphere_label
+
+
+def _materialize_manifest_metadata(dataset) -> Optional[Dict[str, object]]:
+    if isinstance(dataset, Subset):
+        meta = _materialize_manifest_metadata(dataset.dataset)
+        if meta is None:
+            return None
+        df = meta['df'].iloc[list(dataset.indices)].reset_index(drop=True)
+        return {'df': df, 'label_mode': meta['label_mode']}
+
+    if isinstance(dataset, ConcatDataset):
+        parts: List[pd.DataFrame] = []
+        label_mode: Optional[str] = None
+        for sub_dataset in dataset.datasets:
+            meta = _materialize_manifest_metadata(sub_dataset)
+            if meta is None:
+                return None
+            if label_mode is None:
+                label_mode = str(meta['label_mode'])
+            elif str(meta['label_mode']) != label_mode:
+                raise ValueError(
+                    "ConcatDataset contains inconsistent label modes: "
+                    f"{label_mode} vs {meta['label_mode']}"
+                )
+            parts.append(meta['df'])
+        if not parts:
+            return None
+        return {
+            'df': pd.concat(parts, ignore_index=True),
+            'label_mode': label_mode or 'monopolar',
+        }
+
+    if hasattr(dataset, 'ds') and isinstance(dataset.ds, ManifestSOZDataset):
+        return {
+            'df': dataset.ds.df.reset_index(drop=True).copy(),
+            'label_mode': dataset.ds.label_mode,
+        }
+
+    if isinstance(dataset, ManifestSOZDataset):
+        return {
+            'df': dataset.df.reset_index(drop=True).copy(),
+            'label_mode': dataset.label_mode,
+        }
+
+    return None
+
+
+def _build_label_matrix(
+    df: pd.DataFrame,
+    label_mode: str,
+) -> Tuple[np.ndarray, Tuple[str, ...], np.ndarray]:
+    bipolar = df[TCP_COL_NAMES].fillna(0).to_numpy(dtype=np.float32, copy=True)
+    if str(label_mode) == 'bipolar':
+        return bipolar, tuple(TCP_BIPOLAR_NAMES), bipolar
+
+    b2m = _build_bipolar_to_monopolar_matrix()  # (19, 22)
+    monopolar = (bipolar @ b2m.T > 0).astype(np.float32)
+    return monopolar, MONOPOLAR_NAMES, bipolar
+
+
+def analyze_training_labels(dataset) -> Optional[Dict[str, object]]:
+    meta = _materialize_manifest_metadata(dataset)
+    if meta is None:
+        return None
+
+    df = meta['df']
+    labels, channel_names, bipolar_labels = _build_label_matrix(df, str(meta['label_mode']))
+    return {
+        'df': df,
+        'labels': labels,
+        'bipolar_labels': bipolar_labels,
+        'channel_names': channel_names,
+        'label_mode': str(meta['label_mode']),
+    }
+
+
+def compute_pos_weight_from_analysis(
+    analysis: Dict[str, object],
+    device='cpu',
+) -> torch.Tensor:
+    labels = np.asarray(analysis['labels'], dtype=np.float32)
+    if labels.size == 0:
+        raise ValueError("Cannot compute pos_weight from an empty training set")
+
+    pos_sum = torch.from_numpy(labels.sum(axis=0)).float()
+    total = labels.shape[0]
+    neg_sum = float(total) - pos_sum
+    pw = (neg_sum / pos_sum.clamp(min=1.0)).float().clamp(max=50.0)
+
+    pos_rate = pos_sum / max(float(total), 1.0)
+    named_rates = ', '.join(
+        f"{name}:{rate:.3f}"
+        for name, rate in zip(analysis['channel_names'], pos_rate.tolist())
+    )
+    log.info(
+        "pos_weight from manifest labels: min=%.1f max=%.1f mean=%.1f global_pos_rate=%.4f",
+        float(pw.min().item()),
+        float(pw.max().item()),
+        float(pw.mean().item()),
+        float(labels.mean()),
+    )
+    log.info("  per-channel pos_rate: %s", named_rates)
+    return pw.to(device)
+
+
+def build_private_channel_weight(
+    analysis: Optional[Dict[str, object]],
+    min_weight: float,
+    max_weight: float,
+    zero_positive_weight: float,
+    device: torch.device,
+) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, object]]]:
+    if analysis is None:
+        return None, None
+
+    df = analysis['df']
+    sources = {str(s).strip().lower() for s in df['source'].tolist()}
+    if sources != {'private'}:
+        return None, None
+
+    labels = np.asarray(analysis['labels'], dtype=np.float32)
+    pos_counts = labels.sum(axis=0)
+    weights = np.ones(labels.shape[1], dtype=np.float32)
+    nonzero_mask = pos_counts > 0
+
+    if np.any(nonzero_mask):
+        reference = float(np.median(pos_counts[nonzero_mask]))
+        scaled = np.sqrt(reference / np.maximum(pos_counts, 1.0))
+        weights[nonzero_mask] = np.clip(
+            scaled[nonzero_mask],
+            min_weight,
+            max_weight,
+        )
+    weights[~nonzero_mask] = float(zero_positive_weight)
+
+    zero_positive_channels = [
+        name
+        for name, count in zip(analysis['channel_names'], pos_counts.tolist())
+        if count <= 0
+    ]
+    rare_order = np.argsort(pos_counts)
+    ranked = [
+        f"{analysis['channel_names'][idx]}:{int(pos_counts[idx])}->{weights[idx]:.2f}"
+        for idx in rare_order[: min(8, len(rare_order))]
+    ]
+    summary = {
+        'zero_positive_channels': zero_positive_channels,
+        'ranked_channel_weights': ranked,
+    }
+    return torch.tensor(weights, dtype=torch.float32, device=device), summary
+
+
+def build_private_weighted_sampler(
+    analysis: Optional[Dict[str, object]],
+    patient_power: float,
+    rare_channel_strength: float,
+    rare_channel_max_boost: float,
+    sample_weight_cap: float,
+) -> Tuple[Optional[WeightedRandomSampler], Optional[Dict[str, object]]]:
+    if analysis is None:
+        return None, None
+
+    df = analysis['df']
+    sources = {str(s).strip().lower() for s in df['source'].tolist()}
+    if sources != {'private'} or len(df) == 0:
+        return None, None
+
+    patient_ids = [str(pid) for pid in df['patient_id'].tolist()]
+    patient_counts = Counter(patient_ids)
+    patient_weights = np.asarray(
+        [1.0 / max(patient_counts[pid], 1) for pid in patient_ids],
+        dtype=np.float64,
+    )
+    patient_power = max(float(patient_power), 0.0)
+    if patient_power != 1.0:
+        patient_weights = np.power(patient_weights, patient_power)
+    patient_weights = patient_weights / max(patient_weights.mean(), 1e-8)
+
+    labels = np.asarray(analysis['labels'], dtype=np.float32)
+    pos_counts = labels.sum(axis=0)
+    sample_channel_weights = np.ones(len(labels), dtype=np.float64)
+    nonzero_mask = pos_counts > 0
+    if np.any(nonzero_mask):
+        reference = float(np.median(pos_counts[nonzero_mask]))
+        channel_boost = np.ones(labels.shape[1], dtype=np.float64)
+        channel_boost[nonzero_mask] = np.clip(
+            np.sqrt(reference / np.maximum(pos_counts[nonzero_mask], 1.0)),
+            1.0,
+            float(max(rare_channel_max_boost, 1.0)),
+        )
+        for i, row in enumerate(labels):
+            positive = row > 0.5
+            if np.any(positive):
+                sample_channel_weights[i] = float(channel_boost[positive].mean())
+
+    strength = float(np.clip(rare_channel_strength, 0.0, 1.0))
+    sample_weights = patient_weights * (
+        (1.0 - strength) + strength * sample_channel_weights
+    )
+    cap = float(max(sample_weight_cap, 1.0))
+    sample_weights = np.clip(sample_weights, 1.0 / cap, cap)
+    sample_weights = sample_weights / max(sample_weights.mean(), 1e-8)
+
+    summary = {
+        'patient_counts': dict(patient_counts),
+        'weight_min': float(sample_weights.min()),
+        'weight_max': float(sample_weights.max()),
+        'weight_mean': float(sample_weights.mean()),
+    }
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+    return sampler, summary
+
+
+class EEGWindowAugmentor:
+    def __init__(
+        self,
+        fs: float,
+        gaussian_prob: float = 0.0,
+        gaussian_std_scale: float = 0.01,
+        bandstop_prob: float = 0.0,
+        bandstop_min_freq: float = 45.0,
+        bandstop_max_freq: float = 65.0,
+        bandstop_width_hz: float = 2.0,
+        channel_dropout_prob: float = 0.0,
+        max_channel_drops: int = 1,
+    ):
+        self.fs = float(fs)
+        self.gaussian_prob = float(max(gaussian_prob, 0.0))
+        self.gaussian_std_scale = float(max(gaussian_std_scale, 0.0))
+        self.bandstop_prob = float(max(bandstop_prob, 0.0))
+        self.bandstop_min_freq = float(max(bandstop_min_freq, 0.0))
+        self.bandstop_max_freq = float(max(bandstop_max_freq, self.bandstop_min_freq))
+        self.bandstop_width_hz = float(max(bandstop_width_hz, 0.1))
+        self.channel_dropout_prob = float(max(channel_dropout_prob, 0.0))
+        self.max_channel_drops = int(max(max_channel_drops, 0))
+
+    def _gaussian_noise(self, x: torch.Tensor) -> torch.Tensor:
+        if self.gaussian_prob <= 0.0 or self.gaussian_std_scale <= 0.0:
+            return x
+        batch_mask = (torch.rand(x.size(0), device=x.device) < self.gaussian_prob).float()
+        if batch_mask.sum() == 0:
+            return x
+        std = x.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        noise = torch.randn_like(x) * std * self.gaussian_std_scale
+        return x + noise * batch_mask.view(-1, 1, 1)
+
+    def _bandstop(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bandstop_prob <= 0.0:
+            return x
+        batch_mask = torch.rand(x.size(0), device=x.device) < self.bandstop_prob
+        if not bool(batch_mask.any()):
+            return x
+
+        selected = torch.nonzero(batch_mask, as_tuple=False).flatten()
+        if selected.numel() == 0:
+            return x
+
+        n_time = x.size(-1)
+        freqs = torch.fft.rfftfreq(n_time, d=1.0 / self.fs).to(x.device)
+        transformed = torch.fft.rfft(x[selected], dim=-1)
+        half_width = self.bandstop_width_hz / 2.0
+        for local_idx in range(selected.numel()):
+            center = torch.empty(1, device=x.device).uniform_(
+                self.bandstop_min_freq,
+                self.bandstop_max_freq,
+            ).item()
+            keep_mask = ((freqs < center - half_width) | (freqs > center + half_width)).to(transformed.dtype)
+            transformed[local_idx] = transformed[local_idx] * keep_mask.view(1, -1)
+        x = x.clone()
+        x[selected] = torch.fft.irfft(transformed, n=n_time, dim=-1)
+        return x
+
+    def _channel_dropout(
+        self,
+        x: torch.Tensor,
+        bipolar_label: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.channel_dropout_prob <= 0.0 or self.max_channel_drops <= 0:
+            return x
+
+        x = x.clone()
+        n_channels = x.size(1)
+        for batch_idx in range(x.size(0)):
+            if torch.rand(1, device=x.device).item() >= self.channel_dropout_prob:
+                continue
+
+            if bipolar_label is not None:
+                positive = torch.nonzero(bipolar_label[batch_idx] > 0.5, as_tuple=False).flatten()
+            else:
+                positive = torch.empty(0, dtype=torch.long, device=x.device)
+
+            if positive.numel() <= 1:
+                candidates = torch.nonzero(
+                    bipolar_label[batch_idx] <= 0.5 if bipolar_label is not None else torch.ones(n_channels, device=x.device),
+                    as_tuple=False,
+                ).flatten()
+            else:
+                candidates = torch.arange(n_channels, device=x.device)
+
+            if candidates.numel() == 0:
+                continue
+
+            n_drop = min(
+                int(torch.randint(1, self.max_channel_drops + 1, (1,), device=x.device).item()),
+                int(candidates.numel()),
+            )
+            perm = torch.randperm(int(candidates.numel()), device=x.device)[:n_drop]
+            x[batch_idx, candidates[perm], :] = 0.0
+        return x
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        bipolar_label: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = self._gaussian_noise(x)
+        x = self._bandstop(x)
+        x = self._channel_dropout(x, bipolar_label=bipolar_label)
+        return x
 
 
 def _resolve_holdout_patient_counts(
@@ -1090,6 +1550,8 @@ def train_one_epoch(
     writer=None,
     generalized_pos_ratio_threshold: float = 0.5,
     generalized_sample_weight: float = 0.05,
+    train_augmentor: Optional[EEGWindowAugmentor] = None,
+    lr_mirror_prob: float = 0.0,
 ):
     model.train()
     base = model.module if hasattr(model, 'module') else model
@@ -1102,6 +1564,8 @@ def train_one_epoch(
     for step, batch in enumerate(loader):
         x = batch['x'].to(device)
         label = batch['label'].to(device)
+        bipolar_label = batch['bipolar_label'].to(device)
+        monopolar_label = batch['monopolar_label'].to(device)
         region_label = batch['region_label'].to(device)
         hemisphere_label = batch['hemisphere_label'].to(device)
         onset = batch['onset_sec'].to(device)
@@ -1117,6 +1581,20 @@ def train_one_epoch(
             vp_counts = vp_counts.to(device)
         if rel_time is not None:
             rel_time = rel_time.to(device)
+        if lr_mirror_prob > 0.0 and brain_nets is None:
+            x, label, bipolar_label, monopolar_label, region_label, hemisphere_label = (
+                apply_lateral_mirror_augmentation(
+                    x=x,
+                    label=label,
+                    bipolar_label=bipolar_label,
+                    monopolar_label=monopolar_label,
+                    region_label=region_label,
+                    hemisphere_label=hemisphere_label,
+                    mirror_prob=lr_mirror_prob,
+                )
+            )
+        if train_augmentor is not None and brain_nets is None:
+            x = train_augmentor(x, bipolar_label=bipolar_label)
 
         with torch.amp.autocast('cuda', enabled=scaler is not None):
             outputs = model(
@@ -1273,6 +1751,10 @@ def evaluate(
     all_probs, all_targets, all_logits = [], [], []
     all_region_probs, all_region_targets = [], []
     all_hemi_logits, all_hemi_targets = [], []
+    all_gate_weights = []
+    all_branch_weights = []
+    all_valid_patch_counts = []
+    all_rel_time = []
     loss_sums: Dict[str, float] = {}
     n_batches = 0
     for batch in loader:
@@ -1331,6 +1813,14 @@ def evaluate(
         all_region_targets.append(region_label.cpu().numpy())
         all_hemi_logits.append(out['hemisphere_logits'].cpu().numpy())
         all_hemi_targets.append(hemisphere_label.cpu().numpy())
+        gate_w = out.get('gate_weights')
+        if gate_w is not None:
+            all_gate_weights.append(gate_w.cpu().numpy())
+        branch_w = out.get('branch_weights')
+        if branch_w is not None:
+            all_branch_weights.append(branch_w.cpu().numpy())
+        all_valid_patch_counts.append(out['valid_patch_counts'].cpu().numpy())
+        all_rel_time.append(out['seizure_relative_time'].cpu().numpy())
         for name, value in losses.items():
             loss_sums[name] = loss_sums.get(name, 0.0) + float(value.detach().item())
         n_batches += 1
@@ -1342,6 +1832,10 @@ def evaluate(
     region_targets = np.concatenate(all_region_targets, axis=0)
     hemi_logits = np.concatenate(all_hemi_logits, axis=0)
     hemi_targets = np.concatenate(all_hemi_targets, axis=0)
+    gate_weights = np.concatenate(all_gate_weights, axis=0) if all_gate_weights else None
+    branch_weights = np.concatenate(all_branch_weights, axis=0) if all_branch_weights else None
+    valid_patch_counts = np.concatenate(all_valid_patch_counts, axis=0)
+    seizure_relative_time = np.concatenate(all_rel_time, axis=0)
     rank_metrics = compute_localization_ranking_metrics(probs, targets, ks=(1, 3, 5))
     recall_at_1 = rank_metrics['recall_at_1']
     recall_at_3 = rank_metrics['recall_at_3']
@@ -1384,6 +1878,10 @@ def evaluate(
         'region_targets': region_targets,
         'hemisphere_logits': hemi_logits,
         'hemisphere_targets': hemi_targets,
+        'gate_weights': gate_weights,
+        'branch_weights': branch_weights,
+        'valid_patch_counts': valid_patch_counts,
+        'seizure_relative_time': seizure_relative_time,
         **avg_losses,
     }
 
@@ -2274,6 +2772,59 @@ def parse_args():
                    help='Samples with positive-channel ratio above this threshold are down-weighted')
     p.add_argument('--generalized-sample-weight', type=float, default=0.05,
                    help='Sample weight applied to samples above --generalized-pos-ratio-threshold')
+    p.add_argument('--private-balanced-sampler', dest='private_balanced_sampler',
+                   action='store_true',
+                   help='For private-only finetuning, use a weighted sampler that balances patients and mildly boosts rare-channel samples')
+    p.add_argument('--no-private-balanced-sampler', dest='private_balanced_sampler',
+                   action='store_false',
+                   help='Disable the private finetuning weighted sampler')
+    p.set_defaults(private_balanced_sampler=True)
+    p.add_argument('--private-patient-weight-power', type=float, default=1.0,
+                   help='Exponent applied to inverse patient-frequency weights in the private balanced sampler')
+    p.add_argument('--private-rare-channel-sampler-strength', type=float, default=0.5,
+                   help='Mixing factor between patient balancing and rare-channel boosting in the private balanced sampler')
+    p.add_argument('--private-rare-channel-sampler-max-boost', type=float, default=2.5,
+                   help='Maximum per-sample boost contributed by rare positive channels in the private balanced sampler')
+    p.add_argument('--private-sampler-max-weight', type=float, default=4.0,
+                   help='Clamp private sampler weights to [1/max_weight, max_weight] before normalization')
+    p.add_argument('--private-channel-loss-weight', dest='private_channel_loss_weight',
+                   action='store_true',
+                   help='For private-only finetuning, reweight SOZ channel loss to protect zero-positive channels and boost rare positive channels')
+    p.add_argument('--no-private-channel-loss-weight', dest='private_channel_loss_weight',
+                   action='store_false',
+                   help='Disable private finetuning channel loss reweighting')
+    p.set_defaults(private_channel_loss_weight=True)
+    p.add_argument('--private-common-channel-loss-min-weight', type=float, default=0.5,
+                   help='Minimum per-channel SOZ loss weight assigned to common private channels')
+    p.add_argument('--private-rare-channel-loss-max-weight', type=float, default=3.0,
+                   help='Maximum per-channel SOZ loss weight assigned to rare private channels')
+    p.add_argument('--private-zero-positive-channel-weight', type=float, default=0.2,
+                   help='SOZ loss weight for channels with zero positives in the private finetuning train set')
+    p.add_argument('--private-eeg-augment', dest='private_eeg_augment',
+                   action='store_true',
+                   help='Enable lightweight EEG augmentation during private-only finetuning')
+    p.add_argument('--no-private-eeg-augment', dest='private_eeg_augment',
+                   action='store_false',
+                   help='Disable EEG augmentation during private-only finetuning')
+    p.set_defaults(private_eeg_augment=True)
+    p.add_argument('--augment-gaussian-prob', type=float, default=0.4,
+                   help='Probability of adding weak Gaussian noise per private finetuning sample')
+    p.add_argument('--augment-gaussian-std-scale', type=float, default=0.01,
+                   help='Gaussian noise std as a fraction of each channel standard deviation')
+    p.add_argument('--augment-bandstop-prob', type=float, default=0.25,
+                   help='Probability of applying a narrow random band-stop filter per private finetuning sample')
+    p.add_argument('--augment-bandstop-min-freq', type=float, default=45.0,
+                   help='Minimum center frequency for random band-stop augmentation')
+    p.add_argument('--augment-bandstop-max-freq', type=float, default=65.0,
+                   help='Maximum center frequency for random band-stop augmentation')
+    p.add_argument('--augment-bandstop-width-hz', type=float, default=2.0,
+                   help='Bandwidth of the random band-stop augmentation in Hz')
+    p.add_argument('--augment-channel-drop-prob', type=float, default=0.15,
+                   help='Probability of dropping one or more non-critical bipolar channels during private finetuning')
+    p.add_argument('--augment-max-channel-drops', type=int, default=1,
+                   help='Maximum number of bipolar channels to drop for each augmented private finetuning sample')
+    p.add_argument('--augment-lr-mirror-prob', type=float, default=0.10,
+                   help='Probability of applying left-right mirror augmentation to unilateral private finetuning samples')
     p.add_argument('--amp', action='store_true', help='mixed precision')
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--seed', type=int, default=42)
@@ -2377,6 +2928,21 @@ def main():
     n_val = len(val_ds)
     n_test = len(test_ds)
     log.info("  Final dataset sizes: train=%d, val=%d, test=%d", n_train, n_val, n_test)
+    train_analysis = analyze_training_labels(train_ds)
+    train_sources = set()
+    if train_analysis is not None:
+        train_sources = {
+            str(src).strip().lower()
+            for src in train_analysis['df']['source'].tolist()
+        }
+        if train_sources == {'private'}:
+            private_patient_counts = train_analysis['df']['patient_id'].value_counts().to_dict()
+            log.info(
+                "  Private finetune train set: patients=%d label_mode=%s",
+                int(train_analysis['df']['patient_id'].nunique()),
+                train_analysis['label_mode'],
+            )
+            log.info("  Private finetune patient counts: %s", private_patient_counts)
 
     # check sample size
     if n_train < 50:
@@ -2385,8 +2951,63 @@ def main():
     # loaders
     if world > 1:
         train_sampler = DistributedSampler(train_ds, rank=rank, num_replicas=world)
+        if args.private_balanced_sampler and train_sources == {'private'}:
+            log.warning("  Private balanced sampler is disabled under DDP; using DistributedSampler instead")
     else:
         train_sampler = RandomSampler(train_ds)
+        if args.private_balanced_sampler:
+            weighted_sampler, sampler_summary = build_private_weighted_sampler(
+                train_analysis,
+                patient_power=args.private_patient_weight_power,
+                rare_channel_strength=args.private_rare_channel_sampler_strength,
+                rare_channel_max_boost=args.private_rare_channel_sampler_max_boost,
+                sample_weight_cap=args.private_sampler_max_weight,
+            )
+            if weighted_sampler is not None:
+                train_sampler = weighted_sampler
+                log.info(
+                    "  Private balanced sampler enabled: weight_min=%.3f weight_max=%.3f weight_mean=%.3f",
+                    sampler_summary['weight_min'],
+                    sampler_summary['weight_max'],
+                    sampler_summary['weight_mean'],
+                )
+                log.info("  Private sampler patient counts: %s", sampler_summary['patient_counts'])
+
+    train_augmentor = None
+    train_lr_mirror_prob = 0.0
+    if args.private_eeg_augment and train_sources == {'private'}:
+        if args.precomputed_dir:
+            log.warning(
+                "  Private EEG and LR-mirror augmentation disabled because --precomputed-dir "
+                "is set; augmenting x would desync cached brain networks."
+            )
+        else:
+            train_lr_mirror_prob = args.augment_lr_mirror_prob
+            train_augmentor = EEGWindowAugmentor(
+                fs=args.fs,
+                gaussian_prob=args.augment_gaussian_prob,
+                gaussian_std_scale=args.augment_gaussian_std_scale,
+                bandstop_prob=args.augment_bandstop_prob,
+                bandstop_min_freq=args.augment_bandstop_min_freq,
+                bandstop_max_freq=args.augment_bandstop_max_freq,
+                bandstop_width_hz=args.augment_bandstop_width_hz,
+                channel_dropout_prob=args.augment_channel_drop_prob,
+                max_channel_drops=args.augment_max_channel_drops,
+            )
+            log.info(
+                "  Private EEG augmentation enabled: noise(p=%.2f,std_scale=%.4f) "
+                "bandstop(p=%.2f,%.1f-%.1fHz,width=%.1fHz) ch_drop(p=%.2f,max=%d) "
+                "lr_mirror(p=%.2f)",
+                args.augment_gaussian_prob,
+                args.augment_gaussian_std_scale,
+                args.augment_bandstop_prob,
+                args.augment_bandstop_min_freq,
+                args.augment_bandstop_max_freq,
+                args.augment_bandstop_width_hz,
+                args.augment_channel_drop_prob,
+                args.augment_max_channel_drops,
+                args.augment_lr_mirror_prob,
+            )
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, sampler=train_sampler,
@@ -2484,9 +3105,30 @@ def main():
 
     # ── 2b. Compute class balance and set pos_weight ──
     log.info("  Computing pos_weight from training labels...")
-    pw = compute_pos_weight(train_loader, device=device)
+    if train_analysis is not None:
+        pw = compute_pos_weight_from_analysis(train_analysis, device=device)
+    else:
+        pw = compute_pos_weight(train_loader, device=device)
     model.set_pos_weight(pw)
     log.info(f"  pos_weight set (shape={pw.shape})")
+    if args.private_channel_loss_weight:
+        channel_weight, channel_summary = build_private_channel_weight(
+            train_analysis,
+            min_weight=args.private_common_channel_loss_min_weight,
+            max_weight=args.private_rare_channel_loss_max_weight,
+            zero_positive_weight=args.private_zero_positive_channel_weight,
+            device=device,
+        )
+        if channel_weight is not None:
+            model.set_channel_weight(channel_weight)
+            log.info(
+                "  Private channel loss weighting enabled: zero_positive=%s",
+                channel_summary['zero_positive_channels'],
+            )
+            log.info(
+                "  Private channel loss weights (lowest-count first): %s",
+                channel_summary['ranked_channel_weights'],
+            )
 
     # ── 3. Contrastive pretraining (optional) ──
     pretrain_encoder_path = None
@@ -2599,6 +3241,8 @@ def main():
             writer,
             generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
             generalized_sample_weight=args.generalized_sample_weight,
+            train_augmentor=train_augmentor,
+            lr_mirror_prob=train_lr_mirror_prob,
         )
         scheduler.step()
         dt = time.time() - t0
@@ -2696,6 +3340,14 @@ def main():
         ckpt_best = torch.load(str(best_path), map_location=device)
         base_model.load_state_dict(ckpt_best['model_state'])
 
+    val_metrics_best = evaluate(
+        model,
+        val_loader,
+        device,
+        generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+        generalized_sample_weight=args.generalized_sample_weight,
+    )
+
     test_metrics = evaluate(
         model,
         test_loader,
@@ -2755,6 +3407,19 @@ def main():
 
         # save test predictions
         np.savez(
+            str(output_dir / 'val_predictions.npz'),
+            probs=val_metrics_best['probs'],
+            targets=val_metrics_best['targets'],
+            region_probs=val_metrics_best['region_probs'],
+            region_targets=val_metrics_best['region_targets'],
+            hemisphere_logits=val_metrics_best['hemisphere_logits'],
+            hemisphere_targets=val_metrics_best['hemisphere_targets'],
+            gate_weights=val_metrics_best['gate_weights'],
+            branch_weights=val_metrics_best['branch_weights'],
+            valid_patch_counts=val_metrics_best['valid_patch_counts'],
+            seizure_relative_time=val_metrics_best['seizure_relative_time'],
+        )
+        np.savez(
             str(output_dir / 'test_predictions.npz'),
             probs=test_metrics['probs'],
             targets=test_metrics['targets'],
@@ -2762,6 +3427,10 @@ def main():
             region_targets=test_metrics['region_targets'],
             hemisphere_logits=test_metrics['hemisphere_logits'],
             hemisphere_targets=test_metrics['hemisphere_targets'],
+            gate_weights=test_metrics['gate_weights'],
+            branch_weights=test_metrics['branch_weights'],
+            valid_patch_counts=test_metrics['valid_patch_counts'],
+            seizure_relative_time=test_metrics['seizure_relative_time'],
         )
         region_md_path, region_csv_path = save_region_confusion_report(
             region_probs=test_metrics['region_probs'],
