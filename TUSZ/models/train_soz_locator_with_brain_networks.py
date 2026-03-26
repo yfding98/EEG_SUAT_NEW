@@ -499,9 +499,24 @@ def build_private_weighted_sampler(
 
 
 class EEGWindowAugmentor:
+    """EEG signal-level data augmentation.
+
+    Methods from Rommel et al. "Data augmentation for learning predictive
+    models on EEG: a systematic comparison" and EEGConformer:
+
+    - Gaussian noise addition
+    - Random narrow band-stop filtering
+    - Channel dropout (zeroing)
+    - Smooth time mask (Hann-window temporal masking)          [NEW]
+    - Per-channel amplitude scaling                             [NEW]
+    - Frequency shift (spectral phase rotation)                 [NEW]
+    - Temporal shift / jitter (circular shift)                  [NEW]
+    """
+
     def __init__(
         self,
         fs: float,
+        # --- existing ---
         gaussian_prob: float = 0.0,
         gaussian_std_scale: float = 0.01,
         bandstop_prob: float = 0.0,
@@ -510,6 +525,16 @@ class EEGWindowAugmentor:
         bandstop_width_hz: float = 2.0,
         channel_dropout_prob: float = 0.0,
         max_channel_drops: int = 1,
+        # --- new: Rommel et al. ---
+        time_mask_prob: float = 0.0,
+        time_mask_max_ratio: float = 0.2,
+        amplitude_scale_prob: float = 0.0,
+        amplitude_scale_min: float = 0.8,
+        amplitude_scale_max: float = 1.2,
+        freq_shift_prob: float = 0.0,
+        freq_shift_max_hz: float = 2.0,
+        time_shift_prob: float = 0.0,
+        time_shift_max_samples: int = 50,
     ):
         self.fs = float(fs)
         self.gaussian_prob = float(max(gaussian_prob, 0.0))
@@ -520,6 +545,18 @@ class EEGWindowAugmentor:
         self.bandstop_width_hz = float(max(bandstop_width_hz, 0.1))
         self.channel_dropout_prob = float(max(channel_dropout_prob, 0.0))
         self.max_channel_drops = int(max(max_channel_drops, 0))
+        # new
+        self.time_mask_prob = float(max(time_mask_prob, 0.0))
+        self.time_mask_max_ratio = float(np.clip(time_mask_max_ratio, 0.01, 0.5))
+        self.amplitude_scale_prob = float(max(amplitude_scale_prob, 0.0))
+        self.amplitude_scale_min = float(amplitude_scale_min)
+        self.amplitude_scale_max = float(max(amplitude_scale_max, self.amplitude_scale_min))
+        self.freq_shift_prob = float(max(freq_shift_prob, 0.0))
+        self.freq_shift_max_hz = float(max(freq_shift_max_hz, 0.0))
+        self.time_shift_prob = float(max(time_shift_prob, 0.0))
+        self.time_shift_max_samples = int(max(time_shift_max_samples, 0))
+
+    # ---- existing methods ----
 
     def _gaussian_noise(self, x: torch.Tensor) -> torch.Tensor:
         if self.gaussian_prob <= 0.0 or self.gaussian_std_scale <= 0.0:
@@ -595,6 +632,120 @@ class EEGWindowAugmentor:
             x[batch_idx, candidates[perm], :] = 0.0
         return x
 
+    # ---- new methods (Rommel et al.) ----
+
+    def _smooth_time_mask(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply a smooth Hann-window mask to a random temporal segment.
+
+        Forces the model to rely on surrounding temporal context instead of
+        memorising a fixed pattern at a particular time offset.
+        """
+        if self.time_mask_prob <= 0.0:
+            return x
+        batch_mask = torch.rand(x.size(0), device=x.device) < self.time_mask_prob
+        if not bool(batch_mask.any()):
+            return x
+
+        x = x.clone()
+        n_time = x.size(-1)
+        max_mask_len = max(int(n_time * self.time_mask_max_ratio), 1)
+        for batch_idx in torch.nonzero(batch_mask, as_tuple=False).flatten().tolist():
+            mask_len = int(torch.randint(1, max_mask_len + 1, (1,)).item())
+            start = int(torch.randint(0, max(n_time - mask_len, 1), (1,)).item())
+            # Hann window: smooth fade-out rather than hard zeroing
+            hann = torch.hann_window(mask_len, device=x.device, dtype=x.dtype)
+            # invert: 1 at edges, 0 at centre
+            inv_hann = 1.0 - hann
+            x[batch_idx, :, start:start + mask_len] *= inv_hann.unsqueeze(0)
+        return x
+
+    def _amplitude_scale(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-channel random amplitude scaling to simulate inter-subject variability."""
+        if self.amplitude_scale_prob <= 0.0:
+            return x
+        batch_mask = torch.rand(x.size(0), device=x.device) < self.amplitude_scale_prob
+        if not bool(batch_mask.any()):
+            return x
+
+        x = x.clone()
+        selected = torch.nonzero(batch_mask, as_tuple=False).flatten()
+        n_channels = x.size(1)
+        # per-channel scale factor in [scale_min, scale_max]
+        scales = (
+            torch.rand(selected.numel(), n_channels, 1, device=x.device, dtype=x.dtype)
+            * (self.amplitude_scale_max - self.amplitude_scale_min)
+            + self.amplitude_scale_min
+        )
+        x[selected] = x[selected] * scales
+        return x
+
+    def _freq_shift(self, x: torch.Tensor) -> torch.Tensor:
+        """Shift the frequency spectrum by a small random amount (±max_hz).
+
+        Implemented by rotating the phase of the FFT coefficients in the
+        frequency domain, effectively translating spectral content.
+        """
+        if self.freq_shift_prob <= 0.0 or self.freq_shift_max_hz <= 0.0:
+            return x
+        batch_mask = torch.rand(x.size(0), device=x.device) < self.freq_shift_prob
+        if not bool(batch_mask.any()):
+            return x
+
+        x = x.clone()
+        n_time = x.size(-1)
+        selected = torch.nonzero(batch_mask, as_tuple=False).flatten()
+        freqs = torch.fft.rfftfreq(n_time, d=1.0 / self.fs).to(x.device)  # (n_freq,)
+        transformed = torch.fft.rfft(x[selected], dim=-1)  # (sel, C, n_freq)
+
+        for local_idx in range(selected.numel()):
+            delta_hz = (
+                torch.empty(1, device=x.device)
+                .uniform_(-self.freq_shift_max_hz, self.freq_shift_max_hz)
+                .item()
+            )
+            # Phase rotation: shift = exp(j * 2π * delta_f * t)
+            # In frequency domain, a shift by delta_f corresponds to
+            # multiplying by exp(j * 2π * delta_f * n / fs) per time sample,
+            # which in the freq domain maps to a circular convolution.
+            # Simpler approximation: roll the magnitude spectrum by the
+            # nearest integer number of frequency bins.
+            freq_resolution = self.fs / n_time
+            shift_bins = int(round(delta_hz / freq_resolution))
+            if shift_bins == 0:
+                continue
+            transformed[local_idx] = torch.roll(
+                transformed[local_idx], shifts=shift_bins, dims=-1,
+            )
+            # Zero out the wrapped-around bins to avoid artefacts
+            if shift_bins > 0:
+                transformed[local_idx, :, :shift_bins] = 0
+            else:
+                transformed[local_idx, :, shift_bins:] = 0
+
+        x[selected] = torch.fft.irfft(transformed, n=n_time, dim=-1)
+        return x
+
+    def _time_shift(self, x: torch.Tensor) -> torch.Tensor:
+        """Circular temporal shift (jitter) to simulate onset-time uncertainty."""
+        if self.time_shift_prob <= 0.0 or self.time_shift_max_samples <= 0:
+            return x
+        batch_mask = torch.rand(x.size(0), device=x.device) < self.time_shift_prob
+        if not bool(batch_mask.any()):
+            return x
+
+        x = x.clone()
+        for batch_idx in torch.nonzero(batch_mask, as_tuple=False).flatten().tolist():
+            shift = int(torch.randint(
+                -self.time_shift_max_samples,
+                self.time_shift_max_samples + 1,
+                (1,),
+            ).item())
+            if shift != 0:
+                x[batch_idx] = torch.roll(x[batch_idx], shifts=shift, dims=-1)
+        return x
+
+    # ---- __call__ ----
+
     def __call__(
         self,
         x: torch.Tensor,
@@ -602,8 +753,115 @@ class EEGWindowAugmentor:
     ) -> torch.Tensor:
         x = self._gaussian_noise(x)
         x = self._bandstop(x)
+        x = self._smooth_time_mask(x)
+        x = self._amplitude_scale(x)
+        x = self._freq_shift(x)
+        x = self._time_shift(x)
         x = self._channel_dropout(x, bipolar_label=bipolar_label)
         return x
+
+
+class MinorityClassOversampler:
+    """Per-batch minority-class oversampling via S&R (Segmentation & Recombination).
+
+    Adapted from EEGConformer's `interaug` method for multi-label SOZ
+    localization.  Identifies samples with fewer positive region labels
+    (i.e., the "minority" class from the region perspective) and generates
+    new synthetic samples by cutting the EEG window into ``n_segments``
+    temporal segments and recombining segments from different
+    minority-class samples.
+
+    The augmented samples inherit the region / hemisphere / channel labels
+    of the *first* donor sample (anchor) to keep labels consistent.
+    """
+
+    def __init__(
+        self,
+        n_segments: int = 8,
+        oversample_ratio: float = 0.5,
+        region_negative_threshold: float = 0.5,
+        augmentor: Optional[EEGWindowAugmentor] = None,
+    ):
+        self.n_segments = max(int(n_segments), 2)
+        self.oversample_ratio = float(max(oversample_ratio, 0.0))
+        self.region_negative_threshold = float(region_negative_threshold)
+        self.augmentor = augmentor
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        label: torch.Tensor,
+        bipolar_label: torch.Tensor,
+        monopolar_label: torch.Tensor,
+        region_label: torch.Tensor,
+        hemisphere_label: torch.Tensor,
+        onset_sec: torch.Tensor,
+        start_sec: torch.Tensor,
+    ):
+        """Return the original batch concatenated with synthetic minority samples."""
+        if self.oversample_ratio <= 0.0 or x.size(0) == 0:
+            return x, label, bipolar_label, monopolar_label, region_label, hemisphere_label, onset_sec, start_sec
+
+        B, C, T = x.shape
+        n_regions = region_label.size(1) if region_label.dim() > 1 else 1
+
+        # Identify minority samples: those whose region positive ratio is
+        # *below* the threshold.  These are the samples that truly have
+        # fewer positive region labels (and thus contribute more "negatives").
+        if region_label.dim() > 1:
+            pos_ratio = region_label.float().mean(dim=1)  # (B,)
+        else:
+            pos_ratio = region_label.float()
+        minority_mask = pos_ratio < self.region_negative_threshold
+        minority_indices = torch.nonzero(minority_mask, as_tuple=False).flatten()
+
+        if minority_indices.numel() < 2:
+            # Need at least 2 minority samples to do recombination
+            return x, label, bipolar_label, monopolar_label, region_label, hemisphere_label, onset_sec, start_sec
+
+        n_aug = max(int(B * self.oversample_ratio), 1)
+        n_aug = min(n_aug, minority_indices.numel())  # don't exceed available
+        seg_len = T // self.n_segments
+        if seg_len < 1:
+            return x, label, bipolar_label, monopolar_label, region_label, hemisphere_label, onset_sec, start_sec
+
+        # Build augmented samples via S&R
+        aug_x = torch.zeros(n_aug, C, T, device=x.device, dtype=x.dtype)
+        # For labels, use the anchor (first donor) sample
+        anchor_indices = minority_indices[torch.randperm(minority_indices.numel(), device=x.device)[:n_aug]]
+
+        for i in range(n_aug):
+            anchor_idx = anchor_indices[i].item()
+            for seg_idx in range(self.n_segments):
+                # Pick a random donor from the minority pool
+                donor_idx = minority_indices[
+                    torch.randint(0, minority_indices.numel(), (1,), device=x.device).item()
+                ].item()
+                t_start = seg_idx * seg_len
+                t_end = min(t_start + seg_len, T)
+                aug_x[i, :, t_start:t_end] = x[donor_idx, :, t_start:t_end]
+            # Handle remainder if T is not divisible by n_segments
+            remainder_start = self.n_segments * seg_len
+            if remainder_start < T:
+                aug_x[i, :, remainder_start:] = x[anchor_idx, :, remainder_start:]
+
+        # Apply signal-level augmentation to synthetic samples
+        if self.augmentor is not None:
+            aug_bipolar = bipolar_label[anchor_indices]
+            aug_x = self.augmentor(aug_x, bipolar_label=aug_bipolar)
+
+        # Concatenate augmented samples to the original batch
+        x = torch.cat([x, aug_x], dim=0)
+        label = torch.cat([label, label[anchor_indices]], dim=0)
+        bipolar_label = torch.cat([bipolar_label, bipolar_label[anchor_indices]], dim=0)
+        monopolar_label = torch.cat([monopolar_label, monopolar_label[anchor_indices]], dim=0)
+        region_label = torch.cat([region_label, region_label[anchor_indices]], dim=0)
+        hemisphere_label = torch.cat([hemisphere_label, hemisphere_label[anchor_indices]], dim=0)
+        onset_sec = torch.cat([onset_sec, onset_sec[anchor_indices]], dim=0)
+        start_sec = torch.cat([start_sec, start_sec[anchor_indices]], dim=0)
+
+        return x, label, bipolar_label, monopolar_label, region_label, hemisphere_label, onset_sec, start_sec
+
 
 
 def _resolve_holdout_patient_counts(
@@ -1598,6 +1856,7 @@ def train_one_epoch(
     generalized_sample_weight: float = 0.05,
     train_augmentor: Optional[EEGWindowAugmentor] = None,
     lr_mirror_prob: float = 0.0,
+    minority_oversampler: Optional[MinorityClassOversampler] = None,
 ):
     model.train()
     base = model.module if hasattr(model, 'module') else model
@@ -1641,6 +1900,14 @@ def train_one_epoch(
             )
         if train_augmentor is not None and brain_nets is None:
             x = train_augmentor(x, bipolar_label=bipolar_label)
+        # Minority-class S&R oversampling (batch size may increase)
+        if minority_oversampler is not None and brain_nets is None:
+            x, label, bipolar_label, monopolar_label, region_label, hemisphere_label, onset, start = (
+                minority_oversampler(
+                    x, label, bipolar_label, monopolar_label,
+                    region_label, hemisphere_label, onset, start,
+                )
+            )
 
         with torch.amp.autocast('cuda', enabled=scaler is not None):
             outputs = model(
@@ -2857,19 +3124,27 @@ def parse_args():
                    help='Maximum per-channel SOZ loss weight assigned to rare private channels')
     p.add_argument('--private-zero-positive-channel-weight', type=float, default=0.2,
                    help='SOZ loss weight for channels with zero positives in the private finetuning train set')
-    p.add_argument('--private-eeg-augment', dest='private_eeg_augment',
+    p.add_argument('--eeg-augment', dest='eeg_augment',
                    action='store_true',
-                   help='Enable lightweight EEG augmentation during private-only finetuning')
-    p.add_argument('--no-private-eeg-augment', dest='private_eeg_augment',
+                   help='Enable EEG signal augmentation during finetuning (all sources)')
+    p.add_argument('--no-eeg-augment', dest='eeg_augment',
                    action='store_false',
-                   help='Disable EEG augmentation during private-only finetuning')
-    p.set_defaults(private_eeg_augment=True)
+                   help='Disable EEG augmentation during finetuning')
+    # backward compatibility alias
+    p.add_argument('--private-eeg-augment', dest='eeg_augment',
+                   action='store_true',
+                   help=argparse.SUPPRESS)
+    p.add_argument('--no-private-eeg-augment', dest='eeg_augment',
+                   action='store_false',
+                   help=argparse.SUPPRESS)
+    p.set_defaults(eeg_augment=True)
+    # existing signal augmentations
     p.add_argument('--augment-gaussian-prob', type=float, default=0.4,
-                   help='Probability of adding weak Gaussian noise per private finetuning sample')
+                   help='Probability of adding weak Gaussian noise per sample')
     p.add_argument('--augment-gaussian-std-scale', type=float, default=0.01,
                    help='Gaussian noise std as a fraction of each channel standard deviation')
     p.add_argument('--augment-bandstop-prob', type=float, default=0.25,
-                   help='Probability of applying a narrow random band-stop filter per private finetuning sample')
+                   help='Probability of applying a narrow random band-stop filter per sample')
     p.add_argument('--augment-bandstop-min-freq', type=float, default=45.0,
                    help='Minimum center frequency for random band-stop augmentation')
     p.add_argument('--augment-bandstop-max-freq', type=float, default=65.0,
@@ -2877,11 +3152,37 @@ def parse_args():
     p.add_argument('--augment-bandstop-width-hz', type=float, default=2.0,
                    help='Bandwidth of the random band-stop augmentation in Hz')
     p.add_argument('--augment-channel-drop-prob', type=float, default=0.15,
-                   help='Probability of dropping one or more non-critical bipolar channels during private finetuning')
+                   help='Probability of dropping one or more non-critical bipolar channels')
     p.add_argument('--augment-max-channel-drops', type=int, default=1,
-                   help='Maximum number of bipolar channels to drop for each augmented private finetuning sample')
+                   help='Maximum number of bipolar channels to drop for each augmented sample')
     p.add_argument('--augment-lr-mirror-prob', type=float, default=0.10,
-                   help='Probability of applying left-right mirror augmentation to unilateral private finetuning samples')
+                   help='Probability of applying left-right mirror augmentation to unilateral samples')
+    # new signal augmentations (Rommel et al.)
+    p.add_argument('--augment-time-mask-prob', type=float, default=0.3,
+                   help='Probability of applying smooth Hann-window time mask')
+    p.add_argument('--augment-time-mask-max-ratio', type=float, default=0.2,
+                   help='Maximum fraction of temporal length to mask')
+    p.add_argument('--augment-amplitude-scale-prob', type=float, default=0.3,
+                   help='Probability of per-channel amplitude scaling')
+    p.add_argument('--augment-amplitude-scale-min', type=float, default=0.8,
+                   help='Minimum amplitude scale factor')
+    p.add_argument('--augment-amplitude-scale-max', type=float, default=1.2,
+                   help='Maximum amplitude scale factor')
+    p.add_argument('--augment-freq-shift-prob', type=float, default=0.2,
+                   help='Probability of random frequency spectrum shift')
+    p.add_argument('--augment-freq-shift-max-hz', type=float, default=2.0,
+                   help='Maximum frequency shift in Hz')
+    p.add_argument('--augment-time-shift-prob', type=float, default=0.3,
+                   help='Probability of circular temporal shift (jitter)')
+    p.add_argument('--augment-time-shift-max-samples', type=int, default=50,
+                   help='Maximum circular temporal shift in samples')
+    # minority-class S&R oversampling (EEGConformer-inspired)
+    p.add_argument('--augment-minority-oversample', type=float, default=0.5,
+                   help='Ratio of augmented minority-class samples to add per batch (0 disables)')
+    p.add_argument('--augment-sr-segments', type=int, default=8,
+                   help='Number of temporal segments for S&R recombination')
+    p.add_argument('--augment-minority-region-threshold', type=float, default=0.5,
+                   help='Region positive ratio below which a sample is considered minority-class')
     p.add_argument('--amp', action='store_true', help='mixed precision')
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--seed', type=int, default=42)
@@ -3032,10 +3333,11 @@ def main():
 
     train_augmentor = None
     train_lr_mirror_prob = 0.0
-    if args.private_eeg_augment and train_sources == {'private'}:
+    minority_oversampler = None
+    if args.eeg_augment:
         if args.precomputed_dir:
             log.warning(
-                "  Private EEG and LR-mirror augmentation disabled because --precomputed-dir "
+                "  EEG and LR-mirror augmentation disabled because --precomputed-dir "
                 "is set; augmenting x would desync cached brain networks."
             )
         else:
@@ -3050,11 +3352,31 @@ def main():
                 bandstop_width_hz=args.augment_bandstop_width_hz,
                 channel_dropout_prob=args.augment_channel_drop_prob,
                 max_channel_drops=args.augment_max_channel_drops,
+                # new Rommel et al. methods
+                time_mask_prob=args.augment_time_mask_prob,
+                time_mask_max_ratio=args.augment_time_mask_max_ratio,
+                amplitude_scale_prob=args.augment_amplitude_scale_prob,
+                amplitude_scale_min=args.augment_amplitude_scale_min,
+                amplitude_scale_max=args.augment_amplitude_scale_max,
+                freq_shift_prob=args.augment_freq_shift_prob,
+                freq_shift_max_hz=args.augment_freq_shift_max_hz,
+                time_shift_prob=args.augment_time_shift_prob,
+                time_shift_max_samples=args.augment_time_shift_max_samples,
             )
+            # Minority-class S&R oversampler
+            if args.augment_minority_oversample > 0.0:
+                minority_oversampler = MinorityClassOversampler(
+                    n_segments=args.augment_sr_segments,
+                    oversample_ratio=args.augment_minority_oversample,
+                    region_negative_threshold=args.augment_minority_region_threshold,
+                    augmentor=train_augmentor,
+                )
             log.info(
-                "  Private EEG augmentation enabled: noise(p=%.2f,std_scale=%.4f) "
+                "  EEG augmentation enabled: noise(p=%.2f,std_scale=%.4f) "
                 "bandstop(p=%.2f,%.1f-%.1fHz,width=%.1fHz) ch_drop(p=%.2f,max=%d) "
-                "lr_mirror(p=%.2f)",
+                "lr_mirror(p=%.2f) time_mask(p=%.2f,ratio=%.2f) amp_scale(p=%.2f,[%.2f,%.2f]) "
+                "freq_shift(p=%.2f,max=%.1fHz) time_shift(p=%.2f,max=%d) "
+                "minority_oversample(ratio=%.2f,seg=%d,thresh=%.2f)",
                 args.augment_gaussian_prob,
                 args.augment_gaussian_std_scale,
                 args.augment_bandstop_prob,
@@ -3064,6 +3386,18 @@ def main():
                 args.augment_channel_drop_prob,
                 args.augment_max_channel_drops,
                 args.augment_lr_mirror_prob,
+                args.augment_time_mask_prob,
+                args.augment_time_mask_max_ratio,
+                args.augment_amplitude_scale_prob,
+                args.augment_amplitude_scale_min,
+                args.augment_amplitude_scale_max,
+                args.augment_freq_shift_prob,
+                args.augment_freq_shift_max_hz,
+                args.augment_time_shift_prob,
+                args.augment_time_shift_max_samples,
+                args.augment_minority_oversample,
+                args.augment_sr_segments,
+                args.augment_minority_region_threshold,
             )
 
     train_loader = DataLoader(
@@ -3302,6 +3636,7 @@ def main():
             generalized_sample_weight=args.generalized_sample_weight,
             train_augmentor=train_augmentor,
             lr_mirror_prob=train_lr_mirror_prob,
+            minority_oversampler=minority_oversampler,
         )
         scheduler.step()
         dt = time.time() - t0
