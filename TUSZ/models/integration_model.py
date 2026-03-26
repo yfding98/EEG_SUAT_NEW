@@ -128,6 +128,7 @@ class IntegrationConfig:
     w_moe: float = 0.01               # MoE辅助损失权重
     w_region: float = 0.5
     w_hemisphere: float = 0.5
+    task_training_mode: str = 'multitask'
     focal_gamma: float = 2.0
     focal_alpha: float = 0.75
 
@@ -712,15 +713,28 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         Returns: total_loss, loss_dict
         """
         c = self.cfg
-        losses = {}
+        mode = str(getattr(c, 'task_training_mode', 'multitask')).strip().lower()
+        if mode not in {'multitask', 'soz_only', 'region_only', 'hemisphere_only'}:
+            raise ValueError(f"Unsupported task_training_mode: {mode}")
 
-        # primary: SOZ focal loss
-        losses['soz'] = self.focal_loss(
-            outputs['soz_logits'], soz_targets, sample_weight=sample_weight
-        )
-        total = losses['soz']
+        zero = outputs['soz_logits'].new_zeros(())
+        losses = {
+            'soz': zero,
+            'region': zero,
+            'hemisphere': zero,
+            'transition': zero,
+            'pattern': zero,
+            'moe': zero,
+        }
+        total = zero
 
-        if region_targets is not None:
+        if mode in {'multitask', 'soz_only'}:
+            losses['soz'] = self.focal_loss(
+                outputs['soz_logits'], soz_targets, sample_weight=sample_weight
+            )
+            total = total + losses['soz']
+
+        if mode in {'multitask', 'region_only'} and region_targets is not None:
             region_loss = F.binary_cross_entropy_with_logits(
                 outputs['region_logits'],
                 region_targets,
@@ -729,9 +743,9 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             if sample_weight is not None:
                 region_loss = region_loss * sample_weight.unsqueeze(1)
             losses['region'] = region_loss.mean()
-            total = total + c.w_region * losses['region']
+            total = total + (c.w_region * losses['region'] if mode == 'multitask' else losses['region'])
 
-        if hemisphere_targets is not None:
+        if mode in {'multitask', 'hemisphere_only'} and hemisphere_targets is not None:
             valid_hemisphere = hemisphere_targets != -100
             if valid_hemisphere.any():
                 hemisphere_loss = F.cross_entropy(
@@ -744,12 +758,12 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
                 if sample_weight is not None:
                     hemisphere_loss = hemisphere_loss * sample_weight[valid_hemisphere]
                 losses['hemisphere'] = hemisphere_loss.mean()
-                total = total + c.w_hemisphere * losses['hemisphere']
-            else:
-                losses['hemisphere'] = outputs['hemisphere_logits'].new_zeros(())
+                total = total + (
+                    c.w_hemisphere * losses['hemisphere'] if mode == 'multitask' else losses['hemisphere']
+                )
 
         # auxiliary 1: transition detection
-        if transition_targets is not None:
+        if mode == 'multitask' and transition_targets is not None:
             tp = outputs['transition_logits']
             transition_loss = F.binary_cross_entropy_with_logits(
                 tp, transition_targets, reduction='none',
@@ -760,7 +774,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             total = total + c.w_transition * losses['transition']
 
         # auxiliary 2: pattern classification
-        if pattern_targets is not None:
+        if mode == 'multitask' and pattern_targets is not None:
             pattern_loss = F.cross_entropy(
                 outputs['pattern_logits'], pattern_targets, reduction='none',
             )
@@ -770,7 +784,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             total = total + c.w_pattern * losses['pattern']
 
         # MoE auxiliary loss (both branches)
-        if 'moe_loss' in outputs:
+        if mode == 'multitask' and 'moe_loss' in outputs:
             losses['moe'] = outputs['moe_loss']
             total = total + c.w_moe * outputs['moe_loss']
 

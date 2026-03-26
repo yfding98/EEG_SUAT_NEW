@@ -1090,8 +1090,30 @@ def compute_auc(probs: np.ndarray, targets: np.ndarray) -> float:
     return float(np.mean(auc_values)) if auc_values else 0.0
 
 
-def build_selection_key(metrics: Dict[str, float]) -> Tuple[float, float, float, float, float, float]:
-    """Prefer calibrated ranking quality, then localization quality and auxiliary heads."""
+def build_selection_key(
+    metrics: Dict[str, float],
+    task_training_mode: str = 'multitask',
+) -> Tuple[float, float, float, float, float, float]:
+    """Build validation-selection priority according to training mode."""
+    mode = str(task_training_mode).strip().lower()
+    if mode == 'region_only':
+        return (
+            float(metrics.get('region_acc', 0.0)),
+            float(metrics.get('auc', 0.0)),
+            float(metrics.get('ndcg_at_3', 0.0)),
+            float(metrics.get('mrr', 0.0)),
+            float(metrics.get('recall_at_3', metrics.get('top3', 0.0))),
+            float(metrics.get('hemisphere_acc', 0.0)),
+        )
+    if mode == 'hemisphere_only':
+        return (
+            float(metrics.get('hemisphere_acc', 0.0)),
+            float(metrics.get('region_acc', 0.0)),
+            float(metrics.get('auc', 0.0)),
+            float(metrics.get('ndcg_at_3', 0.0)),
+            float(metrics.get('mrr', 0.0)),
+            float(metrics.get('recall_at_3', metrics.get('top3', 0.0))),
+        )
     return (
         float(metrics.get('auc', 0.0)),
         float(metrics.get('ndcg_at_3', 0.0)),
@@ -1099,6 +1121,30 @@ def build_selection_key(metrics: Dict[str, float]) -> Tuple[float, float, float,
         float(metrics.get('recall_at_3', metrics.get('top3', 0.0))),
         float(metrics.get('region_acc', 0.0)),
         float(metrics.get('hemisphere_acc', 0.0)),
+    )
+
+
+def format_selection_key_text(
+    selection_key: Tuple[float, float, float, float, float, float],
+    task_training_mode: str = 'multitask',
+) -> str:
+    mode = str(task_training_mode).strip().lower()
+    if mode == 'region_only':
+        return (
+            f"region_acc={selection_key[0]:.4f}, auc={selection_key[1]:.4f}, "
+            f"ndcg3={selection_key[2]:.4f}, mrr={selection_key[3]:.4f}, "
+            f"r3={selection_key[4]:.4f}, hemi_acc={selection_key[5]:.4f}"
+        )
+    if mode == 'hemisphere_only':
+        return (
+            f"hemi_acc={selection_key[0]:.4f}, region_acc={selection_key[1]:.4f}, "
+            f"auc={selection_key[2]:.4f}, ndcg3={selection_key[3]:.4f}, "
+            f"mrr={selection_key[4]:.4f}, r3={selection_key[5]:.4f}"
+        )
+    return (
+        f"auc={selection_key[0]:.4f}, ndcg3={selection_key[1]:.4f}, "
+        f"mrr={selection_key[2]:.4f}, r3={selection_key[3]:.4f}, "
+        f"region_acc={selection_key[4]:.4f}, hemi_acc={selection_key[5]:.4f}"
     )
 
 
@@ -2764,6 +2810,17 @@ def parse_args():
                    help='Loss weight for coarse region classifier')
     p.add_argument('--w-hemisphere', type=float, default=0.5,
                    help='Loss weight for hemisphere classifier')
+    p.add_argument(
+        '--task-training-mode',
+        choices=('multitask', 'soz_only', 'region_only', 'hemisphere_only'),
+        default='multitask',
+        help=(
+            "Training objective mode: multitask keeps current stage-2 behavior; "
+            "soz_only optimizes only the SOZ loss; "
+            "region_only optimizes only the region loss; "
+            "hemisphere_only optimizes only the hemisphere loss."
+        ),
+    )
     p.add_argument('--focal-alpha', type=float, default=0.75,
                    help='Positive-class balancing factor for the SOZ focal loss')
     p.add_argument('--focal-gamma', type=float, default=2.0,
@@ -3059,15 +3116,17 @@ def main():
         w_pattern=args.w_pattern,
         w_region=args.w_region,
         w_hemisphere=args.w_hemisphere,
+        task_training_mode=args.task_training_mode,
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
     )
     model = TimeFilter_LaBraM_BrainNetwork_Integration(cfg).to(device)
     log.info(model.summary())
     log.info(
-        "  Loss setup: w_transition=%.3f w_pattern=%.3f w_region=%.3f "
+        "  Loss setup: mode=%s w_transition=%.3f w_pattern=%.3f w_region=%.3f "
         "w_hemisphere=%.3f focal_alpha=%.3f focal_gamma=%.3f "
         "generalized_pos_ratio_threshold=%.3f generalized_sample_weight=%.3f",
+        args.task_training_mode,
         args.w_transition,
         args.w_pattern,
         args.w_region,
@@ -3296,7 +3355,7 @@ def main():
                 writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
 
             # save best
-            val_selection_key = build_selection_key(val_metrics)
+            val_selection_key = build_selection_key(val_metrics, args.task_training_mode)
             if val_selection_key > best_selection_key:
                 best_selection_key = val_selection_key
                 best_top3 = val_metrics['recall_at_3']
@@ -3311,13 +3370,9 @@ def main():
                     },
                 )
                 log.info(
-                    "  ** New best: auc=%.4f ndcg3=%.4f mrr=%.4f r3=%.4f region_acc=%.4f hemi_acc=%.4f",
-                    val_metrics['auc'],
-                    val_metrics['ndcg_at_3'],
-                    val_metrics['mrr'],
-                    val_metrics['recall_at_3'],
-                    val_metrics['region_acc'],
-                    val_metrics['hemisphere_acc'],
+                    "  ** New best (%s): %s",
+                    args.task_training_mode,
+                    format_selection_key_text(best_selection_key, args.task_training_mode),
                 )
 
             # periodic save
@@ -3382,6 +3437,7 @@ def main():
             f"- Stage init ckpt: `{args.stage_pretrain_ckpt or stage_pretrain_ckpt or ''}`\n"
             f"- Freeze LaBraM backbone: {bool(args.freeze_labram)}\n"
             f"- LaBraM frozen layers during finetune: {'all' if args.freeze_labram else args.labram_frozen_layers}\n"
+            f"- Task training mode: {args.task_training_mode}\n"
             f"- Finetune epochs: {total_epochs}\n"
             f"- Output mode: {args.output_mode}\n\n"
             f"## Test Metrics\n\n"
@@ -3395,12 +3451,7 @@ def main():
             f"| AUC | {test_metrics['auc']:.4f} |\n"
             f"| Region acc | {test_metrics['region_acc']:.4f} |\n"
             f"| Hemisphere acc | {test_metrics['hemisphere_acc']:.4f} |\n\n"
-            f"## Best validation key: auc={best_selection_key[0]:.4f}, "
-            f"ndcg3={best_selection_key[1]:.4f}, "
-            f"mrr={best_selection_key[2]:.4f}, "
-            f"r3={best_selection_key[3]:.4f}, "
-            f"region_acc={best_selection_key[4]:.4f}, "
-            f"hemi_acc={best_selection_key[5]:.4f}\n"
+            f"## Best validation key: {format_selection_key_text(best_selection_key, args.task_training_mode)}\n"
         )
         (output_dir / 'report.md').write_text(report, encoding='utf-8')
         log.info(f"Report saved to {output_dir / 'report.md'}")
