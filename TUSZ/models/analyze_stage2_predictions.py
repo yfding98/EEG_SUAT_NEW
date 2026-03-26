@@ -12,6 +12,19 @@ FEATURE_NAMES: Tuple[str, ...] = ("gc", "te", "aec", "wpli")
 REGION_NAMES: Tuple[str, ...] = ("FP", "F", "C", "T", "P", "O")
 
 
+def _normalize_region_names(region_names: Sequence[str] | np.ndarray) -> Tuple[str, ...]:
+    arr = np.asarray(region_names)
+    if arr.ndim != 1:
+        raise ValueError(f"region_names must be 1D, got shape={arr.shape}")
+    return tuple(str(name) for name in arr.tolist())
+
+
+def _get_region_names(npz_data) -> Tuple[str, ...]:
+    if "region_names" in npz_data:
+        return _normalize_region_names(npz_data["region_names"])
+    return REGION_NAMES
+
+
 def _safe_div(num: float, den: float) -> float:
     return float(num / den) if den else 0.0
 
@@ -96,6 +109,7 @@ def search_region_thresholds(
     objective: str = "balanced_accuracy",
     region_names: Sequence[str] = REGION_NAMES,
 ) -> List[Dict[str, float]]:
+    region_names = _normalize_region_names(region_names)
     probs = np.asarray(region_probs, dtype=np.float32)
     targets = (np.asarray(region_targets, dtype=np.float32) >= 0.5).astype(np.int64)
     thresholds = np.arange(0.05, 1.00, 0.05)
@@ -126,6 +140,7 @@ def apply_region_thresholds(
     thresholds: Sequence[float],
     region_names: Sequence[str] = REGION_NAMES,
 ) -> List[Dict[str, float]]:
+    region_names = _normalize_region_names(region_names)
     probs = np.asarray(region_probs, dtype=np.float32)
     targets = (np.asarray(region_targets, dtype=np.float32) >= 0.5).astype(np.int64)
     rows: List[Dict[str, float]] = []
@@ -243,6 +258,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     data = np.load(pred_path)
+    region_names = _get_region_names(data)
     gate_summary = None
     branch_rows = None
     tuned_rows = None
@@ -256,16 +272,24 @@ def main() -> int:
 
     if args.val_predictions:
         val_data = np.load(args.val_predictions)
+        val_region_names = _get_region_names(val_data)
+        if val_region_names != region_names:
+            raise ValueError(
+                f"Region names mismatch between validation and applied predictions: "
+                f"{val_region_names} vs {region_names}"
+            )
         tuned_rows = search_region_thresholds(
             region_probs=val_data["region_probs"],
             region_targets=val_data["region_targets"],
             objective=args.region_threshold_objective,
+            region_names=region_names,
         )
         thresholds = [row["threshold"] for row in tuned_rows]
         applied_rows = apply_region_thresholds(
             region_probs=data["region_probs"],
             region_targets=data["region_targets"],
             thresholds=thresholds,
+            region_names=region_names,
         )
 
     report = format_report(

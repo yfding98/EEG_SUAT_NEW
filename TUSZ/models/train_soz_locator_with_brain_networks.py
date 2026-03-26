@@ -67,6 +67,7 @@ try:
         TCP_BIPOLAR_NAMES,
         TCP_COL_NAMES,
         _build_bipolar_to_monopolar_matrix,
+        get_region_names,
     )
     from models.region_confusion import save_region_confusion_report
     from tasks.stage_detection import (
@@ -93,6 +94,7 @@ except ImportError:
         TCP_BIPOLAR_NAMES,
         TCP_COL_NAMES,
         _build_bipolar_to_monopolar_matrix,
+        get_region_names,
     )
     from .region_confusion import save_region_confusion_report
     from ..tasks.stage_detection import (
@@ -1102,12 +1104,14 @@ def build_soz_datasets(
         )
 
     hemisphere_label_mode = 'lrb'
+    region_label_mode = args.region_label_mode
 
     dataset_kwargs = dict(
         manifest_path=args.manifest,
         private_data_root=args.private_data_root,
         tusz_data_root=args.tusz_data_root,
         label_mode=args.output_mode,
+        region_label_mode=region_label_mode,
         hemisphere_label_mode=hemisphere_label_mode,
         pipeline_cfg=pipeline_cfg,
     )
@@ -1140,6 +1144,8 @@ def build_soz_datasets(
         train_parts: List[torch.utils.data.Dataset] = []
         split_meta: Dict[str, object] = {
             'strategy': split_strategy,
+            'region_label_mode': region_label_mode,
+            'region_names': list(get_region_names(region_label_mode)),
             'hemisphere_label_mode': hemisphere_label_mode,
             'private_patient_split': patient_split,
             'log_lines': [],
@@ -1242,6 +1248,8 @@ def build_soz_datasets(
     )
     split_meta = {
         'strategy': 'random',
+        'region_label_mode': region_label_mode,
+        'region_names': list(get_region_names(region_label_mode)),
         'hemisphere_label_mode': hemisphere_label_mode,
         'log_lines': [
             _format_subset_summary('all_sources', _summarize_manifest_subset(manifest_ds)),
@@ -3004,6 +3012,12 @@ def parse_args():
     p.add_argument('--labram-frozen-layers', type=int, default=10,
                    help='During SOZ finetuning, keep the bottom N LaBraM transformer blocks frozen; patch/embed and pos/time embeddings stay frozen with them')
     p.add_argument('--output-mode', default='monopolar', choices=['monopolar', 'bipolar'])
+    p.add_argument(
+        '--region-label-mode',
+        default='coarse',
+        choices=['coarse', 'fine_lateralized'],
+        help='Region target granularity: coarse=[FP,F,C,T,P,O], fine_lateralized=[L_FP,R_FP,L_F,R_F,C,L_T,R_T,P,O]',
+    )
 
     # brain networks
     p.add_argument('--brain-network-features', default='gc,te,aec,wpli')
@@ -3278,6 +3292,7 @@ def main():
         pipeline_cfg=pipeline_cfg,
     )
     log.info("  SOZ split strategy: %s", split_meta['strategy'])
+    log.info("  Region label mode: %s", split_meta.get('region_label_mode', 'coarse'))
     log.info("  Hemisphere label mode: %s", split_meta.get('hemisphere_label_mode', 'lrb'))
     for line in split_meta.get('log_lines', []):
         log.info("  %s", line)
@@ -3433,6 +3448,7 @@ def main():
         )
 
     log.info("=== Step 2: Initializing model ===")
+    region_names = tuple(split_meta.get('region_names', get_region_names(args.region_label_mode)))
     n_hemisphere_classes = 2 if split_meta.get('hemisphere_label_mode') == 'lr_ignore_b' else 3
     cfg = IntegrationConfig(
         task_mode='soz',
@@ -3444,6 +3460,7 @@ def main():
         labram_checkpoint=args.labram_ckpt,
         n_frozen_layers=args.labram_frozen_layers,
         output_mode=args.output_mode,
+        n_regions=len(region_names),
         n_hemisphere_classes=n_hemisphere_classes,
         brain_network_features=selected_brain_features,
         w_transition=args.w_transition,
@@ -3775,6 +3792,8 @@ def main():
             f"- Task training mode: {args.task_training_mode}\n"
             f"- Finetune epochs: {total_epochs}\n"
             f"- Output mode: {args.output_mode}\n\n"
+            f"- Region label mode: {args.region_label_mode}\n"
+            f"- Region names: {', '.join(region_names)}\n\n"
             f"## Test Metrics\n\n"
             f"| Metric | Value |\n|--------|-------|\n"
             f"| Recall@1 | {test_metrics['recall_at_1']:.4f} |\n"
@@ -3798,6 +3817,7 @@ def main():
             targets=val_metrics_best['targets'],
             region_probs=val_metrics_best['region_probs'],
             region_targets=val_metrics_best['region_targets'],
+            region_names=np.asarray(region_names),
             hemisphere_logits=val_metrics_best['hemisphere_logits'],
             hemisphere_targets=val_metrics_best['hemisphere_targets'],
             gate_weights=val_metrics_best['gate_weights'],
@@ -3811,6 +3831,7 @@ def main():
             targets=test_metrics['targets'],
             region_probs=test_metrics['region_probs'],
             region_targets=test_metrics['region_targets'],
+            region_names=np.asarray(region_names),
             hemisphere_logits=test_metrics['hemisphere_logits'],
             hemisphere_targets=test_metrics['hemisphere_targets'],
             gate_weights=test_metrics['gate_weights'],
@@ -3823,6 +3844,7 @@ def main():
             region_targets=test_metrics['region_targets'],
             output_dir=output_dir,
             threshold=0.5,
+            region_names=region_names,
         )
         log.info("Region confusion report saved to %s", region_md_path)
         log.info("Region confusion CSV saved to %s", region_csv_path)

@@ -68,7 +68,13 @@ TCP_BIPOLAR_NAMES = [
     'A1-T3',  'T3-C3', 'C3-CZ', 'CZ-C4', 'C4-T4', 'T4-A2',
 ]
 TCP_COL_NAMES = [ch.replace('-', '_') for ch in TCP_BIPOLAR_NAMES]
-REGION_NAMES = ['FP', 'F', 'C', 'T', 'P', 'O']
+COARSE_REGION_NAMES = ['FP', 'F', 'C', 'T', 'P', 'O']
+FINE_REGION_NAMES = ['L_FP', 'R_FP', 'L_F', 'R_F', 'C', 'L_T', 'R_T', 'P', 'O']
+REGION_LABEL_MODES = {
+    'coarse': tuple(COARSE_REGION_NAMES),
+    'fine_lateralized': tuple(FINE_REGION_NAMES),
+}
+REGION_NAMES = COARSE_REGION_NAMES
 REGION_TO_INDEX = {name: idx for idx, name in enumerate(REGION_NAMES)}
 HEMISPHERE_NAMES = ['L', 'R', 'B']
 HEMISPHERE_TO_INDEX = {name: idx for idx, name in enumerate(HEMISPHERE_NAMES)}
@@ -77,48 +83,116 @@ HEMISPHERE_TO_INDEX_LR = {name: idx for idx, name in enumerate(HEMISPHERE_NAMES_
 HEMISPHERE_IGNORE_INDEX = -100
 
 
-def _channel_to_regions(channel_name: str) -> List[str]:
-    """Map a channel/electrode name to one or more coarse brain regions."""
+def get_region_names(region_label_mode: str = 'coarse') -> Tuple[str, ...]:
+    try:
+        return REGION_LABEL_MODES[region_label_mode]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported region_label_mode: {region_label_mode}; "
+            f"choices={tuple(REGION_LABEL_MODES.keys())}"
+        ) from exc
+
+
+def _electrode_side(channel_name: str) -> Optional[str]:
+    name = str(channel_name).strip().upper()
+    if not name:
+        return None
+    if name.endswith('Z'):
+        return 'M'
+    tail = name[-1]
+    if tail.isdigit():
+        return 'L' if int(tail) % 2 == 1 else 'R'
+    return None
+
+
+def _channel_to_regions(channel_name: str, region_label_mode: str = 'coarse') -> List[str]:
+    """Map a channel/electrode name to one or more region labels."""
     name = str(channel_name).strip().upper()
     if not name:
         return []
     if '-' in name:
         regions: List[str] = []
         for part in name.split('-'):
-            regions.extend(_channel_to_regions(part))
+            regions.extend(_channel_to_regions(part, region_label_mode=region_label_mode))
         return list(dict.fromkeys(regions))
 
-    if name.startswith('FP'):
-        return ['FP']
-    if name.startswith('F'):
-        return ['F']
-    if name.startswith('C') or name == 'CZ':
-        return ['C']
-    if name.startswith('T'):
-        return ['T']
-    if name.startswith('P'):
-        return ['P']
-    if name.startswith('O'):
-        return ['O']
-    return []
+    if region_label_mode == 'coarse':
+        if name.startswith('FP'):
+            return ['FP']
+        if name.startswith('F'):
+            return ['F']
+        if name.startswith('C') or name == 'CZ':
+            return ['C']
+        if name.startswith('T'):
+            return ['T']
+        if name.startswith('P'):
+            return ['P']
+        if name.startswith('O'):
+            return ['O']
+        return []
+
+    if region_label_mode == 'fine_lateralized':
+        side = _electrode_side(name)
+        if name.startswith('FP'):
+            if side == 'L':
+                return ['L_FP']
+            if side == 'R':
+                return ['R_FP']
+            if side == 'M':
+                return ['L_FP', 'R_FP']
+            return []
+        if name.startswith('F'):
+            if side == 'L':
+                return ['L_F']
+            if side == 'R':
+                return ['R_F']
+            if side == 'M':
+                return ['L_F', 'R_F']
+            return []
+        if name.startswith('C') or name == 'CZ':
+            return ['C']
+        if name.startswith('T'):
+            if side == 'L':
+                return ['L_T']
+            if side == 'R':
+                return ['R_T']
+            if side == 'M':
+                return ['L_T', 'R_T']
+            return []
+        if name.startswith('P'):
+            return ['P']
+        if name.startswith('O'):
+            return ['O']
+        return []
+
+    raise ValueError(
+        f"Unsupported region_label_mode: {region_label_mode}; "
+        f"choices={tuple(REGION_LABEL_MODES.keys())}"
+    )
 
 
-def _build_region_target(onset_channels: str, bipolar_label: np.ndarray) -> np.ndarray:
-    """Build a coarse multi-label region target from onset channels or active bipolar pairs."""
-    region_target = np.zeros(len(REGION_NAMES), dtype=np.float32)
+def _build_region_target(
+    onset_channels: str,
+    bipolar_label: np.ndarray,
+    region_label_mode: str = 'coarse',
+) -> np.ndarray:
+    """Build a multi-label region target from onset channels or active bipolar pairs."""
+    region_names = get_region_names(region_label_mode)
+    region_to_index = {name: idx for idx, name in enumerate(region_names)}
+    region_target = np.zeros(len(region_names), dtype=np.float32)
     onset_parts = [part.strip() for part in str(onset_channels).split(';') if part.strip()]
 
     if onset_parts:
         for part in onset_parts:
-            for region in _channel_to_regions(part):
-                region_target[REGION_TO_INDEX[region]] = 1.0
+            for region in _channel_to_regions(part, region_label_mode=region_label_mode):
+                region_target[region_to_index[region]] = 1.0
 
     if region_target.sum() == 0:
         for is_active, pair in zip(bipolar_label.tolist(), TCP_BIPOLAR_NAMES):
             if is_active <= 0:
                 continue
-            for region in _channel_to_regions(pair):
-                region_target[REGION_TO_INDEX[region]] = 1.0
+            for region in _channel_to_regions(pair, region_label_mode=region_label_mode):
+                region_target[region_to_index[region]] = 1.0
 
     return region_target
 
@@ -205,6 +279,7 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         patient_ids: Optional[List[str]] = None,
         soz_only: bool = False,
         label_mode: str = 'bipolar',       # 'bipolar' or 'monopolar'
+        region_label_mode: str = 'coarse',
         hemisphere_label_mode: str = 'lrb',
         pipeline_cfg: 'PipelineConfig' = None,
         exclude_montages: Optional[List[str]] = None,
@@ -216,6 +291,12 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         self.tusz_data_root = tusz_data_root
         self.private_data_root = private_data_root
         self.label_mode = label_mode
+        if region_label_mode not in REGION_LABEL_MODES:
+            raise ValueError(
+                f"Unsupported region_label_mode: {region_label_mode}; "
+                f"choices={tuple(REGION_LABEL_MODES.keys())}"
+            )
+        self.region_label_mode = region_label_mode
         if hemisphere_label_mode not in ('lrb', 'lr_ignore_b'):
             raise ValueError(
                 f"Unsupported hemisphere_label_mode: {hemisphere_label_mode}"
@@ -318,7 +399,8 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
             f"ManifestSOZDataset: {n0} -> {len(self.df)} rows "
             f"(source={source_filter}, split={split_filter}, "
             f"patients={len(self.df['patient_id'].unique())}, "
-            f"label_mode={self.label_mode}, hemisphere_mode={self.hemisphere_label_mode})"
+            f"label_mode={self.label_mode}, region_mode={self.region_label_mode}, "
+            f"hemisphere_mode={self.hemisphere_label_mode})"
         )
 
     def __len__(self) -> int:
@@ -356,6 +438,7 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
         region_label = _build_region_target(
             str(row.get('onset_channels', '')),
             bipolar_label,
+            region_label_mode=self.region_label_mode,
         )
         hemisphere_label = _map_hemisphere_label(
             str(row.get('hemisphere', '')),
@@ -377,6 +460,7 @@ class ManifestSOZDataset(Dataset if _HAS_TORCH else object):
             'bipolar_label':  bipolar_label,
             'monopolar_label': monopolar_label,
             'region_label':   region_label,
+            'region_label_mode': self.region_label_mode,
             'hemisphere_label': hemisphere_label,
         }
 

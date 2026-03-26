@@ -11,6 +11,13 @@ import numpy as np
 REGION_NAMES: Tuple[str, ...] = ("FP", "F", "C", "T", "P", "O")
 
 
+def normalize_region_names(region_names: Sequence[str] | np.ndarray) -> Tuple[str, ...]:
+    arr = np.asarray(region_names)
+    if arr.ndim != 1:
+        raise ValueError(f"region_names must be 1D, got shape={arr.shape}")
+    return tuple(str(name) for name in arr.tolist())
+
+
 def _safe_div(num: float, den: float) -> float:
     return float(num / den) if den else 0.0
 
@@ -21,6 +28,7 @@ def compute_region_confusion_rows(
     threshold: float = 0.5,
     region_names: Sequence[str] = REGION_NAMES,
 ) -> List[dict]:
+    region_names = normalize_region_names(region_names)
     probs = np.asarray(region_probs, dtype=np.float32)
     targets = np.asarray(region_targets, dtype=np.float32)
     if probs.shape != targets.shape:
@@ -110,6 +118,7 @@ def save_region_confusion_report(
     threshold: float = 0.5,
     region_names: Sequence[str] = REGION_NAMES,
 ) -> Tuple[Path, Path]:
+    region_names = normalize_region_names(region_names)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = compute_region_confusion_rows(
@@ -178,11 +187,15 @@ def main() -> int:
         raise KeyError(
             f"{args.predictions} must contain region_probs and region_targets arrays"
         )
+    region_names = REGION_NAMES
+    if "region_names" in data:
+        region_names = normalize_region_names(data["region_names"])
     md_path, csv_path = save_region_confusion_report(
         region_probs=data["region_probs"],
         region_targets=data["region_targets"],
         output_dir=args.output_dir,
         threshold=args.threshold,
+        region_names=region_names,
     )
     print(f"Saved markdown report to {md_path}")
     print(f"Saved csv report to {csv_path}")
