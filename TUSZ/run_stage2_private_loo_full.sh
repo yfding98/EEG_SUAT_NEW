@@ -26,6 +26,7 @@ FINETUNE_EPOCHS="${FINETUNE_EPOCHS:-50}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LR_PRIVATE="${LR_PRIVATE:-2e-5}"
 WORKERS="${WORKERS:-4}"
+FREEZE_LABRAM_PRIVATE="${FREEZE_LABRAM_PRIVATE:-1}"
 
 W_REGION="${W_REGION:-0.5}"
 W_HEMISPHERE="${W_HEMISPHERE:-0.0}"
@@ -36,6 +37,25 @@ FOCAL_GAMMA="${FOCAL_GAMMA:-2.0}"
 GENERALIZED_POS_RATIO_THRESHOLD="${GENERALIZED_POS_RATIO_THRESHOLD:-0.5}"
 GENERALIZED_SAMPLE_WEIGHT="${GENERALIZED_SAMPLE_WEIGHT:-0.2}"
 BRAIN_NETWORK_FEATURES="${BRAIN_NETWORK_FEATURES:-gc,te,aec,wpli}"
+PRIVATE_BALANCED_SAMPLER="${PRIVATE_BALANCED_SAMPLER:-1}"
+PRIVATE_PATIENT_WEIGHT_POWER="${PRIVATE_PATIENT_WEIGHT_POWER:-1.0}"
+PRIVATE_RARE_CHANNEL_SAMPLER_STRENGTH="${PRIVATE_RARE_CHANNEL_SAMPLER_STRENGTH:-0.5}"
+PRIVATE_RARE_CHANNEL_SAMPLER_MAX_BOOST="${PRIVATE_RARE_CHANNEL_SAMPLER_MAX_BOOST:-2.5}"
+PRIVATE_SAMPLER_MAX_WEIGHT="${PRIVATE_SAMPLER_MAX_WEIGHT:-4.0}"
+PRIVATE_CHANNEL_LOSS_WEIGHT="${PRIVATE_CHANNEL_LOSS_WEIGHT:-1}"
+PRIVATE_COMMON_CHANNEL_LOSS_MIN_WEIGHT="${PRIVATE_COMMON_CHANNEL_LOSS_MIN_WEIGHT:-0.5}"
+PRIVATE_RARE_CHANNEL_LOSS_MAX_WEIGHT="${PRIVATE_RARE_CHANNEL_LOSS_MAX_WEIGHT:-3.0}"
+PRIVATE_ZERO_POSITIVE_CHANNEL_WEIGHT="${PRIVATE_ZERO_POSITIVE_CHANNEL_WEIGHT:-0.2}"
+PRIVATE_EEG_AUGMENT="${PRIVATE_EEG_AUGMENT:-1}"
+AUGMENT_GAUSSIAN_PROB="${AUGMENT_GAUSSIAN_PROB:-0.4}"
+AUGMENT_GAUSSIAN_STD_SCALE="${AUGMENT_GAUSSIAN_STD_SCALE:-0.01}"
+AUGMENT_BANDSTOP_PROB="${AUGMENT_BANDSTOP_PROB:-0.25}"
+AUGMENT_BANDSTOP_MIN_FREQ="${AUGMENT_BANDSTOP_MIN_FREQ:-45.0}"
+AUGMENT_BANDSTOP_MAX_FREQ="${AUGMENT_BANDSTOP_MAX_FREQ:-65.0}"
+AUGMENT_BANDSTOP_WIDTH_HZ="${AUGMENT_BANDSTOP_WIDTH_HZ:-2.0}"
+AUGMENT_CHANNEL_DROP_PROB="${AUGMENT_CHANNEL_DROP_PROB:-0.15}"
+AUGMENT_MAX_CHANNEL_DROPS="${AUGMENT_MAX_CHANNEL_DROPS:-1}"
+AUGMENT_LR_MIRROR_PROB="${AUGMENT_LR_MIRROR_PROB:-0.10}"
 
 START_FOLD="${START_FOLD:-0}"
 END_FOLD="${END_FOLD:-}"
@@ -87,6 +107,26 @@ run_private_loo_fold() {
   local fold_index="$1"
   local seed="$2"
   local fold_output="${LOO_OUTPUT_BASE}_fold${fold_index}"
+  local private_args=()
+
+  if [[ "$FREEZE_LABRAM_PRIVATE" == "1" ]]; then
+    private_args+=(--freeze-labram)
+  fi
+  if [[ "$PRIVATE_BALANCED_SAMPLER" == "1" ]]; then
+    private_args+=(--private-balanced-sampler)
+  else
+    private_args+=(--no-private-balanced-sampler)
+  fi
+  if [[ "$PRIVATE_CHANNEL_LOSS_WEIGHT" == "1" ]]; then
+    private_args+=(--private-channel-loss-weight)
+  else
+    private_args+=(--no-private-channel-loss-weight)
+  fi
+  if [[ "$PRIVATE_EEG_AUGMENT" == "1" ]]; then
+    private_args+=(--private-eeg-augment)
+  else
+    private_args+=(--no-private-eeg-augment)
+  fi
 
   echo "[2/2] Running private LOO fold ${fold_index} -> ${fold_output}"
   "$PYTHON_BIN" TUSZ/models/train_soz_locator_with_brain_networks.py \
@@ -113,7 +153,24 @@ run_private_loo_fold() {
     --focal-gamma "$FOCAL_GAMMA" \
     --generalized-pos-ratio-threshold "$GENERALIZED_POS_RATIO_THRESHOLD" \
     --generalized-sample-weight "$GENERALIZED_SAMPLE_WEIGHT" \
+    --private-patient-weight-power "$PRIVATE_PATIENT_WEIGHT_POWER" \
+    --private-rare-channel-sampler-strength "$PRIVATE_RARE_CHANNEL_SAMPLER_STRENGTH" \
+    --private-rare-channel-sampler-max-boost "$PRIVATE_RARE_CHANNEL_SAMPLER_MAX_BOOST" \
+    --private-sampler-max-weight "$PRIVATE_SAMPLER_MAX_WEIGHT" \
+    --private-common-channel-loss-min-weight "$PRIVATE_COMMON_CHANNEL_LOSS_MIN_WEIGHT" \
+    --private-rare-channel-loss-max-weight "$PRIVATE_RARE_CHANNEL_LOSS_MAX_WEIGHT" \
+    --private-zero-positive-channel-weight "$PRIVATE_ZERO_POSITIVE_CHANNEL_WEIGHT" \
+    --augment-gaussian-prob "$AUGMENT_GAUSSIAN_PROB" \
+    --augment-gaussian-std-scale "$AUGMENT_GAUSSIAN_STD_SCALE" \
+    --augment-bandstop-prob "$AUGMENT_BANDSTOP_PROB" \
+    --augment-bandstop-min-freq "$AUGMENT_BANDSTOP_MIN_FREQ" \
+    --augment-bandstop-max-freq "$AUGMENT_BANDSTOP_MAX_FREQ" \
+    --augment-bandstop-width-hz "$AUGMENT_BANDSTOP_WIDTH_HZ" \
+    --augment-channel-drop-prob "$AUGMENT_CHANNEL_DROP_PROB" \
+    --augment-max-channel-drops "$AUGMENT_MAX_CHANNEL_DROPS" \
+    --augment-lr-mirror-prob "$AUGMENT_LR_MIRROR_PROB" \
     --brain-network-features "$BRAIN_NETWORK_FEATURES" \
+    "${private_args[@]}" \
     --output-dir "$fold_output"
 }
 
