@@ -86,6 +86,22 @@ TCP_BIPOLAR_COLUMNS = [
     'A1_T3', 'T3_C3', 'C3_CZ', 'CZ_C4', 'C4_T4', 'T4_A2',
 ]
 
+# ── Integration 模型的 19 通道输出顺序 (来自 BipolarToMonopolarMapper.DEFAULT_MONOPOLAR_19) ──
+MODEL_MONOPOLAR_19 = [
+    'FP1', 'FP2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4',
+    'O1', 'O2', 'F7', 'F8', 'T3', 'T4', 'T5', 'T6',
+    'FZ', 'CZ', 'PZ',
+]
+
+# ── 构建重排索引：将模型输出顺序 → DeepSOZ 官方顺序 ──
+# MODEL_TO_OFFICIAL_IDX[i] = 模型输出中哪个索引对应官方顺序的第 i 个通道
+MODEL_TO_OFFICIAL_IDX = [MODEL_MONOPOLAR_19.index(ch) for ch in OFFICIAL_19_CHANNELS]
+# 例如: OFFICIAL[2]='F7', MODEL 中 F7 在索引 10 → MODEL_TO_OFFICIAL_IDX[2]=10
+
+def reorder_model_to_official(probs: np.ndarray) -> np.ndarray:
+    """将模型输出的 [*, 19] 从 MODEL_MONOPOLAR_19 顺序重排到 OFFICIAL_19_CHANNELS 顺序。"""
+    return probs[..., MODEL_TO_OFFICIAL_IDX]
+
 # 官方 chn_neighbours（19 通道 10-20 系统拓扑邻接关系）
 CHN_NEIGHBOURS_19 = {
     0:  [1, 2, 3, 4],
@@ -439,7 +455,8 @@ def mc_inference_integration(
                     seizure_onset_sec=onset_sec.to(device),
                     window_start_sec=start_sec.to(device),
                 )
-        prob = outputs['soz_probs'].cpu().numpy()  # [B, 19]
+        prob = outputs['soz_probs'].cpu().numpy()  # [B, 19] — MODEL_MONOPOLAR_19 顺序
+        prob = reorder_model_to_official(prob)      # → OFFICIAL_19_CHANNELS 顺序
         results.append(prob)
     model.eval()
     return np.concatenate(results, axis=0)  # [n_samples * B, 19]
@@ -476,7 +493,8 @@ def run_channel_inference(
                 seizure_onset_sec=onset_sec,
                 window_start_sec=start_sec,
             )
-        probs = outputs['soz_probs'].cpu().numpy()  # [B, 19]
+        probs = outputs['soz_probs'].cpu().numpy()  # [B, 19] — MODEL_MONOPOLAR_19 顺序
+        probs = reorder_model_to_official(probs)     # → OFFICIAL_19_CHANNELS 顺序
         all_probs.append(probs)
         all_labels.append(batch['onset_map_19'].numpy())
         for i in range(x.size(0)):
