@@ -3,14 +3,15 @@
 """
 Integration Model 评估脚本 — 使用 DeepSOZ 官方评估方法
 
-使用 TUSZ/models/integration_model.py 训练的模型，
-在 combined_manifest.csv 上跑推理，然后按 DeepSOZ 官方评估逻辑计算：
+使用 train_soz_locator_with_brain_networks.py 训练的模型
+(TimeFilter_LaBraM_BrainNetwork_Integration),
+在 combined_manifest.csv 上跑推理, 按 DeepSOZ 官方评估逻辑计算:
 
-1. Channel-level (19通道)
+1. Channel-level (19 单极通道, DeepSOZ 官方顺序)
    - 逐通道混淆矩阵 (TP/FP/TN/FN/Precision/Recall/Specificity/F1)
    - 多阈值扫描 + 最优阈值
 
-2. Region-level (6脑区)
+2. Region-level (6 脑区)
    - 逐区混淆矩阵
 
 3. Seizure-level 定位正确率 (corr_sz)
@@ -22,16 +23,19 @@ Integration Model 评估脚本 — 使用 DeepSOZ 官方评估方法
    - MC 不确定性 (ptunc)
 
 5. 邻居放宽判断 (chn_neighbours)
-   - 当 SOZ 通道数 ≤ threshold 时，预测通道落在空间邻居也算正确
+   - 当 SOZ 通道数 ≤ threshold 时, 预测通道落在空间邻居也算正确
 
-关键注意：
-   Integration model 输出 19 通道顺序 (STANDARD_19 / BipolarToMonopolarMapper):
-     [FP1, FP2, F3, F4, C3, C4, P3, P4, O1, O2, F7, F8, T3, T4, T5, T6, FZ, CZ, PZ]
+���══════════════════════════════════════════════════════════════════════════════
+通道映射说明:
+═══════════════════════════════════════════════════════════════════════════════
 
-   DeepSOZ 官方 19 通道顺序 (OFFICIAL_19_CHANNELS):
-     [FP1, FP2, F7, F3, FZ, F4, F8, T3, C3, CZ, C4, T4, T5, P3, PZ, P4, T6, O1, O2]
+模型输出 soz_probs [B, 19] (output_mode='monopolar'), 顺序为 STANDARD_19:
+  [FP1, FP2, F3, F4, C3, C4, P3, P4, O1, O2, F7, F8, T3, T4, T5, T6, FZ, CZ, PZ]
 
-   脚本内置了通道重排序映射来对齐两边。
+DeepSOZ 官方评估需要 19 通道顺序 (DEEPSOZ_19):
+  [FP1, FP2, F7, F3, FZ, F4, F8, T3, C3, CZ, C4, T4, T5, P3, PZ, P4, T6, O1, O2]
+
+脚本内置了 reorder_to_deepsoz() 做重排。
 
 用法:
   python evaluate_integration_deepsoz.py \\
@@ -53,24 +57,30 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 
 # ─── 项目路径设置 ──────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # EEG_SUAT_NEW
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / 'TUSZ'))
 sys.path.insert(0, str(PROJECT_ROOT / 'TUSZ' / 'models'))
 
-from manifest_dataset import (
-    ManifestSOZDataset, TCP_BIPOLAR_NAMES, TCP_COL_NAMES,
-    COARSE_REGION_NAMES, HEMISPHERE_NAMES,
-)
-from integration_model import (
+from models.integration_model import (
     TimeFilter_LaBraM_BrainNetwork_Integration,
     IntegrationConfig,
 )
-from bipolar_to_monopolar import DEFAULT_MONOPOLAR_19
+from models.manifest_dataset import (
+    ManifestSOZDataset,
+    TCP_BIPOLAR_NAMES,
+    TCP_COL_NAMES,
+    COARSE_REGION_NAMES,
+    HEMISPHERE_NAMES,
+    _build_bipolar_to_monopolar_matrix,
+    get_region_names,
+)
+from models.bipolar_to_monopolar import DEFAULT_MONOPOLAR_19
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,11 +88,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 通道定义 & 重排序映射
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Integration model 输出 19 通道顺序 (BipolarToMonopolarMapper / STANDARD_19)
+# Integration model 输出 19 通道顺序 (STANDARD_19 / BipolarToMonopolarMapper)
 INTEGRATION_19 = list(DEFAULT_MONOPOLAR_19)
 # ['FP1','FP2','F3','F4','C3','C4','P3','P4','O1','O2',
 #  'F7','F8','T3','T4','T5','T6','FZ','CZ','PZ']
@@ -96,28 +107,43 @@ DEEPSOZ_19 = [
 ]
 
 # 构建 Integration → DeepSOZ 重排索引
-# INTEGRATION_TO_DEEPSOZ[i] = integration_model 输出中第几个通道对应 DeepSOZ 第 i 个通道
 _int_idx = {ch: i for i, ch in enumerate(INTEGRATION_19)}
 INTEGRATION_TO_DEEPSOZ = [_int_idx[ch] for ch in DEEPSOZ_19]
 
-# 构建 DeepSOZ → Integration 重排索引 (用于将 DeepSOZ 顺序标签映射到 Integration 顺序)
+# 反向映射
 _dsz_idx = {ch: i for i, ch in enumerate(DEEPSOZ_19)}
 DEEPSOZ_TO_INTEGRATION = [_dsz_idx[ch] for ch in INTEGRATION_19]
 
 
 def reorder_to_deepsoz(arr: np.ndarray) -> np.ndarray:
-    """将 Integration 模型的 19 通道输出重排为 DeepSOZ 官方顺序。
-    arr: [..., 19] — 最后一维是通道
-    """
+    """将 STANDARD_19 顺序的 [*, 19] 数组重排为 DeepSOZ 官方顺序。"""
     return arr[..., INTEGRATION_TO_DEEPSOZ]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# DeepSOZ 官方评估工具函数 (来自 deeksha-ms/DeepSOZ 源码)
+# 双极标签 → 单极标签 (DeepSOZ 顺序)
 # ═════════════════════════════════════════════════════════════════════════════
 
-# 官方 chn_neighbours (19 通道空间邻接, 索引基于 DEEPSOZ_19 顺序)
-# 来源: deeksha-ms/DeepSOZ code/test/final_eval_all.ipynb
+def bipolar22_to_monopolar19_binary(bipolar_labels: np.ndarray) -> np.ndarray:
+    """
+    22 双极 SOZ 二值标签 → 19 单极 SOZ 二值标签 (DeepSOZ 顺序)
+
+    bipolar_labels: [*, 22] binary
+    返回: [*, 19] binary (DeepSOZ 通道顺序)
+    """
+    b2m = _build_bipolar_to_monopolar_matrix()  # [19, 22] STANDARD_19 顺序
+    orig_shape = bipolar_labels.shape
+    flat = bipolar_labels.reshape(-1, 22)
+    mono = (flat @ b2m.T > 0).astype(np.float32)  # [N, 19] STANDARD_19 顺序
+    mono = mono.reshape(*orig_shape[:-1], 19)
+    return reorder_to_deepsoz(mono)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DeepSOZ 官方评估工具函数
+# ═════════════════════════════════════════════════════════════════════════════
+
+# 官方 chn_neighbours (索引基于 DEEPSOZ_19 顺序)
 CHN_NEIGHBOURS_19 = {
     0:  [1, 2, 3, 4],                 # FP1
     1:  [0, 4, 5, 6],                 # FP2
@@ -142,11 +168,9 @@ CHN_NEIGHBOURS_19 = {
 
 
 def check_neighborhood(max_chn: int, onset_map: np.ndarray) -> bool:
-    """官方 check_neighborhood: max_chn 是否落在任一真实 SOZ 的空间邻居内。"""
     for i in range(len(onset_map)):
-        if onset_map[i] == 1:
-            if max_chn in CHN_NEIGHBOURS_19.get(i, []):
-                return True
+        if onset_map[i] == 1 and max_chn in CHN_NEIGHBOURS_19.get(i, []):
+            return True
     return False
 
 
@@ -156,23 +180,14 @@ def final_loc(
     neighbour_threshold: int = 4,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
-    官方 final_loc (来自 final_eval_all.ipynb):
-
-    psoz        : [N, 19]  N次 MC 采样的通道预测值 (DeepSOZ 通道顺序)
-    true_onset  : [19]     0/1 SOZ 标签 (DeepSOZ 通道顺序)
-
-    流程:
-      1. 每行除以行最大值 (归一化)
-      2. 列均值 → [19] 最终通道概率
-      3. argmax 取预测通道
-      4. 精确命中 or 邻居放宽
-
-    返回 (ysoz, uncertainty, correct)
+    官方 final_loc (final_eval_all.ipynb):
+    psoz: [N, 19], true_onset: [19] (均为 DeepSOZ 顺序)
+    返回 (ysoz [19], uncertainty [19], correct 0/1)
     """
     m = psoz.max(axis=1, keepdims=True)
     m = np.where(m > 0, m, 1.0)
     psoz_norm = psoz / m
-    ysoz = psoz_norm.mean(axis=0)       # [19]
+    ysoz = psoz_norm.mean(axis=0)
 
     max_chn = int(np.argmax(ysoz))
     correct = 1 if true_onset[max_chn] == 1 else 0
@@ -182,7 +197,7 @@ def final_loc(
             and check_neighborhood(max_chn, true_onset)):
         correct = 1
 
-    uncertainty = psoz_norm.var(axis=0)  # [19]
+    uncertainty = psoz_norm.var(axis=0)
     return ysoz, uncertainty, correct
 
 
@@ -210,7 +225,6 @@ def print_confusion_report(
     threshold: float = 0.5,
     title: str = 'Channel-level',
 ) -> Dict:
-    """打印逐通道/逐区混淆矩阵并返回详情 dict。"""
     y_pred = (y_prob >= threshold).astype(int)
 
     print(f'\n## {title} Confusion Matrix (threshold={threshold:.3f})\n')
@@ -235,7 +249,6 @@ def print_confusion_report(
               f'{cm["precision"]:>6.3f} | {cm["recall"]:>6.3f} | '
               f'{cm["specificity"]:>6.3f} | {cm["f1"]:>6.3f} |')
 
-    # MACRO 平均
     macro_prec = np.mean([cm['precision'] for cm in per_label.values()])
     macro_rec  = np.mean([cm['recall']    for cm in per_label.values()])
     macro_spec = np.mean([cm['specificity'] for cm in per_label.values()])
@@ -243,7 +256,6 @@ def print_confusion_report(
     print(f'| {"MACRO":<10} |      |      |      |      |       | '
           f'{macro_prec:>6.3f} | {macro_rec:>6.3f} | {macro_spec:>6.3f} | {macro_f1:>6.3f} |')
 
-    # MICRO 平均
     micro_prec = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
     micro_rec  = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
     micro_spec = total_tn / (total_tn + total_fp) if (total_tn + total_fp) > 0 else 0.0
@@ -262,7 +274,6 @@ def print_confusion_report(
 
 def find_best_threshold(y_true: np.ndarray, y_prob: np.ndarray,
                         thresholds: np.ndarray = None) -> Tuple[float, float]:
-    """扫描阈值，找 macro F1 最优值。"""
     if thresholds is None:
         thresholds = np.arange(0.05, 0.95, 0.05)
     best_th, best_f1 = 0.5, 0.0
@@ -279,68 +290,135 @@ def find_best_threshold(y_true: np.ndarray, y_prob: np.ndarray,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Dataset wrapper (与 train_soz_locator_with_brain_networks.py 一致)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SOZBrainNetworkDataset(torch.utils.data.Dataset):
+    """
+    包装 ManifestSOZDataset, 提供 seizure_onset_sec / window_start_sec
+    给 SeizureAlignedAdaptivePatching 使用。
+
+    输出 x: [22, T] (展平后的原始波形), 与训练时一致。
+    """
+
+    def __init__(self, manifest_ds: ManifestSOZDataset):
+        self.ds = manifest_ds
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        sample = self.ds[idx]
+        x, label, mask, meta, y_bipolar, y_monopolar, y_region, y_hemisphere = sample
+
+        # 展平 [22, P, L] → [22, P*L] 与训练时一致
+        C, P, L = x.shape
+        x_flat = x.reshape(C, P * L)
+
+        row = self.ds.df.iloc[idx]
+        onset_sec = float(row.get('onset_sec', 5.0))
+        start_sec = float(row.get('window_start_sec', 0.0))
+
+        return {
+            'idx': idx,
+            'x': x_flat,
+            'label': label,
+            'bipolar_label': y_bipolar,
+            'monopolar_label': y_monopolar,
+            'region_label': y_region,
+            'hemisphere_label': y_hemisphere,
+            'onset_sec': onset_sec,
+            'start_sec': start_sec,
+            'patient_id': str(meta.get('patient_id', '')),
+            'edf_path': str(meta.get('edf_path', '')),
+        }
+
+
+def eval_collate_fn(batch):
+    ret = {
+        'idx': [b['idx'] for b in batch],
+        'x': torch.stack([b['x'] for b in batch]),
+        'label': torch.stack([b['label'] for b in batch]),
+        'bipolar_label': torch.stack([b['bipolar_label'] for b in batch]),
+        'monopolar_label': torch.stack([b['monopolar_label'] for b in batch]),
+        'region_label': torch.stack([b['region_label'] for b in batch]),
+        'hemisphere_label': torch.stack([b['hemisphere_label'] for b in batch]),
+        'onset_sec': torch.tensor([b['onset_sec'] for b in batch]),
+        'start_sec': torch.tensor([b['start_sec'] for b in batch]),
+        'patient_id': [b['patient_id'] for b in batch],
+        'edf_path': [b['edf_path'] for b in batch],
+    }
+    return ret
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 模型加载
 # ═════════════════════════════════════════════════════════════════════════════
 
 def build_model(args) -> TimeFilter_LaBraM_BrainNetwork_Integration:
-    """根据命令行参数构建 Integration model 并加载权重。"""
-    cfg = IntegrationConfig(
-        n_channels=22,
-        embed_dim=args.embed_dim,
-        n_transformer_layers=args.n_transformer_layers,
-        n_frozen_layers=0,  # 推理时不冻结
-        labram_checkpoint='',  # 不重新加载 LaBraM pretrain
-        n_pre_patches=args.n_pre_patches,
-        n_post_patches=args.n_post_patches,
-        patch_len=args.patch_len,
-        n_timefilter_blocks=args.n_timefilter_blocks,
-        brain_tf_n_blocks=args.brain_tf_n_blocks,
-        brain_tf_hidden=args.brain_tf_hidden,
-        gru_hidden=args.gru_hidden,
-        gcn_hidden=args.gcn_hidden,
-        output_mode='monopolar',      # 输出 19 通道
-        task_mode='soz',
-        n_regions=args.n_regions,
-        use_checkpoint=False,
-    )
+    """
+    从 checkpoint 加载 TimeFilter_LaBraM_BrainNetwork_Integration。
+
+    checkpoint 格式 (由 model.save_checkpoint 保存):
+      {'model_state': state_dict, 'config': IntegrationConfig, ...}
+    """
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+
+    # 尝试从 checkpoint 恢复 config
+    if 'config' in ckpt:
+        cfg = ckpt['config']
+        if isinstance(cfg, dict):
+            cfg = IntegrationConfig(**cfg)
+        logger.info(f'Using config from checkpoint')
+    else:
+        # 回退: 手动构建 config
+        logger.warning('Checkpoint 中无 config, 使用命令行参数构建')
+        cfg = IntegrationConfig(
+            n_channels=22,
+            embed_dim=args.embed_dim,
+            patch_len=args.patch_len,
+            n_pre_patches=args.n_pre_patches,
+            n_post_patches=args.n_post_patches,
+            fs=args.fs,
+            labram_checkpoint='',
+            n_frozen_layers=0,
+            output_mode=args.output_mode,
+            n_regions=args.n_regions,
+            task_mode='soz',
+            use_checkpoint=False,
+        )
+
+    # 推理时不冻结, 不需 LaBraM pretrain
+    cfg.n_frozen_layers = 0
+    cfg.labram_checkpoint = ''
+    cfg.use_checkpoint = False
+
     model = TimeFilter_LaBraM_BrainNetwork_Integration(cfg)
 
-    ckpt_path = args.checkpoint
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        state = ckpt['model_state_dict']
-    elif isinstance(ckpt, dict) and 'state_dict' in ckpt:
-        state = ckpt['state_dict']
-    else:
-        state = ckpt  # 直接是 state_dict
+    state = ckpt.get('model_state', ckpt.get('state_dict', ckpt))
+    if not isinstance(state, dict):
+        raise KeyError("Checkpoint does not contain a valid model state dict")
 
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        logger.warning(f'Missing keys ({len(missing)}): {missing[:5]}...')
-    if unexpected:
-        logger.warning(f'Unexpected keys ({len(unexpected)}): {unexpected[:5]}...')
-    logger.info(f'Loaded checkpoint: {ckpt_path}')
-    return model
+    # 兼容 DDP 的 module. 前缀
+    own_state = model.state_dict()
+    filtered_state = {}
+    for key, value in state.items():
+        clean_key = key[7:] if key.startswith('module.') else key
+        if clean_key in own_state and own_state[clean_key].shape == value.shape:
+            filtered_state[clean_key] = value
+
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+    loaded = len(filtered_state)
+    logger.info(f'Loaded checkpoint: {args.checkpoint}')
+    logger.info(f'  loaded={loaded}, missing={len(missing)}, unexpected={len(unexpected)}')
+    logger.info(f'  output_mode={cfg.output_mode}, embed_dim={cfg.embed_dim}, '
+                f'patches={cfg.n_pre_patches}+{cfg.n_post_patches}, patch_len={cfg.patch_len}')
+    return model, cfg
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 推理函数
 # ═════════════════════════════════════════════════════════════════════════════
-
-def collate_fn(batch):
-    """与 ManifestSOZDataset 配套的 collate 函数。"""
-    Xs, ys, masks, metas, y_bips, y_monos, y_regs, y_hemis = zip(*batch)
-    return (
-        torch.stack(Xs),
-        torch.stack(ys),
-        torch.stack(masks),
-        list(metas),
-        torch.stack(y_bips),
-        torch.stack(y_monos),
-        torch.stack(y_regs),
-        torch.stack(y_hemis),
-    )
-
 
 @torch.no_grad()
 def run_standard_inference(
@@ -351,89 +429,80 @@ def run_standard_inference(
     """
     标准推理 (model.eval(), 无 MC dropout)。
 
-    返回:
-        {
-            'soz_probs_19':     [N, 19] (Integration 顺序)
-            'soz_probs_dsz19':  [N, 19] (DeepSOZ 顺序)
-            'labels_mono_19':   [N, 19] (Integration 顺序)
-            'labels_dsz19':     [N, 19] (DeepSOZ 顺序, 通过重排标签得到)
-            'labels_bip_22':    [N, 22]
-            'region_probs':     [N, 6]
-            'region_labels':    [N, 6]
-            'hemisphere_probs': [N, 3]
-            'hemisphere_labels':[N]
-            'patient_ids':      [N] list
-            'edf_paths':        [N] list
-        }
+    模型输入: x [B, 22, T], seizure_onset_sec [B], window_start_sec [B]
+    模型输出: soz_probs [B, 19] (monopolar, STANDARD_19 顺序)
     """
     model.eval()
     use_amp = device.type == 'cuda'
 
-    all_soz_probs, all_mono_labels, all_bip_labels = [], [], []
+    all_soz_probs, all_bip_labels, all_mono_labels = [], [], []
     all_region_probs, all_region_labels = [], []
     all_hemi_probs, all_hemi_labels = [], []
+    all_bip_logits = []
     all_pids, all_edfs = [], []
 
     for batch in loader:
-        X, y_soz, mask, metas, y_bip, y_mono, y_reg, y_hemi = batch
-        X = X.to(device)
+        x = batch['x'].to(device)
+        onset = batch['onset_sec'].to(device)
+        start = batch['start_sec'].to(device)
 
-        with autocast(enabled=use_amp):
-            outputs = model(X)
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            outputs = model(x, onset, start)
 
-        soz_probs = outputs['soz_probs'].cpu().numpy()          # [B, 19]
-        region_probs = outputs['region_probs'].cpu().numpy()     # [B, 6]
-        hemi_probs = outputs['hemisphere_probs'].cpu().numpy()   # [B, 3]
+        soz_probs = outputs['soz_probs'].cpu().numpy()            # [B, 19] STANDARD_19
+        bipolar_logits = outputs['bipolar_logits'].cpu().numpy()   # [B, 22]
+        region_probs = outputs['region_probs'].cpu().numpy()       # [B, n_regions]
+        hemi_probs = outputs['hemisphere_probs'].cpu().numpy()     # [B, 3]
 
         all_soz_probs.append(soz_probs)
-        all_mono_labels.append(y_mono.numpy())
-        all_bip_labels.append(y_bip.numpy())
+        all_bip_logits.append(bipolar_logits)
+        all_bip_labels.append(batch['bipolar_label'].numpy())
+        all_mono_labels.append(batch['monopolar_label'].numpy())
         all_region_probs.append(region_probs)
-        all_region_labels.append(y_reg.numpy())
+        all_region_labels.append(batch['region_label'].numpy())
         all_hemi_probs.append(hemi_probs)
-        all_hemi_labels.append(y_hemi.numpy())
+        all_hemi_labels.append(batch['hemisphere_label'].numpy())
+        all_pids.extend(batch['patient_id'])
+        all_edfs.extend(batch['edf_path'])
 
-        for m in metas:
-            all_pids.append(m['patient_id'])
-            all_edfs.append(m['edf_path'])
-
-    soz_probs_19 = np.concatenate(all_soz_probs, axis=0)        # [N, 19] Integration 顺序
-
-    # 标签也是 Integration 顺序 (b2m_matrix 生成的 monopolar_label 用的是 STANDARD_19)
-    labels_mono_19 = np.concatenate(all_mono_labels, axis=0)     # [N, 19]
+    soz_probs_int19 = np.concatenate(all_soz_probs, axis=0)       # [N, 19] STANDARD_19
+    mono_labels_int19 = np.concatenate(all_mono_labels, axis=0)    # [N, 19] STANDARD_19
 
     # 重排到 DeepSOZ 顺序
-    soz_probs_dsz19 = reorder_to_deepsoz(soz_probs_19)
-    labels_dsz19 = reorder_to_deepsoz(labels_mono_19)
+    soz_probs_dsz19 = reorder_to_deepsoz(soz_probs_int19)
+    mono_labels_dsz19 = reorder_to_deepsoz(mono_labels_int19)
 
     return {
-        'soz_probs_19':     soz_probs_19,
-        'soz_probs_dsz19':  soz_probs_dsz19,
-        'labels_mono_19':   labels_mono_19,
-        'labels_dsz19':     labels_dsz19,
-        'labels_bip_22':    np.concatenate(all_bip_labels, axis=0),
-        'region_probs':     np.concatenate(all_region_probs, axis=0),
-        'region_labels':    np.concatenate(all_region_labels, axis=0),
-        'hemisphere_probs': np.concatenate(all_hemi_probs, axis=0),
-        'hemisphere_labels': np.concatenate(all_hemi_labels, axis=0),
-        'patient_ids':      all_pids,
-        'edf_paths':        all_edfs,
+        'soz_probs_int19':    soz_probs_int19,
+        'soz_probs_dsz19':    soz_probs_dsz19,
+        'labels_mono_int19':  mono_labels_int19,
+        'labels_mono_dsz19':  mono_labels_dsz19,
+        'bipolar_logits':     np.concatenate(all_bip_logits, axis=0),
+        'labels_bip22':       np.concatenate(all_bip_labels, axis=0),
+        'region_probs':       np.concatenate(all_region_probs, axis=0),
+        'region_labels':      np.concatenate(all_region_labels, axis=0),
+        'hemisphere_probs':   np.concatenate(all_hemi_probs, axis=0),
+        'hemisphere_labels':  np.concatenate(all_hemi_labels, axis=0),
+        'patient_ids':        all_pids,
+        'edf_paths':          all_edfs,
     }
 
 
 def mc_inference_single(
     model: TimeFilter_LaBraM_BrainNetwork_Integration,
-    X: torch.Tensor,
+    x: torch.Tensor,
+    onset: torch.Tensor,
+    start: torch.Tensor,
     device: torch.device,
     n_samples: int = 20,
 ) -> np.ndarray:
     """
     对单个 batch 做 MC dropout 采样。
 
-    model.train() 保持 dropout 开启，前向 n_samples 次。
+    model.train() 保持 dropout 开启, 前向 n_samples 次。
 
-    X: [B, 22, n_patches, patch_len]
-    返回: [n_samples * B, 19] 通道 SOZ 概率 (DeepSOZ 顺序)
+    x: [B, 22, T], onset: [B], start: [B]
+    返回: [n_samples * B, 19] SOZ 概率 (DeepSOZ 通道顺序)
     """
     model.train()
     use_amp = device.type == 'cuda'
@@ -441,23 +510,23 @@ def mc_inference_single(
 
     for _ in range(n_samples):
         with torch.no_grad():
-            with autocast(enabled=use_amp):
-                outputs = model(X.to(device))
-        probs = outputs['soz_probs'].cpu().numpy()       # [B, 19] Integration 顺序
-        probs_dsz = reorder_to_deepsoz(probs)             # [B, 19] DeepSOZ 顺序
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                outputs = model(x.to(device), onset.to(device), start.to(device))
+        probs = outputs['soz_probs'].cpu().numpy()          # [B, 19] STANDARD_19
+        probs_dsz = reorder_to_deepsoz(probs)                # [B, 19] DeepSOZ
         results.append(probs_dsz)
 
     model.eval()
     return np.concatenate(results, axis=0)  # [n_samples * B, 19]
 
 
-# ════════════════════════════��════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # 官方 Seizure/Patient-level 评估
 # ═════════════════════════════════════════════════════════════════════════════
 
 def official_sz_pt_evaluation(
     model: TimeFilter_LaBraM_BrainNetwork_Integration,
-    dataset: ManifestSOZDataset,
+    dataset: SOZBrainNetworkDataset,
     device: torch.device,
     mc_samples: int = 20,
     neighbour_threshold: int = 4,
@@ -465,11 +534,13 @@ def official_sz_pt_evaluation(
     """
     官方 Seizure-level + Patient-level 评估 (MC dropout)。
 
-    按患者分组，对每个发作做 MC 采样，然后用 final_loc 判断定位正确性。
+    按患者分组, 对每个发作做 MC 采样, 然后用 final_loc 判断定位正确性。
     """
-    # 按患者分组
-    patient_ids = dataset.get_patient_ids()
-    df = dataset.df
+    # 按 patient_id 分组
+    pid_to_indices = defaultdict(list)
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        pid_to_indices[sample['patient_id']].append(i)
 
     corr_pt = 0
     total_pt = 0
@@ -479,35 +550,27 @@ def official_sz_pt_evaluation(
     all_sz_unc = []
     sz_details = []
 
-    for pt_id in patient_ids:
-        # 获取该患者所有样本索引
-        pt_mask = df['patient_id'] == pt_id
-        indices = df.index[pt_mask].tolist()
-        if len(indices) == 0:
-            continue
-
+    for pt_id, indices in pid_to_indices.items():
         pt_psoz_all = []
         true_onset_dsz = None
 
-        for idx_in_df in indices:
-            # 获取在 dataset 中的位置索引
-            ds_idx = dataset.df.index.get_loc(idx_in_df)
-
+        for ds_idx in indices:
             sample = dataset[ds_idx]
-            X, y_soz, mask, meta, y_bip, y_mono, y_reg, y_hemi = sample
+            x = sample['x'].unsqueeze(0)               # [1, 22, T]
+            onset = torch.tensor([sample['onset_sec']])  # [1]
+            start = torch.tensor([sample['start_sec']])  # [1]
 
-            # 真实 onset_map: monopolar [19] (Integration 顺序) → DeepSOZ 顺序
-            true_onset_int = y_mono.numpy()                       # [19]
-            true_onset_dsz = reorder_to_deepsoz(true_onset_int)   # [19]
+            # 真实标签: monopolar [19] (STANDARD_19) → DeepSOZ 顺序
+            true_mono_int = sample['monopolar_label'].numpy()
+            true_onset_dsz = reorder_to_deepsoz(true_mono_int)
 
             # MC dropout 采样
-            X_batch = X.unsqueeze(0)                              # [1, 22, P, L]
             mc_maps = mc_inference_single(
-                model, X_batch, device,
+                model, x, onset, start, device,
                 n_samples=mc_samples,
             )  # [mc_samples, 19] DeepSOZ 顺序
 
-            # Seizure-level 评估
+            # Seizure-level
             ysoz, unc, correct = final_loc(
                 mc_maps, true_onset_dsz,
                 neighbour_threshold=neighbour_threshold,
@@ -516,7 +579,7 @@ def official_sz_pt_evaluation(
             all_sz_unc.append(unc)
             sz_details.append({
                 'pt_id': pt_id,
-                'edf_path': meta['edf_path'],
+                'edf_path': sample['edf_path'],
                 'correct': correct,
                 'max_chn': int(np.argmax(ysoz)),
                 'max_chn_name': DEEPSOZ_19[int(np.argmax(ysoz))],
@@ -528,9 +591,9 @@ def official_sz_pt_evaluation(
         if true_onset_dsz is None:
             continue
 
-        # Patient-level 评估
+        # Patient-level
         total_pt += 1
-        pt_psoz = np.concatenate(pt_psoz_all, axis=0)  # [N_total, 19]
+        pt_psoz = np.concatenate(pt_psoz_all, axis=0)
         ysoz_pt, unc_pt, correct_pt = final_loc(
             pt_psoz, true_onset_dsz,
             neighbour_threshold=neighbour_threshold,
@@ -570,33 +633,38 @@ def official_sz_pt_evaluation(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 通道映射验证 (调试用)
-# ═════════════════════════════════════════════════════════════════════════════
+# 通道映射验证
+# ══════════════════════════════════════════════��══════════════════════════════
 
 def verify_channel_mapping():
-    """打印通道映射详情以供人工检查。"""
-    print('\n' + '=' * 70)
+    print('\n' + '=' * 72)
     print('Channel Mapping Verification')
-    print('=' * 70)
+    print('=' * 72)
 
-    print('\nIntegration model 输出顺序 (STANDARD_19 / BipolarToMonopolarMapper):')
+    print(f'\n1. Model output (STANDARD_19, via BipolarToMonopolarMapper):')
     for i, ch in enumerate(INTEGRATION_19):
-        print(f'  [{i:>2}] {ch}')
+        print(f'   [{i:>2}] {ch}')
 
-    print('\nDeepSOZ 官方评估顺序 (OFFICIAL_19_CHANNELS):')
+    print(f'\n2. DeepSOZ official evaluation order:')
     for i, ch in enumerate(DEEPSOZ_19):
-        print(f'  [{i:>2}] {ch}')
+        print(f'   [{i:>2}] {ch}')
 
-    print('\nIntegration → DeepSOZ 重排索引:')
-    print(f'  INTEGRATION_TO_DEEPSOZ = {INTEGRATION_TO_DEEPSOZ}')
-    print('\n  即: DeepSOZ[i] = Integration[INTEGRATION_TO_DEEPSOZ[i]]')
+    print(f'\n3. Reorder mapping (STANDARD_19 → DeepSOZ):')
     for i, src_idx in enumerate(INTEGRATION_TO_DEEPSOZ):
-        assert INTEGRATION_19[src_idx] == DEEPSOZ_19[i], \
-            f'Mapping error: Integration[{src_idx}]={INTEGRATION_19[src_idx]} != DeepSOZ[{i}]={DEEPSOZ_19[i]}'
-        print(f'  DeepSOZ[{i:>2}] {DEEPSOZ_19[i]:<5} ← Integration[{src_idx:>2}] {INTEGRATION_19[src_idx]}')
+        assert INTEGRATION_19[src_idx] == DEEPSOZ_19[i]
+        print(f'   DeepSOZ[{i:>2}] {DEEPSOZ_19[i]:<5} ← STANDARD_19[{src_idx:>2}] {INTEGRATION_19[src_idx]}')
 
-    print('\n[OK] Channel mapping verified — all 19 channels match correctly.')
-    print('=' * 70 + '\n')
+    # 标签映射验证
+    print(f'\n4. Label mapping test:')
+    test_bip = np.zeros(22, dtype=np.float32)
+    test_bip[15] = 1.0  # P4-O2
+    test_mono = bipolar22_to_monopolar19_binary(test_bip.reshape(1, -1)).reshape(19)
+    active = [DEEPSOZ_19[i] for i in range(19) if test_mono[i] == 1]
+    print(f'   bipolar P4-O2=1 → monopolar SOZ: {active}')
+    assert 'P4' in active and 'O2' in active
+
+    print('\n[OK] All channel mappings verified.')
+    print('=' * 72 + '\n')
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -610,54 +678,41 @@ def parse_args():
     )
     # 数据
     p.add_argument('--checkpoint', required=True,
-                   help='Integration model .pt checkpoint')
+                   help='TimeFilter_LaBraM_BrainNetwork_Integration .pt checkpoint')
     p.add_argument('--manifest', required=True,
-                   help='combined_manifest.csv 路径')
-    p.add_argument('--tusz-data-root', default='F:/dataset/TUSZ/v2.0.3/edf',
-                   help='TUSZ EDF 根目录')
-    p.add_argument('--private-data-root', default='',
-                   help='私有数据 EDF 根目录')
+                   help='combined_manifest.csv')
+    p.add_argument('--tusz-data-root', default='F:/dataset/TUSZ/v2.0.3/edf')
+    p.add_argument('--private-data-root', default='')
     p.add_argument('--source', default=None,
-                   choices=['tusz', 'private', 'both'],
-                   help='数据源过滤')
+                   choices=['tusz', 'private', 'both'])
     p.add_argument('--split', nargs='+', default=None,
-                   help='split 过滤 (如 train dev eval)')
-    p.add_argument('--patient-ids', nargs='+', default=None,
-                   help='仅评估这些患者')
+                   help='split 过滤 (train dev eval)')
+    p.add_argument('--patient-ids', nargs='+', default=None)
 
-    # 模型架构 (需与训练时一致)
+    # 模型架构 (仅在 checkpoint 不含 config 时使用)
     p.add_argument('--embed-dim', type=int, default=200)
-    p.add_argument('--n-transformer-layers', type=int, default=12)
+    p.add_argument('--patch-len', type=int, default=200)
     p.add_argument('--n-pre-patches', type=int, default=5)
     p.add_argument('--n-post-patches', type=int, default=5)
-    p.add_argument('--patch-len', type=int, default=200)
-    p.add_argument('--n-timefilter-blocks', type=int, default=2)
-    p.add_argument('--brain-tf-n-blocks', type=int, default=1)
-    p.add_argument('--brain-tf-hidden', type=int, default=64)
-    p.add_argument('--gru-hidden', type=int, default=128)
-    p.add_argument('--gcn-hidden', type=int, default=64)
+    p.add_argument('--fs', type=float, default=200.0)
+    p.add_argument('--output-mode', default='monopolar',
+                   choices=['monopolar', 'bipolar'])
     p.add_argument('--n-regions', type=int, default=6)
 
     # 评估
-    p.add_argument('--threshold', type=float, default=0.5,
-                   help='混淆矩阵二值化阈值')
-    p.add_argument('--mc-samples', type=int, default=20,
-                   help='MC dropout 采样次数')
-    p.add_argument('--neighbour-threshold', type=int, default=4,
-                   help='邻居放宽 SOZ 通道数上限')
+    p.add_argument('--threshold', type=float, default=0.5)
+    p.add_argument('--mc-samples', type=int, default=20)
+    p.add_argument('--neighbour-threshold', type=int, default=4)
     p.add_argument('--batch-size', type=int, default=4)
     p.add_argument('--num-workers', type=int, default=0)
     p.add_argument('--device', default='cuda')
 
     # 输出
-    p.add_argument('--output-dir', default=None,
-                   help='结果保存目录 (默认 checkpoint 同级)')
-    p.add_argument('--save-preds', action='store_true',
-                   help='保存逐样本预测 CSV')
+    p.add_argument('--output-dir', default=None)
+    p.add_argument('--save-preds', action='store_true')
     p.add_argument('--skip-mc', action='store_true',
-                   help='跳过 MC dropout 评估 (仅做标准推理)')
-    p.add_argument('--verify-mapping', action='store_true',
-                   help='打印通道映射验证信息')
+                   help='跳过 MC dropout, 仅做标准混淆矩阵')
+    p.add_argument('--verify-mapping', action='store_true')
     return p.parse_args()
 
 
@@ -668,7 +723,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 通道映射验证
     if args.verify_mapping:
         verify_channel_mapping()
 
@@ -678,88 +732,88 @@ def main():
     logger.info(f'Device: {device}')
 
     # ── 构建模型 ──────────────────────────────────────────────────────────
-    model = build_model(args)
+    model, cfg = build_model(args)
     model.to(device)
 
     # ── 构建数据集 ────────────────────────────────────────────────────────
     source_filter = args.source or 'both'
-    ds = ManifestSOZDataset(
+    manifest_ds = ManifestSOZDataset(
         manifest_path=args.manifest,
         tusz_data_root=args.tusz_data_root,
         private_data_root=args.private_data_root or None,
         source_filter=source_filter,
         split_filter=args.split,
         patient_ids=args.patient_ids,
-        label_mode='monopolar',  # 输出 19 通道标签
+        label_mode='monopolar',  # 需要 monopolar 标签用于 DeepSOZ 评估
     )
+
+    ds = SOZBrainNetworkDataset(manifest_ds)
     logger.info(f'Dataset: {len(ds)} samples, '
-                f'{len(ds.get_patient_ids())} patients, '
+                f'{len(manifest_ds.get_patient_ids())} patients, '
                 f'source={source_filter}')
 
     if len(ds) == 0:
-        logger.error('数据集为空，请检查 manifest 和数据路径')
+        logger.error('数据集为空')
         return
 
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, collate_fn=collate_fn,
+        num_workers=args.num_workers, collate_fn=eval_collate_fn,
         pin_memory=device.type == 'cuda',
     )
 
     # ══════════════════════════════════════════════════════════════════════
-    # 1. 标准推理 → Channel/Region/Hemisphere 混淆矩阵
+    # 1. 标准推理 → 混淆矩阵
     # ══════════════════════════════════════════════════════════════════════
     logger.info('Running standard inference...')
     results = run_standard_inference(model, loader, device)
-
     n_samples = results['soz_probs_dsz19'].shape[0]
     logger.info(f'Inference done: {n_samples} samples')
 
-    # ── 1a. Channel-level 混淆矩阵 (DeepSOZ 通道顺序) ────────────────
-    # 先找最优阈值
+    # 19 单极通道混淆矩阵 (DeepSOZ 顺序)
     best_th, best_f1 = find_best_threshold(
-        results['labels_dsz19'], results['soz_probs_dsz19'],
+        results['labels_mono_dsz19'], results['soz_probs_dsz19'],
     )
-    logger.info(f'Best channel threshold: {best_th:.2f} (macro F1={best_f1:.3f})')
+    logger.info(f'Best threshold: {best_th:.2f} (macro F1={best_f1:.3f})')
 
-    # 固定阈值 0.5 和最优阈值都打印
     ch_report_05 = print_confusion_report(
-        results['labels_dsz19'], results['soz_probs_dsz19'],
+        results['labels_mono_dsz19'], results['soz_probs_dsz19'],
         DEEPSOZ_19, threshold=0.5,
-        title='Channel-level (DeepSOZ order, th=0.5)',
+        title='Channel-level 19ch DeepSOZ order (th=0.5)',
     )
 
     if abs(best_th - 0.5) > 0.01:
         ch_report_best = print_confusion_report(
-            results['labels_dsz19'], results['soz_probs_dsz19'],
+            results['labels_mono_dsz19'], results['soz_probs_dsz19'],
             DEEPSOZ_19, threshold=best_th,
-            title=f'Channel-level (DeepSOZ order, th={best_th:.2f})',
+            title=f'Channel-level 19ch DeepSOZ order (th={best_th:.2f})',
         )
     else:
         ch_report_best = ch_report_05
 
-    # ── 1b. Region-level 混淆矩阵 ────────────────────────────────────
+    # Region-level
     region_report = print_confusion_report(
         results['region_labels'], results['region_probs'],
-        COARSE_REGION_NAMES, threshold=0.5,
+        list(get_region_names('coarse')), threshold=0.5,
         title='Region-level (6 coarse regions)',
     )
 
-    # ── 1c. Hemisphere 准确率 ─────────────────────────────────────────
-    hemi_pred = results['hemisphere_probs'].argmax(axis=1)
+    # Hemisphere
     hemi_true = results['hemisphere_labels']
-    valid_hemi = hemi_true >= 0  # 排除 IGNORE_INDEX = -100
+    valid_hemi = hemi_true >= 0
+    hemi_acc = 0.0
     if valid_hemi.sum() > 0:
-        hemi_acc = (hemi_pred[valid_hemi] == hemi_true[valid_hemi]).mean()
+        hemi_pred = results['hemisphere_probs'].argmax(axis=1)
+        hemi_acc = float((hemi_pred[valid_hemi] == hemi_true[valid_hemi]).mean())
         print(f'\n## Hemisphere Classification')
-        print(f'  Accuracy: {hemi_acc:.3f} ({int((hemi_pred[valid_hemi] == hemi_true[valid_hemi]).sum())} / {int(valid_hemi.sum())})')
-        print(f'  Classes: {HEMISPHERE_NAMES}')
+        print(f'  Accuracy: {hemi_acc:.3f} '
+              f'({int((hemi_pred[valid_hemi] == hemi_true[valid_hemi]).sum())} '
+              f'/ {int(valid_hemi.sum())})')
     else:
-        hemi_acc = 0.0
-        print(f'\n## Hemisphere Classification: no valid samples')
+        print('\n## Hemisphere: no valid samples')
 
     # ══════════════════════════════════════════════════════════════════════
-    # 2. MC Dropout → Seizure/Patient-level 评估
+    # 2. MC Dropout → Seizure/Patient-level
     # ══════════════════════════════════════════════════════════════════════
     official_results = None
     if not args.skip_mc:
@@ -785,7 +839,6 @@ def main():
         print(f'  Correct rate (corr_sz): {sz["corr_sz_mean"]:.3f}')
         print(f'  Uncertainty (mean max-var): {sz["szunc_mean"]:.4f}')
 
-        # 打印每个患者详情
         print(f'\n## Per-patient Details\n')
         print(f'| {"Patient":<20} | {"#Sz":>4} | {"Corr":>5} | '
               f'{"Pred":>10} | {"True SOZ":<30} | {"Unc":>6} |')
@@ -808,7 +861,7 @@ def main():
     summary = {
         'checkpoint': args.checkpoint,
         'n_samples': n_samples,
-        'n_patients': len(ds.get_patient_ids()),
+        'n_patients': len(manifest_ds.get_patient_ids()),
         'source': source_filter,
         'channel_level': {
             'threshold_05': {
@@ -846,7 +899,6 @@ def main():
         json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
     logger.info(f'Results saved: {result_path}')
 
-    # ── 逐样本预测 CSV ──────────────────────────────────────────────
     if args.save_preds:
         rows = []
         for i in range(n_samples):
@@ -854,14 +906,9 @@ def main():
                 'patient_id': results['patient_ids'][i],
                 'edf_path': results['edf_paths'][i],
             }
-            # DeepSOZ 顺序通道概率 & 标签
             for j, ch_name in enumerate(DEEPSOZ_19):
                 row[f'prob_{ch_name}'] = float(results['soz_probs_dsz19'][i, j])
-                row[f'label_{ch_name}'] = int(results['labels_dsz19'][i, j])
-            # Region
-            for j, reg_name in enumerate(COARSE_REGION_NAMES):
-                row[f'reg_prob_{reg_name}'] = float(results['region_probs'][i, j])
-                row[f'reg_label_{reg_name}'] = int(results['region_labels'][i, j])
+                row[f'label_{ch_name}'] = int(results['labels_mono_dsz19'][i, j])
             rows.append(row)
         pred_path = out_dir / f'{stem}_deepsoz_preds.csv'
         pd.DataFrame(rows).to_csv(pred_path, index=False)
