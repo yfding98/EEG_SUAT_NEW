@@ -435,7 +435,8 @@ def run_standard_inference(
     模型输出: soz_probs [B, 19] (monopolar, STANDARD_19 顺序)
     """
     model.eval()
-    use_amp = device.type == 'cuda'
+    # 关闭 AMP — 推理时 float32 更稳定, 避免 float16 overflow → NaN
+    use_amp = False
 
     all_soz_probs, all_soz_logits, all_bip_labels, all_mono_labels = [], [], [], []
     all_region_probs, all_region_labels = [], []
@@ -443,13 +444,53 @@ def run_standard_inference(
     all_bip_logits = []
     all_pids, all_edfs = [], []
 
-    for batch in loader:
+    for step, batch in enumerate(loader):
         x = batch['x'].to(device)
         onset = batch['onset_sec'].to(device)
         start = batch['start_sec'].to(device)
 
+        # ── 第一个 batch 做诊断 ──
+        if step == 0:
+            logger.info(f'[DIAG] input x: shape={tuple(x.shape)}, '
+                        f'dtype={x.dtype}, '
+                        f'min={x.min().item():.4f}, max={x.max().item():.4f}, '
+                        f'mean={x.mean().item():.4f}, '
+                        f'nan_count={torch.isnan(x).sum().item()}, '
+                        f'inf_count={torch.isinf(x).sum().item()}, '
+                        f'all_zero_channels={int((x.abs().sum(dim=-1) == 0).sum().item())}')
+            logger.info(f'[DIAG] onset={onset.tolist()}, start={start.tolist()}')
+
+            # 检查模型权重是否包含 NaN
+            n_nan_params = 0
+            nan_layers = []
+            for name, p in model.named_parameters():
+                if torch.isnan(p).any():
+                    n_nan_params += 1
+                    nan_layers.append(name)
+            for name, buf in model.named_buffers():
+                if torch.isnan(buf).any():
+                    n_nan_params += 1
+                    nan_layers.append(f'(buf){name}')
+            if n_nan_params > 0:
+                logger.error(f'[DIAG] MODEL HAS NaN PARAMS/BUFFERS: {n_nan_params} tensors')
+                for nl in nan_layers[:10]:
+                    logger.error(f'  NaN in: {nl}')
+            else:
+                logger.info(f'[DIAG] Model weights: no NaN detected')
+
         with torch.amp.autocast('cuda', enabled=use_amp):
             outputs = model(x, onset, start)
+
+        # ── 第一个 batch 检查输出 ──
+        if step == 0:
+            for key in ['soz_logits', 'soz_probs', 'bipolar_logits',
+                         'region_logits', 'hemisphere_logits']:
+                if key in outputs:
+                    t = outputs[key]
+                    logger.info(f'[DIAG] {key}: shape={tuple(t.shape)}, '
+                                f'min={t.min().item():.6f}, max={t.max().item():.6f}, '
+                                f'nan={torch.isnan(t).sum().item()}, '
+                                f'inf={torch.isinf(t).sum().item()}')
 
         soz_probs = outputs['soz_probs'].cpu().numpy()            # [B, 19] STANDARD_19
         soz_logits = outputs['soz_logits'].cpu().numpy()          # [B, 19] STANDARD_19
@@ -513,13 +554,11 @@ def mc_inference_single(
     返回: [n_samples * B, 19] SOZ 概率 (DeepSOZ 通道顺序)
     """
     model.train()
-    use_amp = device.type == 'cuda'
     results = []
 
     for _ in range(n_samples):
         with torch.no_grad():
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                outputs = model(x.to(device), onset.to(device), start.to(device))
+            outputs = model(x.to(device), onset.to(device), start.to(device))
         probs = outputs['soz_probs'].cpu().numpy()          # [B, 19] STANDARD_19
         probs_dsz = reorder_to_deepsoz(probs)                # [B, 19] DeepSOZ
         results.append(probs_dsz)
