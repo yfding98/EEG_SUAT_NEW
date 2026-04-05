@@ -44,9 +44,12 @@ MANIFEST="${MANIFEST:-/mnt/hd1/dyf/dataset/EEG_dataset_SUAT/combined_manifest.cs
 DATA_ROOTS="${DATA_ROOTS:-/mnt/hd1/dyf/dataset/EEG_dataset_SUAT}"
 DATA_MODE="${DATA_MODE:-online}"
 
+# ── 缓存配置 ──────────────────────────────────────────────────────────────────
+CACHE_DIR="${CACHE_DIR:-${SCRIPT_DIR}/cache}"
+
 # ── 运行设备 ──────────────────────────────────────────────────────────────────
 DEVICE="${DEVICE:-cuda}"
-NUM_WORKERS="${NUM_WORKERS:-0}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
 
 # ── 参数选择 ──────────────────────────────────────────────────────────────────
 STAGE="${1:-both}"                  # both / 1 / 2
@@ -119,6 +122,7 @@ echo "  折:        ${FOLD_ARG}"
 echo "  manifest:  ${MANIFEST}"
 echo "  data:      ${DATA_ROOTS}"
 echo "  data_mode: ${DATA_MODE}"
+echo "  cache:     ${CACHE_DIR}"
 echo "  device:    ${DEVICE}"
 echo "  output:    ${OUTPUT_DIR}"
 echo "============================================================"
@@ -156,6 +160,7 @@ COMMON_ARGS=(
     --chn-map-w-margin  "${CHN_MAP_W_MARGIN}"
     --grad-clip     "${GRAD_CLIP}"
     --num-workers   "${NUM_WORKERS}"
+    --cache-dir     "${CACHE_DIR}"
     --device        "${DEVICE}"
     --output-dir    "${OUTPUT_DIR}"
     --exp-prefix    "${EXP_PREFIX}"

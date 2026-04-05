@@ -28,6 +28,7 @@ source 列区分数据来源：
                   并按官方 szlocLoader 方式以 onset 为中心截取 45 帧
 """
 
+import hashlib
 import json
 import logging
 import warnings
@@ -506,6 +507,71 @@ def _preprocess_edf(
     return X.astype(np.float32), Y.astype(np.float32)
 
 
+def _compute_cache_key(
+    edf_path: str, sz_start: float, sz_end: float,
+    duration, n_channels: int, use_bipolar: bool,
+    n_windows: int, target_fs: float,
+    f_low: float, f_high: float,
+) -> str:
+    """基于预处理参数计算 SHA-256 哈希，用作缓存文件名。"""
+    key_parts = (
+        edf_path, sz_start, sz_end, duration,
+        n_channels, use_bipolar, n_windows,
+        target_fs, f_low, f_high,
+    )
+    key_str = '|'.join(str(p) for p in key_parts)
+    return hashlib.sha256(key_str.encode('utf-8')).hexdigest()
+
+
+def _preprocess_edf_cached(
+    edf_path: str, sz_start: float, sz_end: float,
+    duration, n_channels: int, use_bipolar: bool,
+    n_windows: int, target_fs: float,
+    f_low: float, f_high: float,
+    cache_dir: Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    带磁盘缓存的 _preprocess_edf 包装。
+
+    cache_dir=None 时直接调用原函数，无任何额外开销。
+    启用时将 (X, Y) 缓存为 .npz 文件，后续直接加载。
+    """
+    if cache_dir is None:
+        return _preprocess_edf(
+            edf_path, sz_start, sz_end, duration,
+            n_channels=n_channels, use_bipolar=use_bipolar,
+            n_windows=n_windows, target_fs=target_fs,
+            f_low=f_low, f_high=f_high,
+        )
+
+    key = _compute_cache_key(
+        edf_path, sz_start, sz_end, duration,
+        n_channels, use_bipolar, n_windows,
+        target_fs, f_low, f_high,
+    )
+    cache_path = Path(cache_dir) / f'{key}.npz'
+
+    if cache_path.exists():
+        data = np.load(cache_path)
+        return data['X'], data['Y']
+
+    # 缓存未命中：执行完整预处理
+    X, Y = _preprocess_edf(
+        edf_path, sz_start, sz_end, duration,
+        n_channels=n_channels, use_bipolar=use_bipolar,
+        n_windows=n_windows, target_fs=target_fs,
+        f_low=f_low, f_high=f_high,
+    )
+
+    # 写入缓存（原子写入：先写 .tmp 再 rename，多 worker 安全）
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix('.tmp')
+    np.savez(tmp_path, X=X, Y=Y)
+    tmp_path.replace(cache_path)
+
+    return X, Y
+
+
 class OnlineStage1Dataset(Dataset):
     """
     在线 EDF Stage-1 数据集（适配 combined_manifest.csv）
@@ -525,6 +591,7 @@ class OnlineStage1Dataset(Dataset):
         target_fs: float = 200.0,
         f_low: float = 1.6,
         f_high: float = 30.0,
+        cache_dir: Optional[str] = None,
     ):
         df = pd.read_csv(manifest_path)
 
@@ -543,6 +610,7 @@ class OnlineStage1Dataset(Dataset):
         self.target_fs   = target_fs
         self.f_low       = f_low
         self.f_high      = f_high
+        self.cache_dir   = cache_dir
         logger.info(f'OnlineStage1Dataset: {len(self.samples)} 样本  '
                     f'source={source}  bipolar={use_bipolar}  '
                     f'n_ch={self.n_channels}')
@@ -553,7 +621,7 @@ class OnlineStage1Dataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         s = self.samples[idx]
         try:
-            X, Y = _preprocess_edf(
+            X, Y = _preprocess_edf_cached(
                 s['edf_path'], s['sz_start'], s['sz_end'],
                 s['duration'],
                 n_channels=self.n_channels,
@@ -561,6 +629,7 @@ class OnlineStage1Dataset(Dataset):
                 n_windows=self.n_windows,
                 target_fs=self.target_fs,
                 f_low=self.f_low, f_high=self.f_high,
+                cache_dir=self.cache_dir,
             )
         except Exception as e:
             logger.error(f"加载失败 {s['fn']}: {e}")

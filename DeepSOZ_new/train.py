@@ -105,6 +105,9 @@ def parse_args():
     g.add_argument('--target-fs',   type=float, default=200.0)
     g.add_argument('--f-low',       type=float, default=1.6)
     g.add_argument('--f-high',      type=float, default=30.0)
+    g.add_argument('--cache-dir',   default=None,
+                   help='EDF 预处理缓存目录。启用后将预处理结果缓存为 .npz，'
+                        '后续 epoch 直接加载，大幅加速训练')
 
     # 训练阶段
     g = p.add_argument_group('训练阶段')
@@ -224,6 +227,7 @@ def build_datasets(
             target_fs=args.target_fs,
             f_low=args.f_low,
             f_high=args.f_high,
+            cache_dir=args.cache_dir,
         )
         s1_tr_ds = OnlineStage1Dataset(
             patient_ids=train_ids,
@@ -249,6 +253,9 @@ def build_datasets(
         )
 
     nw = args.num_workers
+    if args.cache_dir is not None and nw == 0 and args.data_mode == 'online':
+        nw = 4
+        logger.info(f'缓存已启用，自动设置 num_workers={nw}')
     s1_tr = make_dataloader(s1_tr_ds, batch_size=args.stage1_batch,
                             shuffle=True,  num_workers=nw)
     s1_va = make_dataloader(s1_va_ds, batch_size=args.stage1_batch,
@@ -417,6 +424,7 @@ def main():
     logger.info(f'数据源    : {args.source or "全部(tusz+private)"}')
     logger.info(f'导联模式  : {"TCP双极22ch" if args.use_bipolar else "单极19ch"}')
     logger.info(f'设备      : {args.device}')
+    logger.info(f'缓存目录  : {args.cache_dir or "无(未启用缓存)"}')
 
     # K 折划分（按患者，仅在所选 source 范围内划分）
     patient_ids = get_patient_ids(args.manifest, source=args.source)
