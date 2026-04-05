@@ -185,7 +185,7 @@ def final_loc(
     返回 (ysoz [19], uncertainty [19], correct 0/1)
     """
     m = psoz.max(axis=1, keepdims=True)
-    m = np.where(m > 0, m, 1.0)
+    m = np.where(m > 1e-12, m, 1.0)  # 避免除零
     psoz_norm = psoz / m
     ysoz = psoz_norm.mean(axis=0)
 
@@ -198,6 +198,8 @@ def final_loc(
         correct = 1
 
     uncertainty = psoz_norm.var(axis=0)
+    # 修复 NaN: 当方差计算结果为 NaN (样本数不足或全零), 替换为 0
+    uncertainty = np.nan_to_num(uncertainty, nan=0.0)
     return ysoz, uncertainty, correct
 
 
@@ -435,7 +437,7 @@ def run_standard_inference(
     model.eval()
     use_amp = device.type == 'cuda'
 
-    all_soz_probs, all_bip_labels, all_mono_labels = [], [], []
+    all_soz_probs, all_soz_logits, all_bip_labels, all_mono_labels = [], [], [], []
     all_region_probs, all_region_labels = [], []
     all_hemi_probs, all_hemi_labels = [], []
     all_bip_logits = []
@@ -450,11 +452,13 @@ def run_standard_inference(
             outputs = model(x, onset, start)
 
         soz_probs = outputs['soz_probs'].cpu().numpy()            # [B, 19] STANDARD_19
+        soz_logits = outputs['soz_logits'].cpu().numpy()          # [B, 19] STANDARD_19
         bipolar_logits = outputs['bipolar_logits'].cpu().numpy()   # [B, 22]
         region_probs = outputs['region_probs'].cpu().numpy()       # [B, n_regions]
         hemi_probs = outputs['hemisphere_probs'].cpu().numpy()     # [B, 3]
 
         all_soz_probs.append(soz_probs)
+        all_soz_logits.append(soz_logits)
         all_bip_logits.append(bipolar_logits)
         all_bip_labels.append(batch['bipolar_label'].numpy())
         all_mono_labels.append(batch['monopolar_label'].numpy())
@@ -466,15 +470,19 @@ def run_standard_inference(
         all_edfs.extend(batch['edf_path'])
 
     soz_probs_int19 = np.concatenate(all_soz_probs, axis=0)       # [N, 19] STANDARD_19
+    soz_logits_int19 = np.concatenate(all_soz_logits, axis=0)     # [N, 19] STANDARD_19
     mono_labels_int19 = np.concatenate(all_mono_labels, axis=0)    # [N, 19] STANDARD_19
 
     # 重排到 DeepSOZ 顺序
     soz_probs_dsz19 = reorder_to_deepsoz(soz_probs_int19)
+    soz_logits_dsz19 = reorder_to_deepsoz(soz_logits_int19)
     mono_labels_dsz19 = reorder_to_deepsoz(mono_labels_int19)
 
     return {
         'soz_probs_int19':    soz_probs_int19,
         'soz_probs_dsz19':    soz_probs_dsz19,
+        'soz_logits_int19':   soz_logits_int19,
+        'soz_logits_dsz19':   soz_logits_dsz19,
         'labels_mono_int19':  mono_labels_int19,
         'labels_mono_dsz19':  mono_labels_dsz19,
         'bipolar_logits':     np.concatenate(all_bip_logits, axis=0),
@@ -770,11 +778,79 @@ def main():
     n_samples = results['soz_probs_dsz19'].shape[0]
     logger.info(f'Inference done: {n_samples} samples')
 
-    # 19 单极通道混淆矩阵 (DeepSOZ 顺序)
+    # ── 诊断: 打印 raw logits/probs 分布 ─────────────────────────────
+    soz_logits = results['soz_logits_dsz19']   # [N, 19]
+    soz_probs  = results['soz_probs_dsz19']    # [N, 19]
+    bip_logits = results['bipolar_logits']      # [N, 22]
+    bip_probs  = 1.0 / (1.0 + np.exp(-bip_logits))  # sigmoid
+
+    print('\n' + '=' * 72)
+    print('DIAGNOSTIC: Raw Output Distribution')
+    print('=' * 72)
+
+    print('\n-- soz_logits (19ch, after b2m mapping) --')
+    print(f'   overall: min={soz_logits.min():.4f}  max={soz_logits.max():.4f}  '
+          f'mean={soz_logits.mean():.4f}  std={soz_logits.std():.4f}')
+    print(f'   per-channel mean:')
+    for i, ch in enumerate(DEEPSOZ_19):
+        print(f'     [{i:>2}] {ch:<5}  mean={soz_logits[:, i].mean():>8.4f}  '
+              f'std={soz_logits[:, i].std():>7.4f}  '
+              f'min={soz_logits[:, i].min():>8.4f}  max={soz_logits[:, i].max():>8.4f}')
+
+    print('\n-- soz_probs (19ch, sigmoid of soz_logits) --')
+    print(f'   overall: min={soz_probs.min():.4f}  max={soz_probs.max():.4f}  '
+          f'mean={soz_probs.mean():.4f}')
+    print(f'   fraction >= 0.5: {(soz_probs >= 0.5).mean():.4f}')
+    print(f'   fraction >= 0.3: {(soz_probs >= 0.3).mean():.4f}')
+    print(f'   fraction >= 0.1: {(soz_probs >= 0.1).mean():.4f}')
+    # argmax 分布
+    argmax_19 = soz_probs.argmax(axis=1)
+    unique, counts = np.unique(argmax_19, return_counts=True)
+    print(f'   argmax distribution (DeepSOZ order):')
+    for u, c in zip(unique, counts):
+        print(f'     {DEEPSOZ_19[u]:<5} : {c:>5} ({c/n_samples:.1%})')
+
+    print('\n-- bipolar_logits (22ch, before b2m mapping) --')
+    print(f'   overall: min={bip_logits.min():.4f}  max={bip_logits.max():.4f}  '
+          f'mean={bip_logits.mean():.4f}  std={bip_logits.std():.4f}')
+    print(f'   per-channel mean (top 5):')
+    bip_means = bip_logits.mean(axis=0)
+    bip_names = TCP_BIPOLAR_NAMES
+    sorted_idx = np.argsort(bip_means)[::-1]
+    for rank, j in enumerate(sorted_idx[:5]):
+        print(f'     #{rank+1}  [{j:>2}] {bip_names[j]:<10}  mean={bip_means[j]:>8.4f}')
+
+    print(f'\n-- bipolar_probs (sigmoid of bipolar_logits) --')
+    print(f'   overall: min={bip_probs.min():.4f}  max={bip_probs.max():.4f}  '
+          f'mean={bip_probs.mean():.4f}')
+    print(f'   fraction >= 0.5: {(bip_probs >= 0.5).mean():.4f}')
+    print(f'   fraction >= 0.3: {(bip_probs >= 0.3).mean():.4f}')
+    print(f'   fraction >= 0.1: {(bip_probs >= 0.1).mean():.4f}')
+
+    print('=' * 72 + '\n')
+
+    # ── 22 双极通道混淆矩阵 (模型直接输出, 训练时的优化目标) ──────────
+    bip_report_05 = print_confusion_report(
+        results['labels_bip22'], bip_probs,
+        TCP_BIPOLAR_NAMES, threshold=0.5,
+        title='Bipolar 22ch (sigmoid of bipolar_logits, th=0.5)',
+    )
+    best_th_bip, best_f1_bip = find_best_threshold(
+        results['labels_bip22'], bip_probs,
+    )
+    if abs(best_th_bip - 0.5) > 0.01:
+        print_confusion_report(
+            results['labels_bip22'], bip_probs,
+            TCP_BIPOLAR_NAMES, threshold=best_th_bip,
+            title=f'Bipolar 22ch (sigmoid of bipolar_logits, th={best_th_bip:.2f})',
+        )
+    logger.info(f'Bipolar best threshold: {best_th_bip:.2f} (macro F1={best_f1_bip:.3f})')
+
+    # ── 19 单极通道混淆矩阵 (DeepSOZ 顺序) ──────────────────────────
     best_th, best_f1 = find_best_threshold(
         results['labels_mono_dsz19'], results['soz_probs_dsz19'],
     )
-    logger.info(f'Best threshold: {best_th:.2f} (macro F1={best_f1:.3f})')
+    logger.info(f'Monopolar best threshold: {best_th:.2f} (macro F1={best_f1:.3f})')
 
     ch_report_05 = print_confusion_report(
         results['labels_mono_dsz19'], results['soz_probs_dsz19'],
