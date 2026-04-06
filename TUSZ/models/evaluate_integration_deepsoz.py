@@ -571,6 +571,11 @@ def mc_inference_single(
 # 官方 Seizure/Patient-level 评估
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _onset_key(onset_map: np.ndarray) -> str:
+    """将 onset_map [19] 转为可哈希的字符串 key，用于按 SOZ 模式分组。"""
+    return ','.join(str(int(v)) for v in onset_map)
+
+
 def official_sz_pt_evaluation(
     model: TimeFilter_LaBraM_BrainNetwork_Integration,
     dataset: SOZBrainNetworkDataset,
@@ -581,7 +586,17 @@ def official_sz_pt_evaluation(
     """
     官方 Seizure-level + Patient-level 评估 (MC dropout)。
 
-    按患者分组, 对每个发作做 MC 采样, 然后用 final_loc 判断定位正确性。
+    关键设计：同一患者可能有多种不同的 SOZ 模式（不同发作的 onset_channels 不同）。
+
+    Seizure-level:
+      每个发作独立做 MC 采样 → final_loc(mc_maps, 该发作的 onset_map)
+
+    Patient-level:
+      按 SOZ 模式分组（同一患者内 onset_map 相同的发作归为一组）
+      → 每个 SOZ 模式组：聚合该组所有发作的 MC 采样 → final_loc
+      → 该患者的 patient-level 结果 = 所有 SOZ 模式组中，
+        至少有一个组正确 → correct（宽松）
+        或者取各模式的加权平均准确率（严格）
     """
     # 按 patient_id 分组
     pid_to_indices = defaultdict(list)
@@ -598,8 +613,14 @@ def official_sz_pt_evaluation(
     sz_details = []
 
     for pt_id, indices in pid_to_indices.items():
-        pt_psoz_all = []
-        true_onset_dsz = None
+        # ── 第一步: Seizure-level（每个发作独立评估） ──
+        # 同时按 SOZ 模式分组，为 patient-level 做准备
+        # pattern_groups[onset_key] = {
+        #     'onset_map': np.ndarray [19],
+        #     'mc_maps':   list of [mc_samples, 19],
+        #     'n_seizures': int,
+        # }
+        pattern_groups: Dict[str, Dict] = {}
 
         for ds_idx in indices:
             sample = dataset[ds_idx]
@@ -617,56 +638,122 @@ def official_sz_pt_evaluation(
                 n_samples=mc_samples,
             )  # [mc_samples, 19] DeepSOZ 顺序
 
-            # Seizure-level
+            # Seizure-level 评估（使用该发作自己的 onset_map）
             ysoz, unc, correct = final_loc(
                 mc_maps, true_onset_dsz,
                 neighbour_threshold=neighbour_threshold,
             )
             all_corr_sz.append(correct)
             all_sz_unc.append(unc)
+
+            # 构建 SOZ 描述
+            soz_channels = [DEEPSOZ_19[i] for i in range(19) if true_onset_dsz[i] == 1]
             sz_details.append({
                 'pt_id': pt_id,
                 'edf_path': sample['edf_path'],
                 'correct': correct,
                 'max_chn': int(np.argmax(ysoz)),
                 'max_chn_name': DEEPSOZ_19[int(np.argmax(ysoz))],
+                'true_soz': soz_channels,
                 'unc_max': float(unc.max()),
             })
 
-            pt_psoz_all.append(mc_maps)
+            # 按 SOZ 模式分组
+            key = _onset_key(true_onset_dsz)
+            if key not in pattern_groups:
+                pattern_groups[key] = {
+                    'onset_map': true_onset_dsz.copy(),
+                    'mc_maps': [],
+                    'n_seizures': 0,
+                    'soz_channels': soz_channels,
+                }
+            pattern_groups[key]['mc_maps'].append(mc_maps)
+            pattern_groups[key]['n_seizures'] += 1
 
-        if true_onset_dsz is None:
+        if not pattern_groups:
             continue
 
-        # Patient-level
+        # ── 第二步: Patient-level（按 SOZ 模式分组评估） ──
         total_pt += 1
-        pt_psoz = np.concatenate(pt_psoz_all, axis=0)
-        ysoz_pt, unc_pt, correct_pt = final_loc(
-            pt_psoz, true_onset_dsz,
-            neighbour_threshold=neighbour_threshold,
+        n_patterns = len(pattern_groups)
+        pattern_results = []
+
+        for key, group in pattern_groups.items():
+            # 聚合该模式的所有发作的 MC 采样
+            group_psoz = np.concatenate(group['mc_maps'], axis=0)  # [N_total, 19]
+            ysoz_g, unc_g, correct_g = final_loc(
+                group_psoz, group['onset_map'],
+                neighbour_threshold=neighbour_threshold,
+            )
+            pattern_results.append({
+                'soz_channels': group['soz_channels'],
+                'n_seizures': group['n_seizures'],
+                'correct': correct_g,
+                'max_chn_name': DEEPSOZ_19[int(np.argmax(ysoz_g))],
+                'unc_max': float(unc_g.max()),
+            })
+
+        # Patient-level 正确性判定:
+        # 加权平均（按各模式的发作数加权）
+        total_sz_in_patient = sum(g['n_seizures'] for g in pattern_results)
+        weighted_correct = sum(
+            g['correct'] * g['n_seizures'] / total_sz_in_patient
+            for g in pattern_results
         )
-        corr_pt += correct_pt
-        pt_uncs.append(unc_pt)
+        # 严格: 所有模式都正确
+        all_correct = int(all(g['correct'] for g in pattern_results))
+        # 宽松: 至少一种模式正确
+        any_correct = int(any(g['correct'] for g in pattern_results))
+
+        # 使用加权平均作为 patient-level 主指标
+        # 如果加权 >= 0.5 认为该患者正确（多数发作被正确定位）
+        pt_correct = int(weighted_correct >= 0.5)
+        corr_pt += pt_correct
+
+        # 不确定性: 所有模式的平均
+        all_unc = []
+        for group in pattern_groups.values():
+            group_psoz = np.concatenate(group['mc_maps'], axis=0)
+            _, unc_g, _ = final_loc(group_psoz, group['onset_map'],
+                                     neighbour_threshold=neighbour_threshold)
+            all_unc.append(unc_g)
+        pt_unc = np.mean([u.max() for u in all_unc]) if all_unc else 0.0
+        pt_uncs.append(pt_unc)
+
+        # 所有模式的 true SOZ 合并（用于显示）
+        all_soz = set()
+        for g in pattern_results:
+            all_soz.update(g['soz_channels'])
+
         pt_details.append({
-            'pt_id':        pt_id,
-            'correct':      correct_pt,
-            'n_seizures':   len(pt_psoz_all),
-            'max_chn':      int(np.argmax(ysoz_pt)),
-            'max_chn_name': DEEPSOZ_19[int(np.argmax(ysoz_pt))],
-            'true_soz':     [DEEPSOZ_19[i] for i in range(19) if true_onset_dsz[i] == 1],
-            'unc_max':      float(unc_pt.max()),
+            'pt_id':             pt_id,
+            'correct_weighted':  pt_correct,
+            'correct_all':       all_correct,
+            'correct_any':       any_correct,
+            'weighted_score':    round(weighted_correct, 3),
+            'n_seizures':        total_sz_in_patient,
+            'n_patterns':        n_patterns,
+            'patterns':          pattern_results,
+            'all_soz':           sorted(all_soz),
+            'unc_max':           float(pt_unc),
         })
 
     acc_pt = corr_pt / total_pt if total_pt > 0 else 0.0
+    # 额外计算 strict / lenient accuracy
+    acc_pt_strict = sum(d['correct_all'] for d in pt_details) / total_pt if total_pt > 0 else 0.0
+    acc_pt_lenient = sum(d['correct_any'] for d in pt_details) / total_pt if total_pt > 0 else 0.0
+
     corr_sz_mean = float(np.mean(all_corr_sz)) if all_corr_sz else 0.0
-    ptunc_mean = float(np.mean([u.max() for u in pt_uncs])) if pt_uncs else 0.0
+    ptunc_mean = float(np.mean(pt_uncs)) if pt_uncs else 0.0
     szunc_mean = float(np.mean([u.max() for u in all_sz_unc])) if all_sz_unc else 0.0
 
     return {
         'patient_level': {
             'corr_pt': corr_pt,
             'total_pt': total_pt,
-            'acc_pt': acc_pt,
+            'acc_pt_weighted': acc_pt,
+            'acc_pt_strict': acc_pt_strict,
+            'acc_pt_lenient': acc_pt_lenient,
             'ptunc_mean': ptunc_mean,
             'per_patient': pt_details,
         },
@@ -945,8 +1032,11 @@ def main():
         sz = official_results['seizure_level']
 
         print(f'\n## Patient-level SOZ Localization (DeepSOZ method)')
-        print(f'  Correct: {pt["corr_pt"]} / {pt["total_pt"]}  '
-              f'Accuracy: {pt["acc_pt"]:.3f}')
+        print(f'  Total patients: {pt["total_pt"]}')
+        print(f'  Accuracy (weighted): {pt["acc_pt_weighted"]:.3f}  '
+              f'({pt["corr_pt"]} / {pt["total_pt"]})')
+        print(f'  Accuracy (strict, all patterns correct): {pt["acc_pt_strict"]:.3f}')
+        print(f'  Accuracy (lenient, any pattern correct): {pt["acc_pt_lenient"]:.3f}')
         print(f'  Uncertainty (mean max-var): {pt["ptunc_mean"]:.4f}')
 
         print(f'\n## Seizure-level SOZ Localization (DeepSOZ method)')
@@ -955,15 +1045,28 @@ def main():
         print(f'  Uncertainty (mean max-var): {sz["szunc_mean"]:.4f}')
 
         print(f'\n## Per-patient Details\n')
-        print(f'| {"Patient":<20} | {"#Sz":>4} | {"Corr":>5} | '
-              f'{"Pred":>10} | {"True SOZ":<30} | {"Unc":>6} |')
-        print(f'|{"-"*22}|{"-"*6}|{"-"*7}|{"-"*12}|{"-"*32}|{"-"*8}|')
+        print(f'| {"Patient":<16} | {"#Sz":>4} | {"#Pat":>4} | '
+              f'{"W":>4} | {"S":>2} | {"L":>2} | '
+              f'{"Score":>5} | {"Unc":>6} | {"SOZ Patterns":<50} |')
+        print(f'|{"-"*18}|{"-"*6}|{"-"*6}|'
+              f'{"-"*6}|{"-"*4}|{"-"*4}|'
+              f'{"-"*7}|{"-"*8}|{"-"*52}|')
         for d in pt['per_patient']:
-            mark = 'Y' if d['correct'] else 'N'
-            true_str = ','.join(d['true_soz'])[:30]
-            print(f'| {d["pt_id"]:<20} | {d["n_seizures"]:>4} | '
-                  f'{mark:>5} | {d["max_chn_name"]:>10} | '
-                  f'{true_str:<30} | {d["unc_max"]:>6.4f} |')
+            w_mark = 'Y' if d['correct_weighted'] else 'N'
+            s_mark = 'Y' if d['correct_all'] else 'N'
+            l_mark = 'Y' if d['correct_any'] else 'N'
+            # 构建各 pattern 的简要描述
+            pat_strs = []
+            for p_detail in d['patterns']:
+                soz_str = ','.join(p_detail['soz_channels'])
+                p_mark = 'Y' if p_detail['correct'] else 'N'
+                pat_strs.append(f"[{p_mark}:{p_detail['max_chn_name']}->{soz_str}]")
+            patterns_display = ' '.join(pat_strs)[:50]
+            print(f'| {d["pt_id"]:<16} | {d["n_seizures"]:>4} | '
+                  f'{d["n_patterns"]:>4} | '
+                  f'{w_mark:>4} | {s_mark:>2} | {l_mark:>2} | '
+                  f'{d["weighted_score"]:>5.2f} | {d["unc_max"]:>6.4f} | '
+                  f'{patterns_display:<50} |')
 
     # ══════════════════════════════════════════════════════════════════════
     # 3. 保存结果
