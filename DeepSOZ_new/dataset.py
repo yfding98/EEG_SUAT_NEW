@@ -29,6 +29,7 @@ source 列区分数据来源：
 """
 
 import hashlib
+import os
 import json
 import logging
 import warnings
@@ -563,11 +564,18 @@ def _preprocess_edf_cached(
         f_low=f_low, f_high=f_high,
     )
 
-    # 写入缓存（原子写入：先写 .tmp 再 rename，多 worker 安全）
+    # 写入缓存（原子写入：先写带唯一后缀的 .tmp 再 rename，多 worker 安全）
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    tmp_path = cache_path.with_suffix('.tmp')
-    np.savez(tmp_path, X=X, Y=Y)
-    tmp_path.replace(cache_path)
+    tmp_path = cache_path.with_suffix(f'.tmp.{os.getpid()}')
+    try:
+        np.savez(tmp_path, X=X, Y=Y)
+        tmp_path.replace(cache_path)
+    except OSError:
+        # 另一个 worker 已完成写入，忽略
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     return X, Y
 
