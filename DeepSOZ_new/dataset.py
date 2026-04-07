@@ -550,11 +550,17 @@ def _preprocess_edf_cached(
         n_channels, use_bipolar, n_windows,
         target_fs, f_low, f_high,
     )
-    cache_path = Path(cache_dir) / f'{key}.npz'
+    cache_path = Path(cache_dir) / f'{key}.npy'
+
+    # 兼容旧 .npz 缓存
+    npz_path = cache_path.with_suffix('.npz')
+    if npz_path.exists():
+        data = np.load(npz_path)
+        return data['X'], data['Y']
 
     if cache_path.exists():
-        data = np.load(cache_path)
-        return data['X'], data['Y']
+        blob = np.load(cache_path, allow_pickle=True).item()
+        return blob['X'], blob['Y']
 
     # 缓存未命中：执行完整预处理
     X, Y = _preprocess_edf(
@@ -568,10 +574,9 @@ def _preprocess_edf_cached(
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_suffix(f'.tmp.{os.getpid()}')
     try:
-        np.savez(tmp_path, X=X, Y=Y)
+        np.save(tmp_path, {'X': X, 'Y': Y})
         tmp_path.replace(cache_path)
     except OSError:
-        # 另一个 worker 已完成写入，忽略
         try:
             tmp_path.unlink(missing_ok=True)
         except OSError:
@@ -725,7 +730,11 @@ def make_kfold_splits(
 def make_dataloader(dataset: Dataset, batch_size: int = 1,
                     shuffle: bool = True,
                     num_workers: int = 0) -> DataLoader:
-    return DataLoader(dataset, batch_size=batch_size,
-                      shuffle=shuffle, num_workers=num_workers,
-                      pin_memory=torch.cuda.is_available(),
-                      drop_last=False)
+    kw = dict(dataset=dataset, batch_size=batch_size,
+              shuffle=shuffle, num_workers=num_workers,
+              pin_memory=torch.cuda.is_available(),
+              drop_last=False)
+    if num_workers > 0:
+        kw['persistent_workers'] = True
+        kw['prefetch_factor'] = 4
+    return DataLoader(**kw)
