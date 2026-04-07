@@ -1657,6 +1657,22 @@ def main():
         cfg_dict = asdict(cfg)
         json.dump(cfg_dict, f, ensure_ascii=False, indent=2)
 
+    # ── Detect region_label_mode from checkpoint ──
+    region_label_mode = 'coarse'
+    try:
+        ckpt_peek = torch.load(cfg.checkpoint, map_location='cpu', weights_only=False)
+        ckpt_cfg = ckpt_peek.get('config', {})
+        if isinstance(ckpt_cfg, dict):
+            n_regions = ckpt_cfg.get('n_regions', 6)
+        else:
+            n_regions = getattr(ckpt_cfg, 'n_regions', 6)
+        if n_regions == 9:
+            region_label_mode = 'fine_lateralized'
+        log.info(f'Checkpoint n_regions={n_regions} → region_label_mode={region_label_mode}')
+        del ckpt_peek
+    except Exception as e:
+        log.warning(f'Could not detect region_label_mode from checkpoint: {e}')
+
     # ── Load private dataset ──
     log.info(f'Loading private dataset: {cfg.manifest}')
     private_manifest_ds = ManifestSOZDataset(
@@ -1665,7 +1681,7 @@ def main():
         private_data_root=cfg.private_data_root,
         source_filter='private',
         label_mode='monopolar',
-        region_label_mode='coarse',
+        region_label_mode=region_label_mode,
     )
     private_ds = SOZBrainNetworkDataset(private_manifest_ds)
     log.info(f'Private dataset: {len(private_ds)} samples')
@@ -1681,7 +1697,7 @@ def main():
                 source_filter='tusz',
                 split_filter=['train'],
                 label_mode='monopolar',
-                region_label_mode='coarse',
+                region_label_mode=region_label_mode,
             )
             tusz_full_ds = SOZBrainNetworkDataset(tusz_manifest_ds)
             n_replay = min(cfg.tusz_replay_size, len(tusz_full_ds))
