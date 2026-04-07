@@ -315,7 +315,8 @@ def compute_ewc_reference(
     for p in model.parameters():
         p.requires_grad = True
 
-    model.eval()
+    # Must use train mode: cuDNN RNN backward requires training mode
+    model.train()
     fisher = {n: torch.zeros_like(p, device=device)
               for n, p in model.named_parameters()}
     count = 0
