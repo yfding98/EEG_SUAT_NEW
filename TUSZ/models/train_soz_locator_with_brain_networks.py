@@ -79,6 +79,15 @@ try:
         stage_collate_fn,
         summarize_stage_dataset,
     )
+    from tasks.stage_seizure_metrics import (
+        compute_deepsoz_stage_metrics,
+        run_detailed_evaluation as run_deepsoz_detailed_evaluation,
+    )
+    from tasks.soz_localization_metrics import (
+        compute_deepsoz_soz_metrics,
+        compute_deepsoz_soz_metrics_mc,
+        run_detailed_soz_evaluation,
+    )
 except ImportError:
     from .integration_model import (
         TimeFilter_LaBraM_BrainNetwork_Integration, IntegrationConfig,
@@ -105,6 +114,15 @@ except ImportError:
         inspect_stage_annotation_support,
         stage_collate_fn,
         summarize_stage_dataset,
+    )
+    from ..tasks.stage_seizure_metrics import (
+        compute_deepsoz_stage_metrics,
+        run_detailed_evaluation as run_deepsoz_detailed_evaluation,
+    )
+    from ..tasks.soz_localization_metrics import (
+        compute_deepsoz_soz_metrics,
+        compute_deepsoz_soz_metrics_mc,
+        run_detailed_soz_evaluation,
     )
 
 try:
@@ -2066,10 +2084,13 @@ def evaluate(
     device,
     generalized_pos_ratio_threshold: float = 0.5,
     generalized_sample_weight: float = 0.05,
+    collect_sample_info: bool = False,
 ):
     model.eval()
     base = model.module if hasattr(model, 'module') else model
     all_probs, all_targets, all_logits = [], [], []
+    all_patient_ids: List[str] = []
+    all_edf_paths: List[str] = []
     all_region_probs, all_region_targets = [], []
     all_hemi_logits, all_hemi_targets = [], []
     all_gate_weights = []
@@ -2085,7 +2106,11 @@ def evaluate(
         hemisphere_label = batch['hemisphere_label'].to(device)
         onset = batch['onset_sec'].to(device)
         start = batch['start_sec'].to(device)
-        
+
+        if collect_sample_info:
+            all_patient_ids.extend(batch.get('patient_id', []))
+            all_edf_paths.extend(batch.get('edf_path', []))
+
         brain_nets = batch.get('brain_nets', None)
         vp_counts = batch.get('valid_patch_counts', None)
         rel_time = batch.get('rel_time', None)
@@ -2184,7 +2209,7 @@ def evaluate(
         f"hemi_acc={hemisphere_acc:.3f}"
     )
 
-    return {
+    result = {
         'top1': recall_at_1,
         'top3': recall_at_3,
         'top5': recall_at_5,
@@ -2205,6 +2230,10 @@ def evaluate(
         'seizure_relative_time': seizure_relative_time,
         **avg_losses,
     }
+    if collect_sample_info:
+        result['patient_ids'] = all_patient_ids
+        result['edf_paths'] = all_edf_paths
+    return result
 
 
 def train_stage_one_epoch(
@@ -2413,6 +2442,7 @@ def evaluate_stage(
     device,
     show_progress: bool = False,
     log_every: int = 20,
+    collect_temporal: bool = False,
 ):
     model.eval()
     base = model.module if hasattr(model, 'module') else model
@@ -2432,6 +2462,14 @@ def evaluate_stage(
     effective_windows = 0
     skipped_windows = 0
     status_counts: Counter = Counter()
+    # DeepSOZ temporal records (per-patch absolute time + probability)
+    if collect_temporal:
+        temporal_records: Dict[str, list] = {
+            'patient_id': [], 'edf_path': [],
+            'seizure_start_sec': [], 'seizure_end_sec': [],
+            'patch_abs_start_sec': [], 'prob_seizure': [], 'label': [],
+        }
+        _patch_dur = float(base.cfg.patch_len) / float(base.cfg.fs)
 
     iterator = loader
     if show_progress:
@@ -2488,6 +2526,35 @@ def evaluate_stage(
             fp += float(((valid_preds == 1) & (valid_targets == 0)).sum().item())
             tn += float(((valid_preds == 0) & (valid_targets == 0)).sum().item())
             fn += float(((valid_preds == 0) & (valid_targets == 1)).sum().item())
+
+        # Collect per-patch temporal information for DeepSOZ-style evaluation
+        if collect_temporal:
+            batch_ws = batch.get('window_start_sec')
+            batch_ss = batch.get('seizure_start_sec')
+            batch_se = batch.get('seizure_end_sec')
+            batch_pids = batch.get('patient_id')
+            batch_edfs = batch.get('edf_path')
+            if batch_ws is not None and batch_pids is not None:
+                ws_np = batch_ws.numpy() if hasattr(batch_ws, 'numpy') else np.array(batch_ws)
+                ss_np = batch_ss.numpy() if hasattr(batch_ss, 'numpy') else np.array(batch_ss)
+                se_np = batch_se.numpy() if hasattr(batch_se, 'numpy') else np.array(batch_se)
+                labels_cpu = stage_labels.cpu()
+                probs_all = torch.softmax(outputs['stage_logits'], dim=-1)[..., 1].cpu()
+                for i in range(labels_cpu.size(0)):
+                    vmask = labels_cpu[i] != base.cfg.stage_ignore_index
+                    idxs = vmask.nonzero(as_tuple=True)[0]
+                    if len(idxs) == 0:
+                        continue
+                    starts = float(ws_np[i]) + idxs.float().numpy() * _patch_dur
+                    n_p = len(idxs)
+                    temporal_records['patch_abs_start_sec'].extend(starts.tolist())
+                    temporal_records['prob_seizure'].extend(probs_all[i, idxs].tolist())
+                    temporal_records['label'].extend(labels_cpu[i, idxs].tolist())
+                    temporal_records['patient_id'].extend([batch_pids[i]] * n_p)
+                    temporal_records['edf_path'].extend([batch_edfs[i]] * n_p)
+                    temporal_records['seizure_start_sec'].extend([float(ss_np[i])] * n_p)
+                    temporal_records['seizure_end_sec'].extend([float(se_np[i])] * n_p)
+
         for name, value in losses.items():
             loss_sums[name] = loss_sums.get(name, 0.0) + float(value.detach().item())
 
@@ -2532,7 +2599,7 @@ def evaluate_stage(
         f"loss_{name}": value / max(n_batches, 1)
         for name, value in loss_sums.items()
     }
-    return {
+    result = {
         'loss': avg_loss,
         'patch_acc': patch_acc,
         'positive_rate': pos_rate,
@@ -2546,6 +2613,9 @@ def evaluate_stage(
         **binary_metrics,
         **avg_losses,
     }
+    if collect_temporal:
+        result['temporal_records'] = temporal_records
+    return result
 
 
 def run_stage_pretraining(
@@ -2777,8 +2847,24 @@ def run_stage_pretraining(
             device,
             show_progress=is_main(rank),
             log_every=args.stage_log_every,
+            collect_temporal=True,
         )
         scheduler.step()
+
+        # Compute DeepSOZ-style metrics on validation set
+        deepsoz_metrics: Dict[str, float] = {}
+        if is_main(rank) and 'temporal_records' in val_metrics:
+            _patch_dur = float(pipeline_cfg.patch_len) / float(pipeline_cfg.target_fs)
+            try:
+                deepsoz_metrics = compute_deepsoz_stage_metrics(
+                    records=val_metrics['temporal_records'],
+                    patch_duration_sec=_patch_dur,
+                    smoother_kernel_size=getattr(args, 'stage_deepsoz_smoother_kernel', 31),
+                    threshold=None,
+                    max_fpr_per_hour=120.0,
+                )
+            except Exception as exc:
+                log.warning("DeepSOZ metrics failed at epoch %d: %s", epoch + 1, exc)
 
         current_metric = stage_metric_value(val_metrics, args.stage_selection_metric)
         best_metric_for_log = stage_metric_display_value(best_metric, args.stage_selection_metric)
@@ -2841,6 +2927,21 @@ def run_stage_pretraining(
                     train_coverage,
                     val_coverage,
                 )
+            if deepsoz_metrics:
+                log.info(
+                    "  [stage deepsoz] seizure_sens=%.3f fpr/hr=%.1f latency=%.1fs "
+                    "auroc=%.3f win_sens=%.3f win_spec=%.3f threshold=%.3f "
+                    "detected=%d/%d",
+                    deepsoz_metrics.get('seizure_sensitivity', 0.0),
+                    deepsoz_metrics.get('fpr_per_hour', 0.0),
+                    deepsoz_metrics.get('mean_latency_sec', 0.0),
+                    deepsoz_metrics.get('window_auroc', 0.0),
+                    deepsoz_metrics.get('window_sensitivity', 0.0),
+                    deepsoz_metrics.get('window_specificity', 0.0),
+                    deepsoz_metrics.get('optimal_threshold', 0.5),
+                    deepsoz_metrics.get('n_seizures_detected', 0),
+                    deepsoz_metrics.get('n_seizures_total', 0),
+                )
             if writer:
                 writer.add_scalar('val/loss', val_metrics['loss'], epoch)
                 writer.add_scalar('val/patch_acc', val_metrics['patch_acc'], epoch)
@@ -2866,6 +2967,10 @@ def run_stage_pretraining(
                     if key in val_metrics:
                         writer.add_scalar(f'val/{key}', val_metrics[key], epoch)
                 writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
+                if deepsoz_metrics:
+                    for dkey, dval in deepsoz_metrics.items():
+                        if isinstance(dval, (int, float)):
+                            writer.add_scalar(f'val_deepsoz/{dkey}', dval, epoch)
 
             if improved:
                 base_model.save_checkpoint(
@@ -2874,7 +2979,10 @@ def run_stage_pretraining(
                         'epoch': epoch,
                         'best_stage_metric': best_metric,
                         'best_stage_metric_name': args.stage_selection_metric,
-                        'stage_metrics': val_metrics,
+                        'stage_metrics': {
+                            k: v for k, v in val_metrics.items() if k != 'temporal_records'
+                        },
+                        'deepsoz_metrics': deepsoz_metrics,
                     },
                 )
                 log.info(
@@ -3078,6 +3186,12 @@ def parse_args():
                    action='store_false',
                    help='Keep the original patch order during stage-1 training')
     p.set_defaults(stage_shuffle_patches=True)
+    p.add_argument('--stage-deepsoz-smoother-kernel', type=int, default=31,
+                   help='Kernel size for DeepSOZ moving average smoother (odd integer, default 31)')
+    p.add_argument('--mc-samples', type=int, default=20,
+                   help='Number of MC dropout forward passes for DeepSOZ SOZ evaluation (default 20)')
+    p.add_argument('--neighbour-threshold', type=int, default=4,
+                   help='Max SOZ channels for neighborhood relaxation in DeepSOZ localization (default 4)')
 
     # Sequence length configurations
     p.add_argument('--pre-onset-sec', type=float, default=5.0, help='Seconds before onset to extract')
@@ -3687,7 +3801,22 @@ def main():
             device,
             generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
             generalized_sample_weight=args.generalized_sample_weight,
+            collect_sample_info=True,
         )
+
+        # Lightweight per-epoch DeepSOZ SOZ localization metrics
+        soz_deepsoz: Dict[str, float] = {}
+        if is_main(rank) and 'patient_ids' in val_metrics:
+            try:
+                soz_deepsoz = compute_deepsoz_soz_metrics(
+                    probs=val_metrics['probs'],
+                    targets=val_metrics['targets'],
+                    patient_ids=val_metrics['patient_ids'],
+                    edf_paths=val_metrics['edf_paths'],
+                    neighbour_threshold=getattr(args, 'neighbour_threshold', 4),
+                )
+            except Exception as exc:
+                log.warning("DeepSOZ SOZ metrics failed at epoch %d: %s", epoch + 1, exc)
 
         if is_main(rank):
             val_summary = {
@@ -3727,6 +3856,21 @@ def main():
                     if key in val_metrics:
                         writer.add_scalar(f'val/{key}', val_metrics[key], epoch)
                 writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
+                if soz_deepsoz:
+                    for dkey, dval in soz_deepsoz.items():
+                        if isinstance(dval, (int, float)):
+                            writer.add_scalar(f'val_deepsoz_soz/{dkey}', dval, epoch)
+            if soz_deepsoz:
+                log.info(
+                    "  [soz deepsoz] corr_sz=%.3f acc_pt_w=%.3f acc_pt_s=%.3f "
+                    "acc_pt_l=%.3f seizures=%d patients=%d",
+                    soz_deepsoz.get('corr_sz', 0.0),
+                    soz_deepsoz.get('acc_pt_weighted', 0.0),
+                    soz_deepsoz.get('acc_pt_strict', 0.0),
+                    soz_deepsoz.get('acc_pt_lenient', 0.0),
+                    soz_deepsoz.get('n_seizures', 0),
+                    soz_deepsoz.get('n_patients', 0),
+                )
 
             # save best
             val_selection_key = build_selection_key(val_metrics, args.task_training_mode)
@@ -3741,6 +3885,7 @@ def main():
                         'best_recall_at_3': best_top3,
                         'best_selection_key': list(best_selection_key),
                         'val_metrics': val_summary,
+                        'deepsoz_soz_metrics': soz_deepsoz,
                     },
                 )
                 log.info(
@@ -3783,7 +3928,41 @@ def main():
         device,
         generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
         generalized_sample_weight=args.generalized_sample_weight,
+        collect_sample_info=True,
     )
+
+    # Full MC dropout DeepSOZ SOZ evaluation on test set
+    mc_soz_results: Dict[str, object] = {}
+    if is_main(rank):
+        _mc_samples = getattr(args, 'mc_samples', 20)
+        _neighbour_th = getattr(args, 'neighbour_threshold', 4)
+        log.info(
+            "Running MC dropout SOZ evaluation (mc_samples=%d, neighbour_threshold=%d) ...",
+            _mc_samples, _neighbour_th,
+        )
+        try:
+            mc_soz_results = run_detailed_soz_evaluation(
+                model, test_loader, device,
+                mc_samples=_mc_samples,
+                neighbour_threshold=_neighbour_th,
+                output_dir=str(output_dir),
+            )
+            mc_m = mc_soz_results.get('metrics', {})
+            log.info(
+                "  [MC soz deepsoz] corr_sz=%.3f szunc=%.4f "
+                "acc_pt_w=%.3f acc_pt_s=%.3f acc_pt_l=%.3f ptunc=%.4f "
+                "seizures=%d patients=%d",
+                mc_m.get('corr_sz', 0.0),
+                mc_m.get('szunc_mean', 0.0),
+                mc_m.get('acc_pt_weighted', 0.0),
+                mc_m.get('acc_pt_strict', 0.0),
+                mc_m.get('acc_pt_lenient', 0.0),
+                mc_m.get('ptunc_mean', 0.0),
+                mc_m.get('n_seizures', 0),
+                mc_m.get('n_patients', 0),
+            )
+        except Exception as exc:
+            log.warning("MC dropout SOZ evaluation failed: %s", exc)
 
     if is_main(rank):
         log.info(
@@ -3829,6 +4008,24 @@ def main():
             f"| Hemisphere acc | {test_metrics['hemisphere_acc']:.4f} |\n\n"
             f"## Best validation key: {format_selection_key_text(best_selection_key, args.task_training_mode)}\n"
         )
+        # Append MC dropout DeepSOZ results if available
+        if mc_soz_results and 'metrics' in mc_soz_results:
+            mc_m = mc_soz_results['metrics']
+            report += (
+                f"\n## DeepSOZ SOZ Localization (MC dropout, N={getattr(args, 'mc_samples', 20)})\n\n"
+                f"### Seizure-level\n\n"
+                f"| Metric | Value |\n|--------|-------|\n"
+                f"| corr_sz (accuracy) | {mc_m.get('corr_sz', 0.0):.4f} |\n"
+                f"| szunc (mean max uncertainty) | {mc_m.get('szunc_mean', 0.0):.4f} |\n"
+                f"| n_seizures | {mc_m.get('n_seizures', 0)} |\n\n"
+                f"### Patient-level\n\n"
+                f"| Metric | Value |\n|--------|-------|\n"
+                f"| acc_pt (weighted) | {mc_m.get('acc_pt_weighted', 0.0):.4f} |\n"
+                f"| acc_pt (strict) | {mc_m.get('acc_pt_strict', 0.0):.4f} |\n"
+                f"| acc_pt (lenient) | {mc_m.get('acc_pt_lenient', 0.0):.4f} |\n"
+                f"| ptunc (mean max uncertainty) | {mc_m.get('ptunc_mean', 0.0):.4f} |\n"
+                f"| n_patients | {mc_m.get('n_patients', 0)} |\n\n"
+            )
         (output_dir / 'report.md').write_text(report, encoding='utf-8')
         log.info(f"Report saved to {output_dir / 'report.md'}")
 
