@@ -2280,6 +2280,11 @@ def train_stage_one_epoch(
             outputs = model(x)
             loss, losses = base.compute_stage_loss(outputs, stage_labels)
 
+        if torch.isnan(loss):
+            log.warning("NaN loss at stage epoch %d step %d, skipping", epoch + 1, step)
+            optimizer.zero_grad()
+            continue
+
         optimizer.zero_grad()
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -3106,6 +3111,14 @@ def parse_args():
                    help='Positive-class balancing factor for the SOZ focal loss')
     p.add_argument('--focal-gamma', type=float, default=2.0,
                    help='Focusing parameter for the SOZ focal loss')
+    p.add_argument('--w-map-pos', type=float, default=0.3,
+                   help='Loss weight for MapLossL2PosSum (DeepSOZ-style)')
+    p.add_argument('--w-map-neg', type=float, default=0.15,
+                   help='Loss weight for MapLossL2Neg (DeepSOZ-style)')
+    p.add_argument('--w-map-margin', type=float, default=0.15,
+                   help='Loss weight for MapLossMargin (DeepSOZ-style)')
+    p.add_argument('--map-margin', type=float, default=0.5,
+                   help='Margin value for MapLossMargin')
     p.add_argument('--generalized-pos-ratio-threshold', type=float, default=0.5,
                    help='Samples with positive-channel ratio above this threshold are down-weighted')
     p.add_argument('--generalized-sample-weight', type=float, default=0.05,
@@ -3467,6 +3480,10 @@ def main():
         w_pattern=args.w_pattern,
         w_region=args.w_region,
         w_hemisphere=args.w_hemisphere,
+        w_map_pos=args.w_map_pos,
+        w_map_neg=args.w_map_neg,
+        w_map_margin=args.w_map_margin,
+        map_margin=args.map_margin,
         task_training_mode=args.task_training_mode,
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
@@ -3476,6 +3493,7 @@ def main():
     log.info(
         "  Loss setup: mode=%s w_transition=%.3f w_pattern=%.3f w_region=%.3f "
         "w_hemisphere=%.3f focal_alpha=%.3f focal_gamma=%.3f "
+        "w_map_pos=%.3f w_map_neg=%.3f w_map_margin=%.3f map_margin=%.3f "
         "generalized_pos_ratio_threshold=%.3f generalized_sample_weight=%.3f",
         args.task_training_mode,
         args.w_transition,
@@ -3484,6 +3502,10 @@ def main():
         args.w_hemisphere,
         args.focal_alpha,
         args.focal_gamma,
+        args.w_map_pos,
+        args.w_map_neg,
+        args.w_map_margin,
+        args.map_margin,
         args.generalized_pos_ratio_threshold,
         args.generalized_sample_weight,
     )

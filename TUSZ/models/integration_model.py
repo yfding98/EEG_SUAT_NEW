@@ -132,6 +132,16 @@ class IntegrationConfig:
     focal_gamma: float = 2.0
     focal_alpha: float = 0.75
 
+    # DeepSOZ-style Map loss weights
+    # NOTE: Kept lower than original DeepSOZ defaults (1.0/0.5/0.5) because
+    # soz_logits already receive gradients from FocalLoss + region/hemisphere
+    # aggregation losses — 6 gradient paths total. High map weights would
+    # cause the map losses to dominate the combined gradient.
+    w_map_pos: float = 0.3             # MapLossL2PosSum weight
+    w_map_neg: float = 0.15            # MapLossL2Neg weight
+    w_map_margin: float = 0.15         # MapLossMargin weight
+    map_margin: float = 0.5            # margin value for MapLossMargin
+
     # training strategy
     use_checkpoint: bool = False
 
@@ -187,6 +197,56 @@ class FocalLoss(nn.Module):
         if sample_weight is not None:
             focal = focal * sample_weight.unsqueeze(1)
             
+        return focal.mean()
+
+
+class FocalCrossEntropyLoss(nn.Module):
+    """Multi-class Focal Loss for CrossEntropy tasks (e.g. stage detection).
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Uses standard softmax + NLL formulation (not BCE), suitable for mutually
+    exclusive classes like seizure/non-seizure.
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        weight: Optional[torch.Tensor] = None,
+        ignore_index: int = -100,
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        if weight is not None:
+            self.register_buffer('weight', weight)
+        else:
+            self.weight = None
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        logits  : [*, C]  raw class scores
+        targets : [*]     class indices (may contain ignore_index)
+        """
+        logits_flat = logits.reshape(-1, logits.size(-1))
+        targets_flat = targets.reshape(-1)
+
+        valid = targets_flat != self.ignore_index
+        if not valid.any():
+            return logits_flat.new_zeros(())
+
+        logits_v = logits_flat[valid]
+        targets_v = targets_flat[valid]
+
+        # standard CE (no reduction) — numerically stable via log_softmax
+        ce = F.cross_entropy(
+            logits_v, targets_v, reduction='none',
+            weight=self.weight,
+        )
+        # p_t = probability of the correct class
+        log_pt = -ce                            # log(p_t) = -CE(logit, target)
+        pt = log_pt.exp()
+        focal = ((1.0 - pt) ** self.gamma) * ce
         return focal.mean()
 
 
@@ -355,6 +415,157 @@ class PatchStageHead(nn.Module):
 
 
 # =====================================================================
+# DeepSOZ-style aggregation: channel logits → region / hemisphere
+# =====================================================================
+
+class ChannelToRegionAggregation(nn.Module):
+    """Aggregate channel logits [B, 19] → region logits [B, 6] via max pooling.
+
+    Uses STANDARD_19 channel ordering.
+    Regions: FP, F, C, T, P, O
+    """
+
+    REGION_NAMES: Tuple[str, ...] = ('FP', 'F', 'C', 'T', 'P', 'O')
+    # STANDARD_19: FP1(0) FP2(1) F3(2) F4(3) C3(4) C4(5) P3(6) P4(7)
+    #              O1(8) O2(9) F7(10) F8(11) T3(12) T4(13) T5(14) T6(15)
+    #              FZ(16) CZ(17) PZ(18)
+    REGION_CHANNEL_IDX: Dict[str, Tuple[int, ...]] = {
+        'FP': (0, 1),
+        'F':  (2, 3, 10, 11, 16),
+        'C':  (4, 5, 17),
+        'T':  (12, 13, 14, 15),
+        'P':  (6, 7, 18),
+        'O':  (8, 9),
+    }
+
+    def __init__(self):
+        super().__init__()
+        # Pre-build index lists as buffers for fast GPU gather
+        for region in self.REGION_NAMES:
+            self.register_buffer(
+                f'idx_{region}',
+                torch.tensor(self.REGION_CHANNEL_IDX[region], dtype=torch.long),
+                persistent=False,
+            )
+
+    def forward(self, channel_logits: torch.Tensor) -> torch.Tensor:
+        """channel_logits: [B, 19] → region_logits: [B, 6]"""
+        parts = []
+        for region in self.REGION_NAMES:
+            idx = getattr(self, f'idx_{region}')
+            parts.append(channel_logits[:, idx].max(dim=1).values)
+        return torch.stack(parts, dim=1)
+
+
+class ChannelToHemiAggregation(nn.Module):
+    """Aggregate channel logits [B, 19] → hemisphere logits [B, 3].
+
+    Classes: L(0), R(1), B(2).
+    Directly max-pools raw logits per hemisphere group. Output is raw logits
+    suitable for CrossEntropyLoss (which internally applies log_softmax).
+
+    NOTE: Do NOT apply sigmoid before max-pool here — CrossEntropyLoss
+    expects unbounded logits. Sigmoid would compress values to [0,1] and
+    then log_softmax would have almost no discriminative power.
+    """
+
+    # STANDARD_19 ordering
+    LEFT_IDX:  Tuple[int, ...] = (0, 2, 4, 6, 8, 10, 12, 14)   # FP1,F3,C3,P3,O1,F7,T3,T5
+    RIGHT_IDX: Tuple[int, ...] = (1, 3, 5, 7, 9, 11, 13, 15)   # FP2,F4,C4,P4,O2,F8,T4,T6
+    MID_IDX:   Tuple[int, ...] = (16, 17, 18)                    # FZ,CZ,PZ
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('left_idx', torch.tensor(self.LEFT_IDX, dtype=torch.long), persistent=False)
+        self.register_buffer('right_idx', torch.tensor(self.RIGHT_IDX, dtype=torch.long), persistent=False)
+        self.register_buffer('mid_idx', torch.tensor(self.MID_IDX, dtype=torch.long), persistent=False)
+
+    def forward(self, channel_logits: torch.Tensor) -> torch.Tensor:
+        """channel_logits: [B, 19] → hemisphere_logits: [B, 3]"""
+        left_max  = channel_logits[:, self.left_idx].max(dim=1).values   # [B]
+        right_max = channel_logits[:, self.right_idx].max(dim=1).values  # [B]
+        bilateral = (left_max + right_max) * 0.5                          # [B]
+        return torch.stack([left_max, right_max, bilateral], dim=1)
+
+
+# =====================================================================
+# DeepSOZ-style Map losses
+# =====================================================================
+
+class MapLossL2PosSum(nn.Module):
+    """Push SOZ channel predictions toward 1.0.
+
+    Loss = mean_over_batch( sum((target - pred*target)^2) / n_positive )
+    """
+
+    def __init__(self, normalize: bool = True, scale: bool = True):
+        super().__init__()
+        self.normalize = normalize
+        self.scale = scale
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.normalize:
+            # Detach maxes to prevent gradient flow through the normalization factor;
+            # clamp to avoid division by very small values (numerical stability).
+            maxes = pred.max(dim=1, keepdim=True).values.detach().clamp(min=0.1)
+            pred = pred / maxes
+        pos_loc_sum = ((target - pred * target) ** 2).sum(dim=1)
+        if self.scale:
+            factor = target.sum(dim=1).clamp(min=1e-6)
+            pos_loc_sum = pos_loc_sum / factor
+        return pos_loc_sum.mean()
+
+
+class MapLossL2Neg(nn.Module):
+    """Push non-SOZ channel predictions toward 0.0.
+
+    Loss = mean_over_batch( sum((pred*(1-target))^2) / n_negative )
+    """
+
+    def __init__(self, normalize: bool = True, scale: bool = True):
+        super().__init__()
+        self.normalize = normalize
+        self.scale = scale
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.normalize:
+            maxes = pred.max(dim=1, keepdim=True).values.detach().clamp(min=0.1)
+            pred = pred / maxes
+        neg_loc_sum = ((pred * (1.0 - target)) ** 2).sum(dim=1)
+        if self.scale:
+            factor = (1.0 - target).sum(dim=1).clamp(min=1e-6)
+            neg_loc_sum = neg_loc_sum / factor
+        return neg_loc_sum.mean()
+
+
+class MapLossMargin(nn.Module):
+    """Enforce separation: max SOZ prediction > max non-SOZ prediction + margin.
+
+    Loss = mean_over_batch( ReLU(margin + max_neg - max_pos) )
+    """
+
+    def __init__(self, normalize: bool = True, margin: float = 0.5):
+        super().__init__()
+        self.normalize = normalize
+        self.margin = margin
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.normalize:
+            maxes = pred.max(dim=1, keepdim=True).values.detach().clamp(min=0.1)
+            pred = pred / maxes
+        pos_mask = target > 0.5
+        neg_mask = ~pos_mask
+        has_pos = pos_mask.any(dim=1)
+        has_neg = neg_mask.any(dim=1)
+        valid = has_pos & has_neg
+        if not valid.any():
+            return pred.new_zeros(())
+        pos_max = (pred * target)[valid].max(dim=1).values
+        neg_max = (pred * (1.0 - target))[valid].max(dim=1).values
+        return F.relu(self.margin + neg_max - pos_max).mean()
+
+
+# =====================================================================
 # Main Integration Model
 # =====================================================================
 
@@ -455,14 +666,9 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             embed_dim=c.embed_dim, n_channels=c.n_channels,
             n_patches=max_patches, output_mode=c.output_mode,
         )
-        self.region_head = GlobalPoolHead(
-            embed_dim=c.embed_dim,
-            out_dim=c.n_regions,
-        )
-        self.hemisphere_head = GlobalPoolHead(
-            embed_dim=c.embed_dim,
-            out_dim=c.n_hemisphere_classes,
-        )
+        # DeepSOZ-style aggregation: channel logits → region / hemisphere
+        self.region_agg = ChannelToRegionAggregation()
+        self.hemi_agg = ChannelToHemiAggregation()
         self.stage_head = PatchStageHead(
             embed_dim=c.embed_dim,
             n_channels=c.n_channels,
@@ -471,6 +677,9 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
 
         # ── Loss functions ──
         self.focal_loss = FocalLoss(gamma=c.focal_gamma, alpha=c.focal_alpha)
+        self.map_loss_pos = MapLossL2PosSum(normalize=True, scale=True)
+        self.map_loss_neg = MapLossL2Neg(normalize=True, scale=True)
+        self.map_loss_margin = MapLossMargin(normalize=True, margin=c.map_margin)
         self.region_bce = nn.BCEWithLogitsLoss(reduction='mean')
         self.hemisphere_ce = nn.CrossEntropyLoss(
             reduction='mean',
@@ -478,8 +687,8 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         )
         self.transition_bce = nn.BCEWithLogitsLoss(reduction='mean')
         self.pattern_ce = nn.CrossEntropyLoss(reduction='mean')
-        self.stage_ce = nn.CrossEntropyLoss(
-            reduction='mean',
+        self.stage_ce = FocalCrossEntropyLoss(
+            gamma=c.focal_gamma,
             ignore_index=c.stage_ignore_index,
         )
         self._last: Optional[Dict] = None
@@ -502,10 +711,10 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         )
 
     def set_stage_class_weight(self, class_weight: torch.Tensor):
-        """Set class weights for stage-pretraining CrossEntropy loss."""
-        self.stage_ce = nn.CrossEntropyLoss(
+        """Set class weights for stage-pretraining FocalCrossEntropy loss."""
+        self.stage_ce = FocalCrossEntropyLoss(
+            gamma=self.cfg.focal_gamma,
             weight=class_weight,
-            reduction='mean',
             ignore_index=self.cfg.stage_ignore_index,
         )
 
@@ -658,8 +867,9 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         # ── Step 4: SOZ localization ──
         soz_logits, bipolar_logits = self.soz_head(fused)     # [B, 19], [B, 22]
         soz_probs = torch.sigmoid(soz_logits)
-        region_logits = self.region_head(fused)               # [B, 6]
-        hemisphere_logits = self.hemisphere_head(fused)       # [B, 3]
+        # DeepSOZ-style aggregation from channel logits
+        region_logits = self.region_agg(soz_logits)           # [B, 6]
+        hemisphere_logits = self.hemi_agg(soz_logits)         # [B, 3]
 
         # MoE辅助损失合并
         moe_loss = moe_loss_a + moe_loss_b
@@ -720,6 +930,9 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         zero = outputs['soz_logits'].new_zeros(())
         losses = {
             'soz': zero,
+            'map_pos': zero,
+            'map_neg': zero,
+            'map_margin': zero,
             'region': zero,
             'hemisphere': zero,
             'transition': zero,
@@ -733,6 +946,15 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
                 outputs['soz_logits'], soz_targets, sample_weight=sample_weight
             )
             total = total + losses['soz']
+
+            # DeepSOZ-style Map losses on channel probabilities
+            soz_probs = torch.sigmoid(outputs['soz_logits'])
+            losses['map_pos'] = self.map_loss_pos(soz_probs, soz_targets)
+            losses['map_neg'] = self.map_loss_neg(soz_probs, soz_targets)
+            losses['map_margin'] = self.map_loss_margin(soz_probs, soz_targets)
+            total = total + c.w_map_pos * losses['map_pos']
+            total = total + c.w_map_neg * losses['map_neg']
+            total = total + c.w_map_margin * losses['map_margin']
 
         if mode in {'multitask', 'region_only'} and region_targets is not None:
             region_loss = F.binary_cross_entropy_with_logits(
