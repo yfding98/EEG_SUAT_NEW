@@ -105,9 +105,10 @@ def parse_args():
     g.add_argument('--target-fs',   type=float, default=200.0)
     g.add_argument('--f-low',       type=float, default=1.6)
     g.add_argument('--f-high',      type=float, default=30.0)
-    g.add_argument('--cache-dir',   default=None,
+    g.add_argument('--cache-dir',   default='./cache/deepsoz_edf',
                    help='EDF 预处理缓存目录。启用后将预处理结果缓存为 .npz，'
-                        '后续 epoch 直接加载，大幅加速训练')
+                        '后续 epoch 直接加载，大幅加速训练。'
+                        '设为 None 可禁用缓存')
 
     # 训练阶段
     g = p.add_argument_group('训练阶段')
@@ -158,7 +159,7 @@ def parse_args():
     g = p.add_argument_group('通用训练')
     g.add_argument('--grad-clip',    type=float, default=1.0)
     g.add_argument('--no-amp',       action='store_true')
-    g.add_argument('--num-workers',  type=int,   default=0)
+    g.add_argument('--num-workers',  type=int,   default=4)
     g.add_argument('--device',       default='cuda')
 
     # 交叉验证
@@ -381,7 +382,7 @@ def train_fold(fold: int, train_ids: List, val_ids: List, args) -> dict:
             # 最终评估
             try:
                 s2_trainer.load_best()
-                val_metrics = s2_trainer.evaluate(s2_va)
+                val_metrics = s2_trainer.evaluate(s2_va, mc_samples=20)
                 logger.info(f'Fold {fold} Stage-2 最优验证指标:')
                 for k, v in val_metrics.items():
                     if not isinstance(v, dict):
@@ -410,6 +411,10 @@ def train_fold(fold: int, train_ids: List, val_ids: List, args) -> dict:
 def main():
     args = parse_args()
     set_seed(args.seed)
+
+    # 支持命令行 --cache-dir None 禁用缓存
+    if args.cache_dir and args.cache_dir.lower() == 'none':
+        args.cache_dir = None
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -451,10 +456,19 @@ def main():
                for r in all_results]
         aucs = [r.get('val_metrics', {}).get('auc_macro', 0.0)
                 for r in all_results]
+        corr_szs = [r.get('val_metrics', {}).get('mc_corr_sz', 0.0)
+                    for r in all_results]
+        acc_pts = [r.get('val_metrics', {}).get('mc_acc_pt', 0.0)
+                   for r in all_results]
         import numpy as np
         logger.info(f'各折 F1_macro : {[f"{v:.4f}" for v in f1s]}')
         logger.info(f'均值±std     : {np.mean(f1s):.4f}±{np.std(f1s):.4f}')
         logger.info(f'AUC_macro 均值: {np.mean(aucs):.4f}')
+        if any(v > 0 for v in corr_szs):
+            logger.info(f'MC corr_sz 均值: '
+                        f'{np.mean(corr_szs):.3f}±{np.std(corr_szs):.3f}')
+            logger.info(f'MC acc_pt  均值: '
+                        f'{np.mean(acc_pts):.3f}±{np.std(acc_pts):.3f}')
 
         summary = {
             'stage':     args.stage,
@@ -463,6 +477,8 @@ def main():
             'f1_mean':   float(np.mean(f1s)),
             'f1_std':    float(np.std(f1s)),
             'auc_mean':  float(np.mean(aucs)),
+            'mc_corr_sz_mean': float(np.mean(corr_szs)),
+            'mc_acc_pt_mean':  float(np.mean(acc_pts)),
         }
         with open(out_dir / 'summary.json', 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False, default=str)

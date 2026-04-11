@@ -232,11 +232,31 @@ class Stage1Dataset(Dataset):
         if self.normalize:
             X = (X - X.mean()) / (X.std() + 1e-8)
 
+        # 解析时间元数据（离线 manifest 中 sz_starts/sz_ends 为逗号分隔字符串）
+        sz_start_val = float('nan')
+        sz_end_val = float('nan')
+        seg_begin_val = float('nan')
+        try:
+            sz_starts_str = mn.get('sz_starts', mn.get('sz_start', ''))
+            sz_ends_str = mn.get('sz_ends', mn.get('sz_end', ''))
+            if sz_starts_str and str(sz_starts_str) != 'nan':
+                first_start = float(str(sz_starts_str).split(',')[0].strip())
+                first_end = float(str(sz_ends_str).split(',')[0].strip())
+                sz_start_val = first_start
+                sz_end_val = first_end
+                seg_begin_val = max(0.0, first_start - 15.0)
+        except (ValueError, TypeError, IndexError):
+            pass
+
         return {
             'fn':         mn.get('fn', ''),
+            'pt_id':      mn.get('pt_id', ''),
             'buffers':    torch.tensor(X, dtype=torch.float32),
             'sz_labels':  torch.tensor(Y, dtype=torch.float32),
             'onset_map':  torch.tensor(soz, dtype=torch.float32),
+            'sz_start':   torch.tensor(sz_start_val, dtype=torch.float32),
+            'sz_end':     torch.tensor(sz_end_val, dtype=torch.float32),
+            'seg_begin':  torch.tensor(seg_begin_val, dtype=torch.float32),
         }
 
 
@@ -284,6 +304,7 @@ class Stage2Dataset(Dataset):
 
         return {
             'fn':         mn.get('fn', ''),
+            'pt_id':      mn.get('pt_id', ''),
             'buffers':    torch.tensor(X, dtype=torch.float32),
             'sz_labels':  torch.tensor(Y, dtype=torch.float32),
             'onset_map':  torch.tensor(soz, dtype=torch.float32),
@@ -461,7 +482,7 @@ def _preprocess_edf(
     if abs(fs - target_fs) > 0.5:
         n_new = int(out.shape[1] * target_fs / fs)
         from scipy.signal import resample as rs
-        out = np.stack([rs(out[i], n_new) for i in range(C)])
+        out = rs(out, n_new, axis=1)
         fs  = target_fs
 
     # ── 提取时间段：preictal + ictal ──────────────────────────────────
@@ -650,6 +671,9 @@ class OnlineStage1Dataset(Dataset):
             X = np.zeros((1, self.n_windows, self.n_channels, ws), np.float32)
             Y = np.zeros((1, self.n_windows), np.float32)
 
+        # 计算时间段起始点（与 _preprocess_edf 逻辑一致）
+        seg_begin = max(0.0, s['sz_start'] - 15.0)
+
         return {
             'fn':         s['fn'],
             'pt_id':      s['pt_id'],
@@ -657,6 +681,10 @@ class OnlineStage1Dataset(Dataset):
             'buffers':    torch.from_numpy(X),
             'sz_labels':  torch.from_numpy(Y),
             'onset_map':  torch.from_numpy(s['onset_map']),
+            # 时间元数据，用于 DeepSOZ 癫痫检测指标计算
+            'sz_start':   torch.tensor(s['sz_start'], dtype=torch.float32),
+            'sz_end':     torch.tensor(s['sz_end'], dtype=torch.float32),
+            'seg_begin':  torch.tensor(seg_begin, dtype=torch.float32),
         }
 
 

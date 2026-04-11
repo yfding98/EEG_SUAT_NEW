@@ -124,6 +124,66 @@ def compute_soz_metrics(
     return metrics
 
 
+def _compute_deepsoz_soz_lightweight(
+    probs: np.ndarray,
+    targets: np.ndarray,
+    patient_ids: list,
+    edf_paths: list,
+    neighbour_threshold: int = 4,
+) -> dict:
+    """
+    DeepSOZ 论文 SOZ 定位指标（轻量级，单次前向传播，无 MC dropout）。
+
+    数据已在 DeepSOZ 通道顺序下，直接调用 evaluate.py 的 final_loc。
+
+    返回:
+      deepsoz_corr_sz  : 发作级定位正确率
+      deepsoz_acc_pt   : 患者级定位正确率
+      deepsoz_n_seizures, deepsoz_n_patients
+    """
+    from evaluate import final_loc
+    from collections import defaultdict
+
+    n = probs.shape[0]
+    seizure_correct = []
+    patient_seizures: dict = defaultdict(list)
+
+    for i in range(n):
+        true_onset = targets[i]
+        if true_onset.sum() == 0:
+            continue
+        psoz_single = probs[i:i + 1, :]  # [1, 19]
+        _, _, correct = final_loc(psoz_single, true_onset, neighbour_threshold)
+        seizure_correct.append(correct)
+
+        pid = patient_ids[i]
+        patient_seizures[pid].append({
+            'onset_map': true_onset.copy(),
+            'probs': probs[i],
+        })
+
+    corr_sz = float(np.mean(seizure_correct)) if seizure_correct else 0.0
+
+    # 患者级：聚合同一患者所有发作 → final_loc
+    n_patients = len(patient_seizures)
+    pt_correct = 0
+    for pid, seizures in patient_seizures.items():
+        pt_psoz = np.stack([s['probs'] for s in seizures], axis=0)
+        # 按最常见 onset 模式取 true_onset（同一患者通常相同）
+        true_onset = seizures[0]['onset_map']
+        _, _, correct_pt = final_loc(pt_psoz, true_onset, neighbour_threshold)
+        pt_correct += correct_pt
+
+    acc_pt = pt_correct / max(n_patients, 1)
+
+    return {
+        'deepsoz_corr_sz': corr_sz,
+        'deepsoz_acc_pt': acc_pt,
+        'deepsoz_n_seizures': len(seizure_correct),
+        'deepsoz_n_patients': n_patients,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage-1 Trainer（发作检测预训练）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,6 +254,15 @@ class Stage1Trainer:
         self.model.train() if train else self.model.eval()
         total_loss = 0.0
         all_pred, all_true = [], []
+        # 验证时收集时间元数据，用于 DeepSOZ 检测指标
+        temporal_records: Optional[Dict[str, list]] = None
+        has_temporal = False
+        if not train:
+            temporal_records = {
+                'patient_id': [], 'edf_path': [],
+                'seizure_start_sec': [], 'seizure_end_sec': [],
+                'patch_abs_start_sec': [], 'prob_seizure': [], 'label': [],
+            }
 
         ctx = torch.enable_grad() if train else torch.no_grad()
         with ctx:
@@ -228,10 +297,79 @@ class Stage1Trainer:
                 all_true.append(true)
                 pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
+                # 验证时收集时间记录（需要 batch 中有 sz_start 字段）
+                if temporal_records is not None and 'sz_start' in batch:
+                    has_temporal = True
+                    import torch.nn.functional as TF
+                    probs_sz = TF.softmax(logits.detach(), dim=3)[..., 1]  # [B,Nsz,T]
+
+                    for b in range(B):
+                        seg_begin_val = batch['seg_begin'][b].item()
+                        sz_start_val = batch['sz_start'][b].item()
+                        sz_end_val = batch['sz_end'][b].item()
+
+                        # 跳过无效时间戳（NaN 哨兵）
+                        if np.isnan(seg_begin_val):
+                            continue
+
+                        pt_id_val = batch.get('pt_id', batch.get('fn', ['']))
+                        fn_val = batch.get('fn', [''])
+                        if isinstance(pt_id_val, (tuple, list)):
+                            pt_id_val = pt_id_val[b] if b < len(pt_id_val) else ''
+                        if isinstance(fn_val, (tuple, list)):
+                            fn_val = fn_val[b] if b < len(fn_val) else ''
+
+                        for nsz in range(Nsz):
+                            for t in range(T):
+                                patch_start = seg_begin_val + t
+                                temporal_records['patient_id'].append(str(pt_id_val))
+                                temporal_records['edf_path'].append(str(fn_val))
+                                temporal_records['seizure_start_sec'].append(sz_start_val)
+                                temporal_records['seizure_end_sec'].append(sz_end_val)
+                                temporal_records['patch_abs_start_sec'].append(patch_start)
+                                temporal_records['prob_seizure'].append(
+                                    probs_sz[b, nsz, t].item())
+                                temporal_records['label'].append(
+                                    int(Y[b, nsz, t].item()))
+
         all_pred = np.concatenate(all_pred)
         all_true = np.concatenate(all_true)
         metrics = compute_detection_metrics(all_true, all_pred)
         metrics['loss'] = total_loss / max(len(loader), 1)
+
+        # DeepSOZ 论文癫痫检测指标
+        if (temporal_records is not None
+                and has_temporal
+                and len(temporal_records.get('patient_id', [])) > 0):
+            try:
+                import sys as _sys
+                _tasks_dir = str(Path(__file__).resolve().parent.parent
+                                 / 'TUSZ' / 'tasks')
+                if _tasks_dir not in _sys.path:
+                    _sys.path.insert(0, _tasks_dir)
+                from stage_seizure_metrics import (
+                    compute_window_level_metrics,
+                    compute_deepsoz_stage_metrics,
+                )
+                # Window-level: AU-ROC, Sensitivity, Specificity
+                window_m = compute_window_level_metrics(
+                    np.array(temporal_records['prob_seizure']),
+                    np.array(temporal_records['label']),
+                )
+                metrics.update(window_m)
+
+                # Seizure-level: FPR/hr, Sensitivity, Latency
+                stage_m = compute_deepsoz_stage_metrics(
+                    records=temporal_records,
+                    patch_duration_sec=1.0,
+                    smoother_kernel_size=31,
+                )
+                # 加前缀避免键冲突
+                for k, v in stage_m.items():
+                    metrics[f'deepsoz_{k}'] = v
+            except ImportError as e:
+                logger.debug(f'DeepSOZ 检测指标模块不可用: {e}')
+
         return metrics
 
     # ── 训练主循环 ─────────────────────────────────────────────────────────
@@ -277,6 +415,8 @@ class Stage1Trainer:
                 f'[S1] E{epoch:03d}  '
                 f'tr_loss={tr["loss"]:.4f}  tr_f1={tr["f1"]:.4f}  '
                 f'va_loss={va["loss"]:.4f}  va_f1={va["f1"]:.4f}  '
+                f'auroc={va.get("window_auroc", 0.):.4f}  '
+                f'sz_sens={va.get("deepsoz_seizure_sensitivity", 0.):.3f}  '
                 f'{"★" if improved else f"no_imp={no_improve}"}'
             )
 
@@ -425,12 +565,13 @@ class Stage2Trainer:
         返回 (loss_metrics, soz_metrics)
 
         loss_metrics : dict with 'loss' and loss components
-        soz_metrics  : dict with f1_macro, auc_macro, etc.
+        soz_metrics  : dict with f1_macro, auc_macro, deepsoz_corr_sz, etc.
         """
         self.model.train() if train else self.model.eval()
         total_loss = 0.0
         loss_components: Dict[str, float] = {}
         all_attn_probs, all_soz_labels = [], []
+        all_pt_ids, all_fns = [], []
 
         ctx = torch.enable_grad() if train else torch.no_grad()
         with ctx:
@@ -451,7 +592,7 @@ class Stage2Trainer:
 
                     # sz_labels 按发作取平均（多次发作的标签合并）
                     # 官方以 Nsz=1 批次处理；这里做均值近似
-                    sz_labels_2d = Y[:, 0, :]   # [B, T] 取第��次发作
+                    sz_labels_2d = Y[:, 0, :]   # [B, T] 取第一次发作
 
                     loss, comps = self.criterion(
                         chn_sz_logits=ch_sz_logits,
@@ -486,6 +627,21 @@ class Stage2Trainer:
                 all_soz_labels.append(soz.detach().cpu().numpy())
                 pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
+                # 验证时收集患者/文件元数据（用于 DeepSOZ 定位指标）
+                if not train:
+                    batch_pt = batch.get('pt_id', batch.get('fn', [''] * B))
+                    batch_fn = batch.get('fn', [''] * B)
+                    if isinstance(batch_pt, str):
+                        batch_pt = [batch_pt]
+                    elif isinstance(batch_pt, tuple):
+                        batch_pt = list(batch_pt)
+                    if isinstance(batch_fn, str):
+                        batch_fn = [batch_fn]
+                    elif isinstance(batch_fn, tuple):
+                        batch_fn = list(batch_fn)
+                    all_pt_ids.extend(batch_pt)
+                    all_fns.extend(batch_fn)
+
         n_batches = max(len(loader), 1)
         loss_dict = {'loss': total_loss / n_batches}
         for k in loss_components:
@@ -495,6 +651,17 @@ class Stage2Trainer:
         all_labels = np.concatenate(all_soz_labels,  axis=0)
         soz_metrics = compute_soz_metrics(all_labels, all_probs,
                                           label_names=self.label_names)
+
+        # DeepSOZ 论文 SOZ 定位指标（验证时计算）
+        if not train and len(all_pt_ids) > 0:
+            try:
+                deepsoz_m = _compute_deepsoz_soz_lightweight(
+                    all_probs, all_labels, all_pt_ids, all_fns,
+                )
+                soz_metrics.update(deepsoz_m)
+            except Exception as e:
+                logger.debug(f'DeepSOZ SOZ 指标计算跳过: {e}')
+
         return loss_dict, soz_metrics
 
     # ── 训练主循环 ─────────────────────────────────────────────────────────
@@ -548,6 +715,8 @@ class Stage2Trainer:
                 f'va_loss={va_loss["loss"]:.4f}  '
                 f'va_f1={va_soz["f1_macro"]:.4f}  '
                 f'va_auc={va_soz.get("auc_macro", 0.):.4f}  '
+                f'corr_sz={va_soz.get("deepsoz_corr_sz", 0.):.3f}  '
+                f'acc_pt={va_soz.get("deepsoz_acc_pt", 0.):.3f}  '
                 f'{"★" if improved else f"no_imp={no_improve}"}'
             )
 
@@ -586,8 +755,17 @@ class Stage2Trainer:
         self,
         loader: DataLoader,
         threshold: float = 0.5,
+        mc_samples: int = 20,
     ) -> Dict:
-        """完整推理评估（加载 best checkpoint 后调用）"""
+        """
+        完整推理评估（加载 best checkpoint 后调用）。
+
+        包含：
+          1. 标准指标（f1_macro, auc_macro 等）
+          2. MC dropout DeepSOZ 论文指标
+             - 发作级: mc_corr_sz, mc_szunc_mean
+             - 患者级: mc_acc_pt, mc_ptunc_mean
+        """
         self.model.eval()
         all_probs, all_labels = [], []
 
@@ -602,9 +780,87 @@ class Stage2Trainer:
 
         all_probs  = np.concatenate(all_probs,  axis=0)
         all_labels = np.concatenate(all_labels, axis=0)
-        return compute_soz_metrics(all_labels, all_probs,
-                                   threshold=threshold,
-                                   label_names=self.label_names)
+        metrics = compute_soz_metrics(all_labels, all_probs,
+                                      threshold=threshold,
+                                      label_names=self.label_names)
+
+        # MC dropout DeepSOZ 论文指标
+        if mc_samples > 0:
+            logger.info(f'[Stage-2] MC dropout 评估 (samples={mc_samples})...')
+            mc_metrics = self._evaluate_mc_deepsoz(loader, mc_samples=mc_samples)
+            metrics.update(mc_metrics)
+
+        return metrics
+
+    def _evaluate_mc_deepsoz(
+        self,
+        loader: DataLoader,
+        mc_samples: int = 20,
+    ) -> Dict:
+        """
+        MC dropout DeepSOZ SOZ 定位评估。
+
+        保持 model.train() 使 dropout 生效，前向 mc_samples 次。
+        计算发作级和患者级定位正确率 + 不确定性。
+        """
+        from evaluate import mc_inference_single, final_loc
+        from collections import defaultdict
+
+        patient_data: dict = defaultdict(list)
+
+        for batch in loader:
+            X = batch['buffers'].to(self.device)       # [B, Nsz, T, C, L]
+            soz = batch['onset_map'].numpy()            # [B, 19]
+            pt_ids = batch.get('pt_id', batch.get('fn', ['unknown']))
+            if isinstance(pt_ids, str):
+                pt_ids = [pt_ids]
+            elif isinstance(pt_ids, tuple):
+                pt_ids = list(pt_ids)
+
+            for b in range(X.shape[0]):
+                single_x = X[b:b + 1]
+                mc_maps = mc_inference_single(
+                    self.model, single_x, self.device,
+                    n_samples=mc_samples, use_amp=self.use_amp,
+                )  # [mc_samples, C]
+                patient_data[pt_ids[b]].append({
+                    'mc_maps': mc_maps,
+                    'true_onset': soz[b],
+                })
+
+        # 发作级
+        all_corr_sz, all_sz_unc = [], []
+        for pid, entries in patient_data.items():
+            for e in entries:
+                if e['true_onset'].sum() == 0:
+                    continue
+                ysoz, unc, correct = final_loc(e['mc_maps'], e['true_onset'])
+                all_corr_sz.append(correct)
+                all_sz_unc.append(float(unc.max()))
+
+        # 患者级
+        n_patients = 0
+        pt_correct = 0
+        pt_uncs = []
+        for pid, entries in patient_data.items():
+            valid = [e for e in entries if e['true_onset'].sum() > 0]
+            if not valid:
+                continue
+            n_patients += 1
+            pt_mc = np.concatenate([e['mc_maps'] for e in valid], axis=0)
+            true_onset = valid[0]['true_onset']
+            ysoz_pt, unc_pt, correct_pt = final_loc(pt_mc, true_onset)
+            pt_correct += correct_pt
+            pt_uncs.append(float(unc_pt.max()))
+
+        return {
+            'mc_corr_sz':   float(np.mean(all_corr_sz)) if all_corr_sz else 0.0,
+            'mc_szunc_mean': float(np.mean(all_sz_unc)) if all_sz_unc else 0.0,
+            'mc_acc_pt':    pt_correct / max(n_patients, 1),
+            'mc_ptunc_mean': float(np.mean(pt_uncs)) if pt_uncs else 0.0,
+            'mc_n_patients': n_patients,
+            'mc_n_seizures': len(all_corr_sz),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

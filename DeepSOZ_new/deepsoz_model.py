@@ -311,12 +311,11 @@ class DeepSOZLocator(nn.Module):
         """
         B, T, C, _ = h.shape
         probs = F.softmax(h, dim=3)
-        device = h.device if h.device.type != 'cpu' else None
-        max_logits = torch.zeros(B, T, 2, device=device)
-        for bb in range(B):
-            max_chns = torch.argmax(probs[bb, :, :, 1], dim=1)  # [T]
-            for tt in range(T):
-                max_logits[bb, tt, :] = h[bb, tt, max_chns[tt], :]
+        # 每个 (b, t) 取发作概率最高的通道索引
+        max_chns = torch.argmax(probs[..., 1], dim=2)                  # [B, T]
+        # 用 gather 从 h 中提取对应通道的 2 类 logits
+        idx = max_chns.unsqueeze(-1).unsqueeze(-1).expand(B, T, 1, 2)  # [B,T,1,2]
+        max_logits = torch.gather(h, 2, idx).squeeze(2)                # [B,T,2]
         return max_logits
 
     # ── 前向传播 ─────────────────────────────────────────────────────────────
