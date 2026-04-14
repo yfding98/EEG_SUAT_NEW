@@ -117,6 +117,7 @@ class IntegrationConfig:
     output_mode: str = 'monopolar'     # 'monopolar' (19) or 'bipolar' (22)
     n_monopolar: int = 19
     n_regions: int = 6
+    region_label_mode: str = 'coarse'   # 'coarse' (6) or 'fine_lateralized' (9)
     n_hemisphere_classes: int = 3
     n_stage_classes: int = 2
     stage_ignore_index: int = -100
@@ -419,17 +420,17 @@ class PatchStageHead(nn.Module):
 # =====================================================================
 
 class ChannelToRegionAggregation(nn.Module):
-    """Aggregate channel logits [B, 19] → region logits [B, 6] via max pooling.
+    """Aggregate channel logits [B, 19] → region logits via max pooling.
 
     Uses STANDARD_19 channel ordering.
-    Regions: FP, F, C, T, P, O
+    Supports both coarse (6 regions) and fine_lateralized (9 regions).
     """
 
-    REGION_NAMES: Tuple[str, ...] = ('FP', 'F', 'C', 'T', 'P', 'O')
     # STANDARD_19: FP1(0) FP2(1) F3(2) F4(3) C3(4) C4(5) P3(6) P4(7)
     #              O1(8) O2(9) F7(10) F8(11) T3(12) T4(13) T5(14) T6(15)
     #              FZ(16) CZ(17) PZ(18)
-    REGION_CHANNEL_IDX: Dict[str, Tuple[int, ...]] = {
+    COARSE_REGION_NAMES: Tuple[str, ...] = ('FP', 'F', 'C', 'T', 'P', 'O')
+    COARSE_CHANNEL_IDX: Dict[str, Tuple[int, ...]] = {
         'FP': (0, 1),
         'F':  (2, 3, 10, 11, 16),
         'C':  (4, 5, 17),
@@ -437,21 +438,39 @@ class ChannelToRegionAggregation(nn.Module):
         'P':  (6, 7, 18),
         'O':  (8, 9),
     }
+    FINE_REGION_NAMES: Tuple[str, ...] = ('L_FP', 'R_FP', 'L_F', 'R_F', 'C', 'L_T', 'R_T', 'P', 'O')
+    FINE_CHANNEL_IDX: Dict[str, Tuple[int, ...]] = {
+        'L_FP': (0,),              # FP1
+        'R_FP': (1,),              # FP2
+        'L_F':  (2, 10, 16),       # F3, F7, FZ(midline→both)
+        'R_F':  (3, 11, 16),       # F4, F8, FZ(midline→both)
+        'C':    (4, 5, 17),        # C3, C4, CZ
+        'L_T':  (12, 14),          # T3, T5
+        'R_T':  (13, 15),          # T4, T6
+        'P':    (6, 7, 18),        # P3, P4, PZ
+        'O':    (8, 9),            # O1, O2
+    }
 
-    def __init__(self):
+    def __init__(self, region_label_mode: str = 'coarse'):
         super().__init__()
+        if region_label_mode == 'fine_lateralized':
+            self.region_names = self.FINE_REGION_NAMES
+            channel_idx = self.FINE_CHANNEL_IDX
+        else:
+            self.region_names = self.COARSE_REGION_NAMES
+            channel_idx = self.COARSE_CHANNEL_IDX
         # Pre-build index lists as buffers for fast GPU gather
-        for region in self.REGION_NAMES:
+        for region in self.region_names:
             self.register_buffer(
                 f'idx_{region}',
-                torch.tensor(self.REGION_CHANNEL_IDX[region], dtype=torch.long),
+                torch.tensor(channel_idx[region], dtype=torch.long),
                 persistent=False,
             )
 
     def forward(self, channel_logits: torch.Tensor) -> torch.Tensor:
-        """channel_logits: [B, 19] → region_logits: [B, 6]"""
+        """channel_logits: [B, 19] → region_logits: [B, n_regions]"""
         parts = []
-        for region in self.REGION_NAMES:
+        for region in self.region_names:
             idx = getattr(self, f'idx_{region}')
             parts.append(channel_logits[:, idx].max(dim=1).values)
         return torch.stack(parts, dim=1)
@@ -667,7 +686,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             n_patches=max_patches, output_mode=c.output_mode,
         )
         # DeepSOZ-style aggregation: channel logits → region / hemisphere
-        self.region_agg = ChannelToRegionAggregation()
+        self.region_agg = ChannelToRegionAggregation(region_label_mode=c.region_label_mode)
         self.hemi_agg = ChannelToHemiAggregation()
         self.stage_head = PatchStageHead(
             embed_dim=c.embed_dim,
@@ -868,7 +887,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         soz_logits, bipolar_logits = self.soz_head(fused)     # [B, 19], [B, 22]
         soz_probs = torch.sigmoid(soz_logits)
         # DeepSOZ-style aggregation from channel logits
-        region_logits = self.region_agg(soz_logits)           # [B, 6]
+        region_logits = self.region_agg(soz_logits)           # [B, n_regions]
         hemisphere_logits = self.hemi_agg(soz_logits)         # [B, 3]
 
         # MoE辅助损失合并
@@ -915,7 +934,7 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
         Args
         ----
         soz_targets        : [B, 19] or [B, 22]
-        region_targets     : [B, 6]  (optional, multi-label)
+        region_targets     : [B, n_regions]  (optional, multi-label)
         hemisphere_targets : [B]     (optional, 0=L,1=R,2=B,-100=ignore)
         transition_targets : [B, P]  (optional)
         pattern_targets    : [B]     (optional)

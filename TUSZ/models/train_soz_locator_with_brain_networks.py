@@ -3588,6 +3588,7 @@ def main():
         n_frozen_layers=args.labram_frozen_layers,
         output_mode=args.output_mode,
         n_regions=len(region_names),
+        region_label_mode=args.region_label_mode,
         n_hemisphere_classes=n_hemisphere_classes,
         brain_network_features=selected_brain_features,
         w_transition=args.w_transition,
